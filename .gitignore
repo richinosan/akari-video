@@ -11,6 +11,7 @@ electron-builder-out/
 .DS_Store
 .env
 .env.*
+mise.local.toml
 *.vsix
 plugins/
 bin/akari
