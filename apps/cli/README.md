@@ -1,5 +1,7 @@
 # AKARI CLI (`apps/cli`)
 
+**English** | [日本語](./README.ja.md)
+
 Go + Cobra front-end for headless AKARI Video. The IPC contract is
 [ConnectRPC](https://connectrpc.com) (`proto/akari/v1/orchestrator.proto`).
 
