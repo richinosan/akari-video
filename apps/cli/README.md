@@ -17,7 +17,10 @@ mise run gen-proto
 mise run cli-build   # → bin/akari
 ```
 
-Pinned in repo-root `mise.toml`: `node`, `ffmpeg`, `go`, `buf` (+ `mise.lock`).
+Pinned in repo-root `mise.toml`: `node`, `ffmpeg`, `go`, `buf`, `golangci-lint`, `govulncheck` (+ `mise.lock`).
+
+CI (`.github/workflows/go-cli.yml`): `golangci-lint` + `go test ./...` on PR/push.
+Weekly `govulncheck` (`.github/workflows/go-cli-security.yml`) opens/updates a dependency PR when needed.
 
 ## Commands
 

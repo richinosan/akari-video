@@ -39,7 +39,7 @@ func newBatchCommand() *cobra.Command {
 						worst = event.GetExitClass()
 					}
 				}
-				fmt.Fprintf(
+				_, _ = fmt.Fprintf(
 					cmd.OutOrStdout(),
 					"[%d/%d] %s %s %s\n",
 					event.GetIndex(),
@@ -49,10 +49,10 @@ func newBatchCommand() *cobra.Command {
 					event.GetExitClass().String(),
 				)
 				if event.GetMessage() != "" {
-					fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", event.GetMessage())
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", event.GetMessage())
 				}
 				if event.GetOutputPath() != "" {
-					fmt.Fprintf(cmd.OutOrStdout(), "  output: %s\n", event.GetOutputPath())
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  output: %s\n", event.GetOutputPath())
 				}
 				return nil
 			})

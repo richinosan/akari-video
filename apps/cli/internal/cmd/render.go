@@ -41,9 +41,9 @@ func newRenderPlanCommand() *cobra.Command {
 				return err
 			}
 			printExitClass(cmd, resp.Msg.GetExitClass())
-			fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
 			if resp.Msg.GetOutputPath() != "" {
-				fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
 			}
 			return exitFromClass(resp.Msg.GetExitClass())
 		},
@@ -79,9 +79,9 @@ func newRenderRunCommand() *cobra.Command {
 				return err
 			}
 			printExitClass(cmd, resp.Msg.GetExitClass())
-			fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
 			if resp.Msg.GetOutputPath() != "" {
-				fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
 			}
 			return exitFromClass(resp.Msg.GetExitClass())
 		},
@@ -93,7 +93,7 @@ func newRenderRunCommand() *cobra.Command {
 }
 
 func printExitClass(cmd *cobra.Command, class akariv1.ExitClass) {
-	fmt.Fprintf(cmd.ErrOrStderr(), "exit_class: %s\n", class.String())
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "exit_class: %s\n", class.String())
 }
 
 func exitFromClass(class akariv1.ExitClass) error {

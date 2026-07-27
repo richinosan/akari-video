@@ -10,8 +10,6 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	akariv1connect "github.com/richinosan/akari-video/apps/cli/gen/akari/v1/akariv1connect"
 	"github.com/richinosan/akari-video/apps/cli/internal/orchestrator"
@@ -77,9 +75,12 @@ func newServeCommand() *cobra.Command {
 			path, handler := akariv1connect.NewOrchestratorServiceHandler(svc)
 			mux.Handle(path, handler)
 
+			var protocols http.Protocols
+			protocols.SetUnencryptedHTTP2(true)
 			server := &http.Server{
-				Addr:    addr,
-				Handler: h2c.NewHandler(mux, &http2.Server{}),
+				Addr:      addr,
+				Handler:   mux,
+				Protocols: &protocols,
 			}
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -87,7 +88,7 @@ func newServeCommand() *cobra.Command {
 
 			errCh := make(chan error, 1)
 			go func() {
-				fmt.Fprintf(cmd.ErrOrStderr(), "akari serve listening on %s (ConnectRPC %s)\n", addr, path)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "akari serve listening on %s (ConnectRPC %s)\n", addr, path)
 				errCh <- server.ListenAndServe()
 			}()
 

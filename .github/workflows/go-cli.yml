@@ -1,0 +1,46 @@
+name: Go CLI
+
+on:
+  push:
+    branches:
+      - richinosan/main
+      - main
+    paths:
+      - apps/cli/**
+      - proto/**
+      - buf.yaml
+      - buf.gen.yaml
+      - mise.toml
+      - mise.lock
+      - .github/workflows/go-cli.yml
+  pull_request:
+    paths:
+      - apps/cli/**
+      - proto/**
+      - buf.yaml
+      - buf.gen.yaml
+      - mise.toml
+      - mise.lock
+      - .github/workflows/go-cli.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: golangci-lint
+        run: mise run cli-lint
+
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: go test ./...
+        run: mise run cli-test

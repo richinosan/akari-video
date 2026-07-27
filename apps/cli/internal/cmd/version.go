@@ -11,7 +11,7 @@ func newVersionCommand() *cobra.Command {
 		Use:   "version",
 		Short: "Print CLI version",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintln(cmd.OutOrStdout(), "akari-cli 0.1.0")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "akari-cli 0.1.0")
 		},
 	}
 }
