@@ -1,10 +1,12 @@
-# Tool versions for local / CI / headless CLI work (render-cut, edit-lint, etc.).
+# Tool versions for local / CI / headless CLI work (render-cut, edit-lint, apps/cli).
 # Install: `mise install`  —  run tools: `mise exec -- <cmd>`
 #
 # node: engines require >=20 (`packages/akari-launcher`). Pin current Node 22 LTS
 #       rather than `latest` so shell / Electron-adjacent paths stay reproducible.
 # ffmpeg: render-cut / edit-lint call ffmpeg and ffprobe directly. Pin to match
 #         the version family already used in local verification (8.1.x).
+# go: apps/cli (cobra + ConnectRPC). Match apps/cli/go.mod (>=1.25).
+# buf: proto codegen (`buf generate` → apps/cli/gen). Lockfile pins per-platform checksums.
 
 [tools]
 node = "22.23.1"
@@ -20,3 +22,8 @@ run = "buf generate"
 description = "Run Go CLI unit tests"
 dir = "apps/cli"
 run = "go test ./..."
+
+[tasks.cli-build]
+description = "Build akari CLI binary to bin/akari"
+dir = "apps/cli"
+run = "go build -o ../../bin/akari ./cmd/akari"

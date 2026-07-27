@@ -13,9 +13,11 @@ v0 delegates to existing Node CLIs:
 ```sh
 # from repo root (mise recommended)
 mise install
-buf generate
-cd apps/cli && go build -o ../../bin/akari ./cmd/akari
+mise run gen-proto
+mise run cli-build   # → bin/akari
 ```
+
+Pinned in repo-root `mise.toml`: `node`, `ffmpeg`, `go`, `buf` (+ `mise.lock`).
 
 ## Commands
 
