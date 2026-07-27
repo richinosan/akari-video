@@ -2432,6 +2432,52 @@ checksum = "sha256:ef408f85f664a4b9c9dac3cb2e36154d9baa15a88984ea800e11060e0f239
 url = "https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_6.conda"
 checksum = "sha256:368d8628424966fd8f9c8018326a9c779e06913dd39e646cf331226acc90e5b2"
 
+[[tools.buf]]
+version = "1.72.0"
+backend = "aqua:bufbuild/buf"
+
+[tools.buf."platforms.linux-arm64"]
+checksum = "sha256:7641bd7e06a37a54cbb8c789f53465899def96196ab5c08057432f781a15d517"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772526"
+provenance = "minisign"
+
+[tools.buf."platforms.linux-arm64-musl"]
+checksum = "sha256:7641bd7e06a37a54cbb8c789f53465899def96196ab5c08057432f781a15d517"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772526"
+provenance = "minisign"
+
+[tools.buf."platforms.linux-x64"]
+checksum = "sha256:a9c6186cf6fcf062b247345e1b7b12c26f580c1b2a4bbf4d3fe080abf85ceee8"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772583"
+provenance = "minisign"
+
+[tools.buf."platforms.linux-x64-musl"]
+checksum = "sha256:a9c6186cf6fcf062b247345e1b7b12c26f580c1b2a4bbf4d3fe080abf85ceee8"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772583"
+provenance = "minisign"
+
+[tools.buf."platforms.macos-arm64"]
+checksum = "sha256:be040ae0ca381103dfda68a36738695c4db3e48de8e91412acdc3d991f39b91e"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772487"
+provenance = "minisign"
+
+[tools.buf."platforms.macos-x64"]
+checksum = "sha256:8b87e66786b46b20e7f7e328c9e15f64f636041acfdbf93374873d9014a62d30"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Darwin-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772489"
+provenance = "minisign"
+
+[tools.buf."platforms.windows-x64"]
+checksum = "sha256:0332d8d1bf062c95a0418081b7e574551032ee72064af05e304e3a1454f8cf11"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Windows-x86_64.zip"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772631"
+provenance = "minisign"
+
 [[tools.ffmpeg]]
 version = "8.1.2"
 backend = "conda:ffmpeg"
@@ -3076,6 +3122,38 @@ conda_deps = [
     "tk-8.6.13-h967ab96_3",
     "tzdata-2026c-h151e31d_0",
 ]
+
+[[tools.go]]
+version = "1.25.12"
+backend = "core:go"
+
+[tools.go."platforms.linux-arm64"]
+checksum = "sha256:8b5884aef89600aef5b0b051fb971f11f49bb996521e911f30f02a66884f7bd2"
+url = "https://dl.google.com/go/go1.25.12.linux-arm64.tar.gz"
+
+[tools.go."platforms.linux-arm64-musl"]
+checksum = "sha256:8b5884aef89600aef5b0b051fb971f11f49bb996521e911f30f02a66884f7bd2"
+url = "https://dl.google.com/go/go1.25.12.linux-arm64.tar.gz"
+
+[tools.go."platforms.linux-x64"]
+checksum = "sha256:234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"
+url = "https://dl.google.com/go/go1.25.12.linux-amd64.tar.gz"
+
+[tools.go."platforms.linux-x64-musl"]
+checksum = "sha256:234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"
+url = "https://dl.google.com/go/go1.25.12.linux-amd64.tar.gz"
+
+[tools.go."platforms.macos-arm64"]
+checksum = "sha256:fa2c88bbcf64bd3b2aef355f026cfec6d3a4a01c132f999c8f8c964eb767164f"
+url = "https://dl.google.com/go/go1.25.12.darwin-arm64.tar.gz"
+
+[tools.go."platforms.macos-x64"]
+checksum = "sha256:00a2e743b82bccec03c51c4b0f7e46d5fec52184075fd6c5183c3bb39ae9fb00"
+url = "https://dl.google.com/go/go1.25.12.darwin-amd64.tar.gz"
+
+[tools.go."platforms.windows-x64"]
+checksum = "sha256:d5dc82da351b00e5eedd04f41356817d674cc4308131f0f638a5b14c5c3af4cb"
+url = "https://dl.google.com/go/go1.25.12.windows-amd64.zip"
 
 [[tools.node]]
 version = "22.23.1"

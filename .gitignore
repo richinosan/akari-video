@@ -13,3 +13,4 @@ electron-builder-out/
 .env.*
 *.vsix
 plugins/
+bin/akari
