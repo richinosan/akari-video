@@ -40,3 +40,8 @@ run = "govulncheck ./..."
 description = "Build akari CLI binary to bin/akari"
 dir = "apps/cli"
 run = "go build -o ../../bin/akari ./cmd/akari"
+
+[tasks.orchestrator-test]
+description = "Run Node orchestrator package tests"
+dir = "packages/orchestrator"
+run = "node --test test/*.test.mjs"

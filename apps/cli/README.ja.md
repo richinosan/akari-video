@@ -39,4 +39,9 @@ akari batch --approve-plan <project-a> <project-b>
 
 ## IPC
 
-`OrchestratorService` は `akari serve` で提供します。いまの cobra サブコマンドは同一ハンドラをプロセス内で呼び出します。将来リモートワーカーに分離しても、protobuf 面を変えずに同じ契約を使えます。
+`OrchestratorService` の提供先:
+
+- Go: `akari serve`
+- Node: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
+
+cobra サブコマンドは現状 Go ハンドラをプロセス内で呼び出します。リモートクライアントはどちらのワーカーにも同じ ConnectRPC 契約で接続できます。

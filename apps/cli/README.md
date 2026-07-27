@@ -39,6 +39,9 @@ akari batch --approve-plan <project-a> <project-b>
 
 ## IPC
 
-`OrchestratorService` is served by `akari serve`. Cobra subcommands call the same handler
-in-process today; remote workers can implement the same contract later without changing
-the protobuf surface.
+`OrchestratorService` is served by:
+
+- Go: `akari serve`
+- Node: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
+
+Cobra subcommands call the Go handler in-process today. Either worker can serve the same ConnectRPC contract for remote clients.
