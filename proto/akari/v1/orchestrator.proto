@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package akari.v1;
+
+option go_package = "github.com/richinosan/akari-video/apps/cli/gen/akari/v1;akariv1";
+
+// OrchestratorService is the IPC contract between the Go CLI (cobra) and render
+// workers. v0 delegates to existing Node CLIs (edit-lint, render-cut). The
+// protobuf surface stays stable when workers are split behind ConnectRPC.
+service OrchestratorService {
+  // LintProject runs edit-lint as a preflight check.
+  rpc LintProject(LintProjectRequest) returns (LintProjectResponse);
+
+  // PlanRender runs render-cut --plan-only and surfaces render.json paths.
+  rpc PlanRender(PlanRenderRequest) returns (PlanRenderResponse);
+
+  // RenderProject runs render-cut after an explicit plan approval gate.
+  rpc RenderProject(RenderProjectRequest) returns (RenderProjectResponse);
+
+  // RenderBatch plans or renders multiple projects and streams per-project events.
+  rpc RenderBatch(RenderBatchRequest) returns (stream RenderBatchEvent);
+}
+
+// ExitClass mirrors render-cut / edit-lint process exit codes.
+enum ExitClass {
+  EXIT_CLASS_UNSPECIFIED = 0;
+  EXIT_CLASS_OK = 1; // exit 0
+  EXIT_CLASS_REFUSAL = 2; // exit 1 — lint fail, verify fail, refused
+  EXIT_CLASS_EXECUTION_ERROR = 3; // exit 2 — spawn/parse/runtime failure
+}
+
+message LintProjectRequest {
+  string project_root = 1;
+  bool include_media = 2;
+}
+
+message LintProjectResponse {
+  ExitClass exit_class = 1;
+  string lint_json_path = 2;
+  string verdict = 3;
+  string message = 4;
+}
+
+message PlanRenderRequest {
+  string project_root = 1;
+  string output_path = 2;
+  bool force_lint_override = 3;
+}
+
+message PlanRenderResponse {
+  ExitClass exit_class = 1;
+  string render_json_path = 2;
+  string report_html_path = 3;
+  string output_path = 4;
+  double predicted_duration_seconds = 5;
+  string message = 6;
+}
+
+message RenderProjectRequest {
+  string project_root = 1;
+  string output_path = 2;
+  // plan_approved must be true for non-interactive render (no silent approval).
+  bool plan_approved = 3;
+  bool force_lint_override = 4;
+}
+
+message RenderProjectResponse {
+  ExitClass exit_class = 1;
+  string render_json_path = 2;
+  string output_path = 3;
+  string verify_verdict = 4;
+  string message = 5;
+}
+
+message RenderBatchRequest {
+  repeated string project_roots = 1;
+  bool plan_only = 2;
+  bool plan_approved = 3;
+  bool continue_on_error = 4;
+  bool force_lint_override = 5;
+}
+
+message RenderBatchEvent {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_LINT = 1;
+    PHASE_PLAN = 2;
+    PHASE_RENDER = 3;
+    PHASE_DONE = 4;
+  }
+
+  string project_root = 1;
+  int32 index = 2;
+  int32 total = 3;
+  Phase phase = 4;
+  ExitClass exit_class = 5;
+  string message = 6;
+  string output_path = 7;
+}

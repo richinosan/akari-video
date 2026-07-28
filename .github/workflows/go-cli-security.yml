@@ -1,0 +1,66 @@
+name: Go CLI security
+
+on:
+  schedule:
+    # Weekly Monday 03:00 UTC — govulncheck and open/update a dependency PR when needed.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+
+      - name: govulncheck
+        id: vuln
+        continue-on-error: true
+        run: |
+          set +e
+          mise run cli-vulncheck 2>&1 | tee govulncheck.log
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Update Go modules
+        if: steps.vuln.outputs.exit_code != '0'
+        working-directory: apps/cli
+        run: |
+          mise exec -- go get -u ./...
+          mise exec -- go mod tidy
+
+      - name: Prepare PR body
+        if: steps.vuln.outputs.exit_code != '0'
+        run: |
+          {
+            echo "govulncheck が脆弱性を検出したため、\`apps/cli\` の Go 依存を更新します。"
+            echo ""
+            echo "この PR は \`.github/workflows/go-cli-security.yml\` により自動生成・更新されます。"
+            echo "マージ前に \`mise run cli-test\` と \`mise run cli-lint\` の結果を確認してください。"
+            echo ""
+            echo "<details><summary>govulncheck log</summary>"
+            echo ""
+            echo '```'
+            cat govulncheck.log
+            echo '```'
+            echo "</details>"
+          } > pr-body.md
+
+      - name: Create or update security PR
+        if: steps.vuln.outputs.exit_code != '0'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/go-govulncheck-updates
+          delete-branch: false
+          title: "chore(cli): govulncheck 検出分の Go 依存を更新"
+          commit-message: "chore(cli): govulncheck 検出分の Go 依存を更新"
+          body-path: pr-body.md
+          labels: |
+            dependencies
+            security

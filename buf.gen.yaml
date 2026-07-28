@@ -1,0 +1,18 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/richinosan/akari-video/apps/cli/gen
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: apps/cli/gen
+    opt: paths=source_relative
+  - remote: buf.build/connectrpc/go
+    out: apps/cli/gen
+    opt: paths=source_relative
+  - remote: buf.build/bufbuild/es
+    out: packages/orchestrator/gen
+    opt:
+      - target=js
+      - import_extension=.js

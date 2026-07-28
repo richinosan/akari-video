@@ -1,0 +1,62 @@
+name: Go CLI
+
+on:
+  push:
+    branches:
+      - richinosan/main
+      - main
+    paths:
+      - apps/cli/**
+      - packages/orchestrator/**
+      - proto/**
+      - buf.yaml
+      - buf.gen.yaml
+      - mise.toml
+      - mise.lock
+      - .github/workflows/go-cli.yml
+  pull_request:
+    paths:
+      - apps/cli/**
+      - packages/orchestrator/**
+      - proto/**
+      - buf.yaml
+      - buf.gen.yaml
+      - mise.toml
+      - mise.lock
+      - .github/workflows/go-cli.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: golangci-lint
+        run: mise run cli-lint
+
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: go test ./...
+        run: mise run cli-test
+
+  orchestrator-test:
+    name: orchestrator (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.1"
+      - name: Install orchestrator workspace deps
+        run: npm install --ignore-scripts --no-audit --no-fund -w @akari-video/orchestrator
+      - name: orchestrator unit tests
+        run: mise run orchestrator-test
