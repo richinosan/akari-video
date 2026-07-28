@@ -15,3 +15,6 @@ mise.local.toml
 *.vsix
 plugins/
 bin/akari
+bin/akari-linux-amd64
+bin/akari-windows-amd64.exe
+bin/akari-bundle/

@@ -5,10 +5,14 @@
 Go + Cobra front-end for headless AKARI Video. The IPC contract is
 [ConnectRPC](https://connectrpc.com) (`proto/akari/v1/orchestrator.proto`).
 
-v0 delegates to existing Node CLIs:
+v0 delegates to existing Node CLIs via a bundled Node orchestrator worker:
 
 - `packages/edit-lint/bin/edit-lint.mjs`
 - `packages/render-cut/bin/render-cut.mjs`
+
+The Go binary (`akari`) is the user-facing CLI. `render` / `batch` auto-start the
+Node worker and call `OrchestratorService` over ConnectRPC (h2c). `akari serve`
+starts the worker in the foreground.
 
 ## Build
 
@@ -16,8 +20,13 @@ v0 delegates to existing Node CLIs:
 # from repo root (mise recommended)
 mise install
 mise run gen-proto
-mise run cli-build   # → bin/akari
+mise run cli-build              # → bin/akari (+ bin/akari-bundle/)
+mise run cli-build-linux        # → bin/akari-linux-amd64
+mise run cli-build-windows      # → bin/akari-windows-amd64.exe
 ```
+
+`cli-build*` runs `bundle-orchestrator` first, copying orchestrator + edit-lint +
+render-cut into `bin/akari-bundle/` beside the Go binary.
 
 Pinned in repo-root `mise.toml`: `node`, `ffmpeg`, `go`, `buf`, `golangci-lint`, `govulncheck` (+ `mise.lock`).
 
@@ -35,13 +44,16 @@ akari batch --plan-only <project-a> <project-b>
 akari batch --approve-plan <project-a> <project-b>
 ```
 
-`--repo-root` or `AKARI_VIDEO_ROOT` points at the monorepo when not run from inside it.
+`--repo-root` or `AKARI_VIDEO_ROOT` points at the monorepo when developing without
+`bin/akari-bundle/`. `AKARI_ORCHESTRATOR_ADDR` overrides the worker address
+(default `127.0.0.1:7707`). `AKARI_NODE` overrides the Node binary used to spawn
+the worker.
 
 ## IPC
 
-`OrchestratorService` is served by:
+`OrchestratorService` is implemented by the Node worker:
 
-- Go: `akari serve`
-- Node: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
+- bundled: `bin/akari-bundle/packages/orchestrator/bin/akari-orchestrator.mjs serve`
+- dev: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
 
-Cobra subcommands call the Go handler in-process today. Either worker can serve the same ConnectRPC contract for remote clients.
+Go commands are ConnectRPC clients. Health check: `GET /healthz`.

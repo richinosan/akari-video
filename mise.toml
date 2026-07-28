@@ -36,10 +36,29 @@ description = "Scan Go CLI dependencies with govulncheck"
 dir = "apps/cli"
 run = "govulncheck ./..."
 
+[tasks.bundle-orchestrator]
+description = "Bundle Node orchestrator runtime into bin/akari-bundle"
+run = "node scripts/bundle-orchestrator.mjs"
+
 [tasks.cli-build]
-description = "Build akari CLI binary to bin/akari"
+description = "Build akari CLI binary (native) with bundled orchestrator"
+depends = ["bundle-orchestrator"]
 dir = "apps/cli"
 run = "go build -o ../../bin/akari ./cmd/akari"
+
+[tasks.cli-build-linux]
+description = "Cross-build akari for linux/amd64"
+depends = ["bundle-orchestrator"]
+dir = "apps/cli"
+env = { GOOS = "linux", GOARCH = "amd64" }
+run = "go build -o ../../bin/akari-linux-amd64 ./cmd/akari"
+
+[tasks.cli-build-windows]
+description = "Cross-build akari for windows/amd64"
+depends = ["bundle-orchestrator"]
+dir = "apps/cli"
+env = { GOOS = "windows", GOARCH = "amd64" }
+run = "go build -o ../../bin/akari-windows-amd64.exe ./cmd/akari"
 
 [tasks.orchestrator-test]
 description = "Run Node orchestrator package tests"

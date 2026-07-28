@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"connectrpc.com/connect"
 	"github.com/spf13/cobra"
 
 	akariv1 "github.com/richinosan/akari-video/apps/cli/gen/akari/v1"
@@ -28,24 +27,24 @@ func newRenderPlanCommand() *cobra.Command {
 		Short: "Run render-cut --plan-only via OrchestratorService",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, err := newService()
+			client, err := newRPCClient(context.Background())
 			if err != nil {
 				return err
 			}
-			resp, err := svc.PlanRender(context.Background(), connect.NewRequest(&akariv1.PlanRenderRequest{
+			resp, err := client.PlanRender(context.Background(), &akariv1.PlanRenderRequest{
 				ProjectRoot:       args[0],
 				OutputPath:        outputPath,
 				ForceLintOverride: force,
-			}))
+			})
 			if err != nil {
 				return err
 			}
-			printExitClass(cmd, resp.Msg.GetExitClass())
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
-			if resp.Msg.GetOutputPath() != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
+			printExitClass(cmd, resp.GetExitClass())
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.GetMessage())
+			if resp.GetOutputPath() != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.GetOutputPath())
 			}
-			return exitFromClass(resp.Msg.GetExitClass())
+			return exitFromClass(resp.GetExitClass())
 		},
 	}
 	cmd.Flags().StringVar(&outputPath, "out", "", "output path override")
@@ -65,25 +64,25 @@ func newRenderRunCommand() *cobra.Command {
 			if !approve {
 				return fmt.Errorf("--approve-plan is required for non-interactive render")
 			}
-			svc, err := newService()
+			client, err := newRPCClient(context.Background())
 			if err != nil {
 				return err
 			}
-			resp, err := svc.RenderProject(context.Background(), connect.NewRequest(&akariv1.RenderProjectRequest{
+			resp, err := client.RenderProject(context.Background(), &akariv1.RenderProjectRequest{
 				ProjectRoot:       args[0],
 				OutputPath:        outputPath,
 				PlanApproved:      true,
 				ForceLintOverride: force,
-			}))
+			})
 			if err != nil {
 				return err
 			}
-			printExitClass(cmd, resp.Msg.GetExitClass())
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.Msg.GetMessage())
-			if resp.Msg.GetOutputPath() != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.Msg.GetOutputPath())
+			printExitClass(cmd, resp.GetExitClass())
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), resp.GetMessage())
+			if resp.GetOutputPath() != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "output: %s\n", resp.GetOutputPath())
 			}
-			return exitFromClass(resp.Msg.GetExitClass())
+			return exitFromClass(resp.GetExitClass())
 		},
 	}
 	cmd.Flags().StringVar(&outputPath, "out", "", "output path override")

@@ -1,9 +1,8 @@
 import { createServer } from "node:http";
 
-import { createConnectRouter } from "@connectrpc/connect";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 
-import { OrchestratorService } from "../gen/akari/v1/orchestrator_connect.js";
+import { OrchestratorService } from "../gen/akari/v1/orchestrator_pb.js";
 import { createOrchestratorService } from "./service.mjs";
 
 const USAGE = `Usage: akari-orchestrator serve [--addr <host:port>]
@@ -28,14 +27,24 @@ export async function runServeCli(argv) {
     return 2;
   }
 
-  const routes = createConnectRouter().service(
-    OrchestratorService,
-    createOrchestratorService(),
-  );
-  const server = createServer(connectNodeAdapter({ routes }));
+  const { host, port } = parseListenAddr(addr);
+
+  const connectHandler = connectNodeAdapter({
+    routes: (router) => {
+      router.service(OrchestratorService, createOrchestratorService());
+    },
+  });
+  const server = createServer((req, res) => {
+    if (req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    connectHandler(req, res);
+  });
   await new Promise((resolve, reject) => {
-    server.listen(addr, () => {
-      console.error(`akari-orchestrator listening on ${addr}`);
+    server.listen({ host, port }, () => {
+      console.error(`akari-orchestrator listening on ${host}:${port}`);
       resolve();
     });
     server.on("error", reject);
@@ -47,4 +56,24 @@ export async function runServeCli(argv) {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   return 0;
+}
+
+function parseListenAddr(addr) {
+  if (addr.startsWith("[")) {
+    const end = addr.indexOf("]");
+    if (end === -1) {
+      throw new Error(`invalid listen addr: ${addr}`);
+    }
+    const host = addr.slice(1, end);
+    const port = Number(addr.slice(end + 2));
+    return { host, port };
+  }
+  const sep = addr.lastIndexOf(":");
+  if (sep === -1) {
+    throw new Error(`invalid listen addr: ${addr}`);
+  }
+  return {
+    host: addr.slice(0, sep),
+    port: Number(addr.slice(sep + 1)),
+  };
 }

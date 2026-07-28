@@ -5,10 +5,14 @@
 headless な AKARI Video 向けの Go + Cobra フロントエンドです。IPC 契約は
 [ConnectRPC](https://connectrpc.com)（`proto/akari/v1/orchestrator.proto`）です。
 
-v0 は既存の Node CLI に委譲します。
+v0 は bundled な Node orchestrator ワーカー経由で既存の Node CLI に委譲します。
 
 - `packages/edit-lint/bin/edit-lint.mjs`
 - `packages/render-cut/bin/render-cut.mjs`
+
+Go バイナリ（`akari`）がユーザー向け CLI です。`render` / `batch` は Node ワーカーを
+自動起動し、ConnectRPC（h2c）で `OrchestratorService` を呼びます。`akari serve` は
+ワーカーをフォアグラウンドで起動します。
 
 ## ビルド
 
@@ -16,8 +20,13 @@ v0 は既存の Node CLI に委譲します。
 # リポジトリルートから（mise 推奨）
 mise install
 mise run gen-proto
-mise run cli-build   # → bin/akari
+mise run cli-build              # → bin/akari（+ bin/akari-bundle/）
+mise run cli-build-linux        # → bin/akari-linux-amd64
+mise run cli-build-windows      # → bin/akari-windows-amd64.exe
 ```
+
+`cli-build*` は先に `bundle-orchestrator` を実行し、orchestrator + edit-lint +
+render-cut を Go バイナリ横の `bin/akari-bundle/` に同梱します。
 
 リポジトリルートの `mise.toml` で pin: `node` / `ffmpeg` / `go` / `buf` / `golangci-lint` / `govulncheck`（`mise.lock` 同梱）。
 
@@ -35,13 +44,15 @@ akari batch --plan-only <project-a> <project-b>
 akari batch --approve-plan <project-a> <project-b>
 ```
 
-リポジトリ内で実行しない場合は、`--repo-root` または `AKARI_VIDEO_ROOT` でモノレポのルートを指定します。
+`bin/akari-bundle/` なしで開発する場合は `--repo-root` または `AKARI_VIDEO_ROOT` で
+モノレポを指定します。`AKARI_ORCHESTRATOR_ADDR` でワーカーアドレス（既定 `127.0.0.1:7707`）、
+`AKARI_NODE` でワーカー起動に使う Node を上書きできます。
 
 ## IPC
 
-`OrchestratorService` の提供先:
+`OrchestratorService` の実装は Node ワーカーです。
 
-- Go: `akari serve`
-- Node: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
+- 同梱: `bin/akari-bundle/packages/orchestrator/bin/akari-orchestrator.mjs serve`
+- 開発: `node packages/orchestrator/bin/akari-orchestrator.mjs serve`
 
-cobra サブコマンドは現状 Go ハンドラをプロセス内で呼び出します。リモートクライアントはどちらのワーカーにも同じ ConnectRPC 契約で接続できます。
+Go コマンドは ConnectRPC クライアントです。ヘルスチェック: `GET /healthz`。

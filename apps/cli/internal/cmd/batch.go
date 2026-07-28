@@ -22,12 +22,12 @@ func newBatchCommand() *cobra.Command {
 			if !planOnly && !approve {
 				return fmt.Errorf("--approve-plan is required when not using --plan-only")
 			}
-			svc, err := newService()
+			client, err := newRPCClient(context.Background())
 			if err != nil {
 				return err
 			}
 			var worst akariv1.ExitClass
-			err = svc.RunBatch(context.Background(), &akariv1.RenderBatchRequest{
+			err = client.RunBatch(context.Background(), &akariv1.RenderBatchRequest{
 				ProjectRoots:      args,
 				PlanOnly:          planOnly,
 				PlanApproved:      approve,

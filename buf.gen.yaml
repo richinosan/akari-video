@@ -16,8 +16,3 @@ plugins:
     opt:
       - target=js
       - import_extension=.js
-  - remote: buf.build/connectrpc/es
-    out: packages/orchestrator/gen
-    opt:
-      - target=js
-      - import_extension=.js

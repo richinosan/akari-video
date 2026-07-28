@@ -4,16 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
-	akariv1connect "github.com/richinosan/akari-video/apps/cli/gen/akari/v1/akariv1connect"
-	"github.com/richinosan/akari-video/apps/cli/internal/orchestrator"
 	"github.com/richinosan/akari-video/apps/cli/internal/reporoot"
+	"github.com/richinosan/akari-video/apps/cli/internal/rpcclient"
 )
 
 var (
@@ -46,63 +44,54 @@ func newRootCommand() *cobra.Command {
 	return root
 }
 
-func resolveRepoRoot() (string, error) {
-	if repoRootFlag != "" {
-		return reporoot.FromEnvOrResolve(repoRootFlag)
+func orchestratorAddr() string {
+	if v := os.Getenv("AKARI_ORCHESTRATOR_ADDR"); v != "" {
+		return v
 	}
-	return reporoot.FromEnvOrResolve("")
+	return rpcclient.DefaultAddr
 }
 
-func newService() (*orchestrator.Service, error) {
-	root, err := resolveRepoRoot()
+func applyRepoRootFlag() error {
+	if repoRootFlag == "" {
+		return nil
+	}
+	root, err := reporoot.FromEnvOrResolve(repoRootFlag)
 	if err != nil {
+		return err
+	}
+	return os.Setenv("AKARI_VIDEO_ROOT", root)
+}
+
+func newRPCClient(ctx context.Context) (*rpcclient.Client, error) {
+	if err := applyRepoRootFlag(); err != nil {
 		return nil, err
 	}
-	return orchestrator.NewService(root), nil
+	client := rpcclient.New(orchestratorAddr())
+	if err := client.EnsureWorker(ctx); err != nil {
+		return nil, fmt.Errorf("start orchestrator worker: %w", err)
+	}
+	return client, nil
 }
 
 func newServeCommand() *cobra.Command {
 	var addr string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Start ConnectRPC OrchestratorService (IPC)",
+		Short: "Start bundled Node orchestrator (ConnectRPC)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			svc, err := newService()
-			if err != nil {
+			if err := applyRepoRootFlag(); err != nil {
 				return err
 			}
-			mux := http.NewServeMux()
-			path, handler := akariv1connect.NewOrchestratorServiceHandler(svc)
-			mux.Handle(path, handler)
-
-			var protocols http.Protocols
-			protocols.SetUnencryptedHTTP2(true)
-			server := &http.Server{
-				Addr:      addr,
-				Handler:   mux,
-				Protocols: &protocols,
+			if addr == "" {
+				addr = orchestratorAddr()
 			}
-
+			client := rpcclient.New(addr)
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-
-			errCh := make(chan error, 1)
-			go func() {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "akari serve listening on %s (ConnectRPC %s)\n", addr, path)
-				errCh <- server.ListenAndServe()
-			}()
-
-			select {
-			case <-ctx.Done():
-				return server.Shutdown(context.Background())
-			case err := <-errCh:
-				if err == http.ErrServerClosed {
-					return nil
-				}
-				return err
-			}
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "akari serve starting node orchestrator on %s\n", addr)
+			return client.RunWorkerForeground(ctx)
 		},
 	}
-	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:7707", "listen address")
+	cmd.Flags().StringVar(&addr, "addr", "", "listen address (default: AKARI_ORCHESTRATOR_ADDR or 127.0.0.1:7707)")
 	return cmd
 }
