@@ -10,6 +10,7 @@
 
 # generated third-party license notices (prepackage で毎回再生成)
 /resources/generated-notices/
+/resources/bundled-cli/
 
 # dependencies
 /node_modules/

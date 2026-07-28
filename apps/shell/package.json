@@ -127,6 +127,13 @@
           "bin/**/*",
           "src/**/*"
         ]
+      },
+      {
+        "from": "resources/bundled-cli",
+        "to": "bundled-cli",
+        "filter": [
+          "bin/**/*"
+        ]
       }
     ],
     "mac": {

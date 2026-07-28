@@ -9,7 +9,23 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bundleRoot = join(repoRoot, "bin", "akari-bundle");
+
+const args = process.argv.slice(2);
+let bundleRoot = join(repoRoot, "bin", "akari-bundle");
+for (let i = 0; i < args.length; i += 1) {
+  if (args[i] === "--out" && args[i + 1]) {
+    bundleRoot = args[i + 1];
+    i += 1;
+    continue;
+  }
+  if (args[i] === "--help" || args[i] === "-h") {
+    console.error("Usage: node scripts/bundle-orchestrator.mjs [--out <akari-bundle-dir>]");
+    process.exit(0);
+  }
+  console.error(`unknown argument: ${args[i]}`);
+  process.exit(2);
+}
+
 const packages = ["orchestrator", "edit-lint", "render-cut"];
 
 function shouldSkip(path) {

@@ -21,6 +21,38 @@ golangci-lint = "2.12.2"
 description = "Generate ConnectRPC Go stubs from proto/"
 run = "buf generate"
 
+[tasks.bundle-orchestrator]
+description = "Bundle Node orchestrator runtime into bin/akari-bundle"
+run = "node scripts/bundle-orchestrator.mjs"
+
+[tasks.build]
+description = "Build self-contained akari CLI dist for host OS (dist/akari-<platform>/)"
+run = "node scripts/build-release.mjs"
+
+[tasks.build-linux]
+description = "Build akari CLI dist for linux/amd64"
+run = "node scripts/build-release.mjs --platform linux-x64"
+
+[tasks.build-win64]
+description = "Build akari CLI dist for windows/amd64"
+run = "node scripts/build-release.mjs --platform win-x64"
+
+[tasks.build-osx]
+description = "Build akari CLI dist for macOS arm64 (Go cross-compile; shell needs macOS host)"
+run = "node scripts/build-release.mjs --platform osx-arm64"
+
+[tasks.build-shell]
+description = "Build host CLI dist + Electron shell package (--with-shell)"
+run = "node scripts/build-release.mjs --with-shell"
+
+[tasks.build-shell-linux]
+description = "Build linux CLI dist + Electron shell package"
+run = "node scripts/build-release.mjs --platform linux-x64 --with-shell"
+
+[tasks.build-shell-win64]
+description = "Build windows CLI dist + Electron shell package (may need wine on Linux)"
+run = "node scripts/build-release.mjs --platform win-x64 --with-shell"
+
 [tasks.cli-test]
 description = "Run Go CLI unit tests"
 dir = "apps/cli"
@@ -36,29 +68,18 @@ description = "Scan Go CLI dependencies with govulncheck"
 dir = "apps/cli"
 run = "govulncheck ./..."
 
-[tasks.bundle-orchestrator]
-description = "Bundle Node orchestrator runtime into bin/akari-bundle"
-run = "node scripts/bundle-orchestrator.mjs"
-
+# Deprecated aliases — prefer `build` / `build-linux` / `build-win64`.
 [tasks.cli-build]
-description = "Build akari CLI binary (native) with bundled orchestrator"
-depends = ["bundle-orchestrator"]
-dir = "apps/cli"
-run = "go build -o ../../bin/akari ./cmd/akari"
+description = "Alias for build (host)"
+depends = ["build"]
 
 [tasks.cli-build-linux]
-description = "Cross-build akari for linux/amd64"
-depends = ["bundle-orchestrator"]
-dir = "apps/cli"
-env = { GOOS = "linux", GOARCH = "amd64" }
-run = "go build -o ../../bin/akari-linux-amd64 ./cmd/akari"
+description = "Alias for build-linux"
+depends = ["build-linux"]
 
 [tasks.cli-build-windows]
-description = "Cross-build akari for windows/amd64"
-depends = ["bundle-orchestrator"]
-dir = "apps/cli"
-env = { GOOS = "windows", GOARCH = "amd64" }
-run = "go build -o ../../bin/akari-windows-amd64.exe ./cmd/akari"
+description = "Alias for build-win64"
+depends = ["build-win64"]
 
 [tasks.orchestrator-test]
 description = "Run Node orchestrator package tests"
