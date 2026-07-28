@@ -26,32 +26,20 @@ description = "Bundle Node orchestrator runtime into bin/akari-bundle"
 run = "node scripts/bundle-orchestrator.mjs"
 
 [tasks.build]
-description = "Build self-contained akari CLI dist for host OS (dist/akari-<platform>/)"
+description = "Build unified akari dist for host OS (app + akari cli + bundle)"
 run = "node scripts/build-release.mjs"
 
 [tasks.build-linux]
-description = "Build akari CLI dist for linux/amd64"
+description = "Build unified akari dist for linux/amd64"
 run = "node scripts/build-release.mjs --platform linux-x64"
 
 [tasks.build-win64]
-description = "Build akari CLI dist for windows/amd64"
+description = "Build unified akari dist for windows/amd64"
 run = "node scripts/build-release.mjs --platform win-x64"
 
 [tasks.build-osx]
-description = "Build akari CLI dist for macOS arm64 (Go cross-compile; shell needs macOS host)"
+description = "Build unified akari dist for macOS arm64 (app requires macOS host)"
 run = "node scripts/build-release.mjs --platform osx-arm64"
-
-[tasks.build-shell]
-description = "Build host CLI dist + Electron shell package (--with-shell)"
-run = "node scripts/build-release.mjs --with-shell"
-
-[tasks.build-shell-linux]
-description = "Build linux CLI dist + Electron shell package"
-run = "node scripts/build-release.mjs --platform linux-x64 --with-shell"
-
-[tasks.build-shell-win64]
-description = "Build windows CLI dist + Electron shell package (may need wine on Linux)"
-run = "node scripts/build-release.mjs --platform win-x64 --with-shell"
 
 [tasks.cli-test]
 description = "Run Go CLI unit tests"
@@ -68,7 +56,6 @@ description = "Scan Go CLI dependencies with govulncheck"
 dir = "apps/cli"
 run = "govulncheck ./..."
 
-# Deprecated aliases — prefer `build` / `build-linux` / `build-win64`.
 [tasks.cli-build]
 description = "Alias for build (host)"
 depends = ["build"]

@@ -19,4 +19,4 @@ bin/akari-linux-amd64
 bin/akari-windows-amd64.exe
 bin/akari-bundle/
 dist/akari-*/
-dist/akari-video-shell-*/
+dist/.electron-staging-*/

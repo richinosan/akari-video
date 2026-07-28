@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/richinosan/akari-video/apps/cli/internal/applaunch"
 	"github.com/richinosan/akari-video/apps/cli/internal/reporoot"
 	"github.com/richinosan/akari-video/apps/cli/internal/rpcclient"
 )
@@ -33,14 +34,23 @@ func Execute() error {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "akari",
-		Short: "AKARI Video headless CLI",
+		Short: "AKARI Video",
+		Long:  "Launch the AKARI Video desktop app. Use `akari cli` for headless commands (render, batch, serve).",
+		RunE: func(_ *cobra.Command, args []string) error {
+			return applaunch.Run(args)
+		},
 	}
 	root.PersistentFlags().StringVar(&repoRootFlag, "repo-root", "", "akari-video monorepo root (default: auto-detect or AKARI_VIDEO_ROOT)")
 
-	root.AddCommand(newVersionCommand())
-	root.AddCommand(newServeCommand())
-	root.AddCommand(newRenderCommand())
-	root.AddCommand(newBatchCommand())
+	cli := &cobra.Command{
+		Use:   "cli",
+		Short: "Headless CLI (render, batch, serve)",
+	}
+	cli.AddCommand(newVersionCommand())
+	cli.AddCommand(newServeCommand())
+	cli.AddCommand(newRenderCommand())
+	cli.AddCommand(newBatchCommand())
+	root.AddCommand(cli)
 	return root
 }
 

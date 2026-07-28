@@ -17,9 +17,14 @@ func hasOrchestrator(root string) bool {
 // RuntimeRoot returns the directory that contains packages/orchestrator (bundle or monorepo).
 func RuntimeRoot() (string, error) {
 	if exe, err := os.Executable(); err == nil {
-		adjacent := filepath.Join(filepath.Dir(exe), "akari-bundle")
-		if hasOrchestrator(adjacent) {
-			return adjacent, nil
+		exeDir := filepath.Dir(exe)
+		for _, adjacent := range []string{
+			filepath.Join(exeDir, "lib", "akari-bundle"),
+			filepath.Join(exeDir, "akari-bundle"),
+		} {
+			if hasOrchestrator(adjacent) {
+				return adjacent, nil
+			}
 		}
 	}
 
@@ -46,7 +51,7 @@ func NodeBinary() string {
 type runtimeNotFoundError struct{}
 
 func (runtimeNotFoundError) Error() string {
-	return "orchestrator runtime not found (expected bin/akari-bundle or monorepo packages/orchestrator)"
+	return "orchestrator runtime not found (expected lib/akari-bundle or akari-bundle next to akari, or monorepo packages/orchestrator)"
 }
 
 func errRuntimeNotFound() error {

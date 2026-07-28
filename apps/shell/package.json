@@ -138,6 +138,7 @@
     ],
     "mac": {
       "icon": "resources/icons/icon.icns",
+      "executableName": "akari-video",
       "hardenedRuntime": true,
       "entitlements": "resources/entitlements.mac.plist",
       "entitlementsInherit": "resources/entitlements.mac.plist",
@@ -146,6 +147,7 @@
     },
     "win": {
       "icon": "resources/icons/icon.png",
+      "executableName": "akari-video",
       "target": "dir"
     },
     "nsis": {
@@ -157,6 +159,7 @@
     },
     "linux": {
       "icon": "resources/icons/icon.png",
+      "executableName": "akari-video",
       "target": "dir"
     }
   }

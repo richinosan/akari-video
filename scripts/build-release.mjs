@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * Build a self-contained akari CLI distribution:
+ * Build unified akari distribution:
  *   dist/akari-<platform>/
- *     akari[.exe]
- *     akari-bundle/
+ *     akari[.exe]           # entry point: app launcher + `akari cli` headless commands
+ *     lib/
+ *       akari-bundle/       # Node orchestrator runtime
+ *       app/                # Electron app (linux-unpacked / win-unpacked / .app contents)
  *
  * Usage:
- *   node scripts/build-release.mjs [--platform host|linux-x64|win-x64|osx-arm64|osx-x64] [--with-shell]
+ *   node scripts/build-release.mjs [--platform host|linux-x64|win-x64|osx-arm64|osx-x64]
  */
 import { spawnSync } from "node:child_process";
-import { chmod, cp, mkdir, rm } from "node:fs/promises";
+import { chmod, cp, mkdir, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,24 +46,18 @@ const PLATFORMS = {
 };
 
 function usage() {
-  console.error(`Usage: node scripts/build-release.mjs [--platform <id>] [--with-shell]
+  console.error(`Usage: node scripts/build-release.mjs [--platform <id>]
 
-Platforms: ${Object.keys(PLATFORMS).join(", ")}, host (default)
-  --with-shell  Also package apps/shell with electron-builder (slow; mac requires macOS host)`);
+Platforms: ${Object.keys(PLATFORMS).join(", ")}, host (default)`);
 }
 
 function parseArgs(argv) {
   const args = [...argv];
   let platform = "host";
-  let withShell = false;
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === "--platform" && args[i + 1]) {
       platform = args[i + 1];
       i += 1;
-      continue;
-    }
-    if (args[i] === "--with-shell") {
-      withShell = true;
       continue;
     }
     if (args[i] === "--help" || args[i] === "-h") {
@@ -72,7 +68,7 @@ function parseArgs(argv) {
     usage();
     process.exit(2);
   }
-  return { platform, withShell };
+  return { platform };
 }
 
 function detectHostPlatform() {
@@ -86,6 +82,13 @@ function detectHostPlatform() {
     return process.arch === "arm64" ? "osx-arm64" : "osx-x64";
   }
   throw new Error(`unsupported host platform: ${process.platform}`);
+}
+
+function canBuildShellOnHost(platformId) {
+  if (platformId.startsWith("osx")) {
+    return process.platform === "darwin";
+  }
+  return true;
 }
 
 function run(command, args, options = {}) {
@@ -122,57 +125,92 @@ async function buildCliBinary(platformId, outPath) {
   }
 }
 
-async function stageCliDistribution(platformId) {
-  const spec = PLATFORMS[platformId];
-  const distRoot = join(repoRoot, "dist", `akari-${platformId}`);
-  const bundleRoot = join(distRoot, "akari-bundle");
-  const cliPath = join(distRoot, `akari${spec.ext}`);
+async function findUnpackedDir(stagingRoot, platformId) {
+  const entries = await readdir(stagingRoot, { withFileTypes: true });
+  if (platformId.startsWith("osx")) {
+    for (const entry of entries) {
+      const entryPath = join(stagingRoot, entry.name);
+      if (entry.isDirectory() && entry.name.endsWith(".app")) {
+        return entryPath;
+      }
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const children = await readdir(entryPath, { withFileTypes: true }).catch(() => []);
+      for (const child of children) {
+        if (child.isDirectory() && child.name.endsWith(".app")) {
+          return join(entryPath, child.name);
+        }
+      }
+    }
+    throw new Error(`macOS .app not found under ${stagingRoot}`);
+  }
 
-  await rm(distRoot, { recursive: true, force: true });
-  await mkdir(distRoot, { recursive: true });
-
-  await bundleOrchestrator(bundleRoot);
-  await buildCliBinary(platformId, cliPath);
-
-  console.log(`akari CLI distribution ready: ${distRoot}`);
-  return distRoot;
+  const prefix = platformId.startsWith("win") ? "win" : "linux";
+  for (const entry of entries) {
+    if (entry.isDirectory() && entry.name.startsWith(`${prefix}-`) && entry.name.endsWith("-unpacked")) {
+      return join(stagingRoot, entry.name);
+    }
+  }
+  throw new Error(`electron unpacked dir not found under ${stagingRoot}`);
 }
 
-async function buildShellPackage(platformId, cliDistRoot) {
+async function buildShellInto(platformId, appRoot) {
   const spec = PLATFORMS[platformId];
   const shellDir = join(repoRoot, "apps/shell");
-  const bundledCliRoot = join(shellDir, "resources", "bundled-cli");
-  const shellOut = join(repoRoot, "dist", `akari-video-shell-${platformId}`);
+  const shellStaging = join(repoRoot, "dist", `.electron-staging-${platformId}`);
 
-  if (process.platform !== "darwin" && platformId.startsWith("osx")) {
-    throw new Error(`electron-builder cannot package ${platformId} without a macOS host`);
-  }
   if (process.platform === "linux" && platformId === "win-x64") {
     console.error("note: packaging win-x64 Electron from Linux may require wine (electron-builder)");
   }
-
-  await rm(bundledCliRoot, { recursive: true, force: true });
-  await mkdir(join(bundledCliRoot, "bin"), { recursive: true });
-  await cp(join(cliDistRoot, `akari${spec.ext}`), join(bundledCliRoot, "bin", `akari${spec.ext}`));
-  await cp(join(cliDistRoot, "akari-bundle"), join(bundledCliRoot, "bin", "akari-bundle"), {
-    recursive: true,
-  });
 
   const installEnv = process.platform === "darwin" ? { PYTHON: "/usr/bin/python3" } : {};
   run("npm", ["install", "--no-workspaces"], { cwd: shellDir, env: installEnv });
   run("npm", ["run", "build"], { cwd: shellDir });
 
-  await rm(shellOut, { recursive: true, force: true });
+  await rm(shellStaging, { recursive: true, force: true });
   run(
     "npx",
-    ["electron-builder", "--dir", ...spec.electron, `--config.directories.output=${shellOut}`],
+    ["electron-builder", "--dir", ...spec.electron, `--config.directories.output=${shellStaging}`],
     { cwd: shellDir },
   );
 
-  console.log(`AKARI Video shell package ready: ${shellOut}`);
+  const unpacked = await findUnpackedDir(shellStaging, platformId);
+  await rm(appRoot, { recursive: true, force: true });
+  await cp(unpacked, appRoot, { recursive: true });
+  await rm(shellStaging, { recursive: true, force: true });
 }
 
-const { platform, withShell } = parseArgs(process.argv.slice(2));
+async function stageDistribution(platformId) {
+  const spec = PLATFORMS[platformId];
+  const distRoot = join(repoRoot, "dist", `akari-${platformId}`);
+  const libRoot = join(distRoot, "lib");
+  const bundleRoot = join(libRoot, "akari-bundle");
+  const appRoot = join(libRoot, "app");
+
+  await rm(distRoot, { recursive: true, force: true });
+  await mkdir(libRoot, { recursive: true });
+
+  await bundleOrchestrator(bundleRoot);
+
+  if (canBuildShellOnHost(platformId)) {
+    await buildShellInto(platformId, appRoot);
+  } else {
+    console.error(`note: skipping Electron app for ${platformId} on this host (CLI-only dist)`);
+  }
+
+  await buildCliBinary(platformId, join(distRoot, `akari${spec.ext}`));
+
+  console.log(`akari distribution ready: ${distRoot}`);
+  if (canBuildShellOnHost(platformId)) {
+    console.log("  akari                 # launch desktop app");
+    console.log("  akari cli version     # headless commands");
+  } else {
+    console.log("  akari cli ...         # headless commands only (app not packaged on this host)");
+  }
+}
+
+const { platform } = parseArgs(process.argv.slice(2));
 const platformId = platform === "host" ? detectHostPlatform() : platform;
 if (!PLATFORMS[platformId]) {
   console.error(`unknown platform: ${platformId}`);
@@ -180,7 +218,4 @@ if (!PLATFORMS[platformId]) {
   process.exit(2);
 }
 
-const cliDistRoot = await stageCliDistribution(platformId);
-if (withShell) {
-  await buildShellPackage(platformId, cliDistRoot);
-}
+await stageDistribution(platformId);
