@@ -5,6 +5,13 @@ out/
 # templates/kaisetsu-short の tools/lib/ はビルド出力ではなくテンプレのソース（上の lib/ から除外）
 !templates/kaisetsu-short/tools/lib/
 !templates/kaisetsu-short/tools/lib/**
+# packages/edit-store の lib/ はコミットする（preview-server がビルドなしで直接 import するため。
+# 再生成: cd packages/edit-store && npm run build — src と drift させないこと）
+!packages/edit-store/lib/
+!packages/edit-store/lib/**
+# packages/pen-visuals の lib/ も同様にコミットする（shell extension の tsc が型解決に使うため）
+!packages/pen-visuals/lib/
+!packages/pen-visuals/lib/**
 electron-builder-out/
 *.app
 *.log
@@ -13,6 +20,7 @@ electron-builder-out/
 .env.*
 mise.local.toml
 *.vsix
+*.tsbuildinfo
 plugins/
 bin/akari
 bin/akari-linux-amd64
@@ -20,3 +28,6 @@ bin/akari-windows-amd64.exe
 bin/akari-bundle/
 dist/akari-*/
 dist/.electron-staging-*/
+x.sh
+.akari/
+test-results/
