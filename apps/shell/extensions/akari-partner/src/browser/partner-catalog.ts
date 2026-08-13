@@ -30,7 +30,22 @@ export type PartnerCatalogEntry = PartnerCliCatalogEntry | PartnerExtensionCatal
 
 export const PARTNER_CATALOG = rawCatalog as PartnerCatalogEntry[];
 
+export const PARTNER_AGENT_LABELS: Record<PartnerAgentId, string> = {
+    claude: 'Claude Code',
+    codex: 'Codex (OpenAI)',
+    opencode: 'opencode',
+    copilot: 'GitHub Copilot',
+    cursor: 'Cursor',
+    antigravity: 'Antigravity (Google)',
+    grok: 'Grok Build (xAI)'
+};
+
 export const PARTNER_CLI_ICON_CLASSES: Record<PartnerAgentId, string> = {
     claude: 'akari-partner-claude-cli-icon',
-    codex: 'akari-partner-codex-cli-icon'
+    codex: 'akari-partner-codex-cli-icon',
+    opencode: 'akari-partner-opencode-cli-icon',
+    copilot: 'akari-partner-copilot-cli-icon',
+    cursor: 'akari-partner-cursor-cli-icon',
+    antigravity: 'akari-partner-antigravity-cli-icon',
+    grok: 'akari-partner-grok-cli-icon'
 };

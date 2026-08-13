@@ -52,6 +52,7 @@ export function buildTailPadCommand({
   outputPath,
   cutsEndSeconds,
   finalDurationSeconds,
+  videoEncodeArgs = null,
 }) {
   const padSeconds = finalDurationSeconds - cutsEndSeconds;
   return {
@@ -65,15 +66,12 @@ export function buildTailPadCommand({
       "-i",
       inputPath,
       "-filter_complex",
-      `[0:v]tpad=stop_mode=add:stop_duration=${formatNumber(padSeconds)}:color=black[padv];[0:a]apad=whole_dur=${formatNumber(finalDurationSeconds)}[pada]`,
+      `[0:v]tpad=stop_mode=add:stop_duration=${formatNumber(padSeconds)}:color=black[padv_raw];[padv_raw]scale=out_range=tv[padv];[0:a]apad=whole_dur=${formatNumber(finalDurationSeconds)}[pada]`,
       "-map",
       "[padv]",
       "-map",
       "[pada]",
-      "-c:v",
-      "libx264",
-      "-profile:v",
-      "high",
+      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",

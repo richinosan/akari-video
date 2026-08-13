@@ -24,8 +24,7 @@ You need **three things**: Node.js, an AI agent, and ffmpeg.
 **Auto-install (recommended)**:
 
 Run only **one** command — the one for your OS.
-The installer checks out the **latest release** (not the development branch). If already
-installed, the same command updates you to the newest release.
+The installer checks out the **latest release** (not the development branch).
 
 **Windows (PowerShell)**:
 ```sh
@@ -49,7 +48,33 @@ The script automatically checks and installs:
 - ffmpeg (nothing to do — `npm install` pulls in a bundled GPL build automatically,
   sha256-verified; a system ffmpeg on PATH is preferred when present)
 
+The CLI is installed to `~/.akari/app/` by default. Set `AKARI_INSTALL_DIR` to override
+that location. The `~/.akari/app/` directory is replaceable as a whole during updates;
+other entries directly under `~/.akari/`—including `assets/`, `avatars/`, `runtime/`, and
+`*.json` files—are user data and are preserved. If an older installer-managed copy is
+found at `~/akari-video/`, the installer shows migration instructions but never deletes
+the old copy automatically.
+
 git is not required either — the installer fetches the repository as a tarball.
+
+**Updating**: `akari` keeps itself up to date automatically — no need to re-run the
+installer, use git, or even run `akari update` yourself. When a new version is
+available, it's downloaded and checksum-verified in the background while you keep
+working (this never blocks startup), then applied atomically the next time you run
+`akari`; a one-line "updated to vX.Y.Z" notice confirms it. The previous version is
+kept for one generation; `akari update --rollback` reverts to it, and `akari update`
+still works for an on-demand check/apply. Set `AKARI_NO_AUTO_UPDATE=1` to disable
+both the background download and the automatic apply (you'll still get the one-line
+"a new version is available" notice, and can update manually with `akari update`) —
+useful for CI or when you want to pin your environment. Re-running the installer
+above also still works (and is the way to move to a different `AKARI_INSTALL_DIR`,
+or to recover an installation that isn't managed by `akari update`, e.g. a global
+npm install or a monorepo checkout, neither of which are auto-updated).
+
+The desktop app (the Theia-based shell) downloads new versions automatically too.
+Once the download finishes, the home screen banner switches to "Downloaded. It will be
+applied on restart." with a "Restart and apply now" button — or it applies the next time
+you quit and relaunch the app normally. It never force-restarts you mid-session.
 
 **Prefer a lightweight CLI-only install?** `npm i -g akari-video` installs just the `akari`
 command (agent workflow bundled; the browser preview server is not included — use the
@@ -159,6 +184,121 @@ checksums. If an ffmpeg is already on your PATH, it is used first.
 ffmpeg -version
 # Should show version information
 ```
+
+### 4. The monorepo and its npm dependencies
+
+The one-line installer above already does everything in this section. Read it only when you
+set the monorepo up by hand — for example when you fetch it as a tarball instead of running
+the installer.
+
+Fetch the source. A tarball needs no git — this is how `install.sh` fetches it, except that
+the installer defaults to the newest release tag (`tar.gz/refs/tags/vX.Y.Z`) rather than
+`main`:
+
+```sh
+mkdir %USERPROFILE%\.akari\app
+curl -fsSL -o main.tar.gz https://codeload.github.com/AkariLabs/akari-video/tar.gz/refs/heads/main
+tar -xzf main.tar.gz -C %USERPROFILE%\.akari\app --strip-components=1
+```
+
+(On Linux / macOS the same two commands work with `$HOME/.akari/app` as the destination.)
+
+#### Windows: symlink errors while extracting are expected — ignore them
+
+Creating a symbolic link on Windows requires a privilege a normal account does not have, so
+`tar` fails on every symlink in the repository and **exits 1**:
+
+```
+.agents/skills/address-review: Can't create '\\?\C:\Users\<you>\.akari\app\.agents\skills\address-review': Invalid argument
+.claude/skills/...   (same)
+.codex/skills/...    (same)
+.cursor/skills/...   (same)
+.opencode/skills/... (same)
+plugin/skills:       (same)
+```
+
+**This is not a failed install.** The only entries that fail are the symlinked agent
+entrances (the skill directories under `.agents/`, `.claude/`, `.codex/`, `.cursor/`,
+`.opencode/`, plus `plugin/skills`); every real file (`packages/`, `skills/`, `docs/`,
+`templates/`, …) is extracted and you can keep going. Those symlinks only point at
+`skills/`, and the skill sources themselves are all under `skills/<name>/SKILL.md` — so you
+can point your agent at that path directly ("read `skills/edit-plan/SKILL.md` and follow
+it").
+
+Because `tar` still exits 1, a script wrapping the extraction sees a "failure". Check for an
+extracted file instead of trusting the exit code — for example
+`packages\akari-launcher\bin\akari.mjs`.
+
+To have the symlinks created for real, allow symlink creation and extract again:
+
+- Turn on **Developer Mode** (Settings → System → For developers), or run the extraction from
+  a shell started with **Run as administrator**
+- If you clone with git instead, also set `git config --global core.symlinks true` **before**
+  the clone — without it each symlink becomes a plain text file
+
+#### Install the npm dependencies
+
+A fresh checkout has no `node_modules/`, and nothing installs it for you. The CLI packages
+that need external npm packages fail at first use until you do — `template-render`, for
+example, reports (in Japanese) that it could not load `puppeteer-core` and that you should
+run `npm install` in that package's directory:
+
+```
+Error: puppeteer-core を読み込めませんでした。パッケージの依存が入っていない可能性があります。
+  npm install    をこのパッケージのディレクトリで実行してください。
+```
+
+These are the packages with external dependencies. Every other package under `packages/`
+runs on the Node standard library alone (a few declare devDependencies used only to build or
+test them):
+
+| Package | External dependencies | Needed for |
+|---|---|---|
+| `packages/template-render` | `puppeteer-core` | rendering overlay HTML into frames |
+| `packages/render-cut` | `puppeteer-core`, `hyperframes` | the final MP4 export |
+| `packages/bake-layer` | `puppeteer`, `esbuild` | baking overlay layers |
+| `packages/preview-server` | `esbuild` | the browser preview server |
+| `packages/preview-engine` | `@webav/av-cliper`, `@webav/mp4box.js` | the preview playback engine |
+| `packages/media-bin` | none — but its `postinstall` downloads ffmpeg/ffprobe (sha256-verified) | ffmpeg for every media step |
+| `packages/akari-tools` | `puppeteer-core` + the monorepo package `@akari-video/render-cut` | root install only — see below |
+| `packages/export-nle` | the monorepo package `@akari-video/media-bin` | root install only — see below |
+| `apps/shell` | Theia / Electron | the desktop app — see [Windows build guide](./dev/windows-build.md) (Japanese) |
+
+**Everything at once (what the installer runs)** — the repository root declares npm
+workspaces for `packages/*` and `apps/*`, so one install at the root covers them all:
+
+```sh
+cd %USERPROFILE%\.akari\app
+npm install
+```
+
+This also installs the desktop shell (`apps/shell`, Theia + Electron), which builds native
+modules on Windows and needs the prerequisites listed in the
+[Windows build guide](./dev/windows-build.md) (Japanese).
+
+**CLI only** — to skip the desktop shell, install the packages above one by one:
+
+```powershell
+# PowerShell
+foreach ($p in 'template-render','render-cut','bake-layer','preview-server','preview-engine','media-bin') {
+  Push-Location "packages\$p"; npm install; Pop-Location
+}
+```
+
+```sh
+# bash
+for p in template-render render-cut bake-layer preview-server preview-engine media-bin; do
+  (cd "packages/$p" && npm install)
+done
+```
+
+`packages/akari-tools` and `packages/export-nle` depend on other packages of this monorepo
+(`@akari-video/render-cut` / `@akari-video/media-bin`), which are not published to npm — a
+per-package install there fails with `404 Not Found`. Install from the repository root
+instead, where npm workspaces link them locally.
+
+Do not add `--ignore-scripts`: the `postinstall` of `packages/media-bin` is what downloads
+the bundled ffmpeg/ffprobe.
 
 ---
 

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const LAYER_KINDS = new Set(["baked", "video"]);
+const LAYER_KINDS = new Set(["baked", "video", "filter"]);
 const LAYER_BLEND_MODES = new Set([
   "normal",
   "screen",
@@ -19,6 +19,7 @@ const LAYER_BLEND_MODES = new Set([
   "hardlight",
   "softlight",
 ]);
+const LAYER_KEYFRAME_EASINGS = new Set(["linear", "ease-in-out"]);
 
 const usage = "使い方: node packages/schemas/bin/validate-edit.mjs <edit.json>";
 const editArgument = process.argv[2];
@@ -337,9 +338,16 @@ function validateLayers(value) {
       fail(`${label}.duration は 0 より大きい有限数である必要があります`);
     }
     if (!LAYER_KINDS.has(layer.kind)) {
-      fail(`${label}.kind は baked または video である必要があります`);
+      fail(`${label}.kind は baked/video/filter のいずれかである必要があります`);
     }
-    validateNonEmptyString(layer.src, `${label}.src`);
+    if (layer.kind === "filter") {
+      for (const field of ["src", "chroma_key", "blend", "crop", "transform"]) {
+        if (hasOwn(layer, field)) fail(`${label}.${field} は kind が filter のとき使用できません`);
+      }
+      validateLayerFilter(layer.filter, `${label}.filter`);
+    } else {
+      validateNonEmptyString(layer.src, `${label}.src`);
+    }
     if (hasOwn(layer, "opacity")) {
       if (!isFiniteNumber(layer.opacity) || layer.opacity < 0 || layer.opacity > 1) {
         fail(`${label}.opacity は 0 から 1 の範囲の有限数である必要があります`);
@@ -357,11 +365,51 @@ function validateLayers(value) {
       }
       validateLayerChromaKey(layer.chroma_key, `${label}.chroma_key`);
     }
+    if (hasOwn(layer, "crop")) {
+      validateLayerCrop(layer.crop, `${label}.crop`);
+    }
+    if (hasOwn(layer, "perspective")) {
+      validateLayerPerspective(layer.perspective, `${label}.perspective`);
+    }
+    if (hasOwn(layer, "keyframes")) {
+      validateLayerKeyframes(layer.keyframes, `${label}.keyframes`);
+    }
     if (hasOwn(layer, "track")) {
       if (!Number.isInteger(layer.track) || layer.track < 0) {
         fail(`${label}.track は 0 以上の整数である必要があります`);
       }
     }
+  }
+}
+
+function validateLayerFilter(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  const allowedKeysByType = new Map([
+    ["invert", new Set(["type"])],
+    ["lut", new Set(["type", "id", "intensity"])],
+    ["saturation", new Set(["type", "value"])],
+  ]);
+  const allowedKeys = allowedKeysByType.get(value.type);
+  if (allowedKeys === undefined) {
+    fail(`${label}.type は invert/lut/saturation のいずれかである必要があります`);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) fail(`${label} に未知のキーがあります: ${key}`);
+  }
+  if (value.type === "lut") {
+    validateNonEmptyString(value.id, `${label}.id`);
+    if (hasOwn(value, "intensity")
+        && (!isFiniteNumber(value.intensity) || value.intensity < 0 || value.intensity > 1)) {
+      fail(`${label}.intensity は 0 から 1 の範囲の有限数である必要があります`);
+    }
+  }
+  if (value.type === "saturation"
+      && (!isFiniteNumber(value.value) || value.value < 0 || value.value > 3)) {
+    fail(`${label}.value は 0 から 3 の範囲の有限数である必要があります`);
   }
 }
 
@@ -378,6 +426,119 @@ function validateLayerTransform(value, label) {
   if (hasOwn(value, "scale") && (!isFiniteNumber(value.scale) || value.scale <= 0)) {
     fail(`${label}.scale は 0 より大きい有限数である必要があります`);
   }
+}
+
+function validateLayerCrop(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  for (const field of ["x", "y"]) {
+    if (!isFiniteNumber(value[field]) || value[field] < 0 || value[field] > 1) {
+      fail(`${label}.${field} は 0 から 1 の範囲の有限数である必要があります`);
+    }
+  }
+  for (const field of ["w", "h"]) {
+    if (!isFiniteNumber(value[field]) || value[field] <= 0 || value[field] > 1) {
+      fail(`${label}.${field} は 0 より大きく 1 以下の有限数である必要があります`);
+    }
+  }
+  if (isFiniteNumber(value.x) && isFiniteNumber(value.w) && value.x + value.w > 1 + 1e-9) {
+    fail(`${label}.x + ${label}.w は 1 以下である必要があります`);
+  }
+  if (isFiniteNumber(value.y) && isFiniteNumber(value.h) && value.y + value.h > 1 + 1e-9) {
+    fail(`${label}.y + ${label}.h は 1 以下である必要があります`);
+  }
+}
+
+function validateLayerPerspective(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  const corners = value.corners;
+  if (!Array.isArray(corners) || corners.length !== 4) {
+    fail(`${label}.corners は [TL,TR,BL,BR] の 4 要素配列である必要があります`);
+    return;
+  }
+  const names = ["TL", "TR", "BL", "BR"];
+  let allFinite = true;
+  const points = corners.map((corner, index) => {
+    const cornerLabel = `${label}.corners[${index}] (${names[index]})`;
+    if (!Array.isArray(corner) || corner.length !== 2) {
+      fail(`${cornerLabel} は [x, y] の 2 要素配列である必要があります`);
+      allFinite = false;
+      return null;
+    }
+    const [x, y] = corner;
+    if (!isFiniteNumber(x) || x < 0 || x > 1) {
+      fail(`${cornerLabel}.x は 0 から 1 の範囲の有限数である必要があります`);
+      allFinite = false;
+    }
+    if (!isFiniteNumber(y) || y < 0 || y > 1) {
+      fail(`${cornerLabel}.y は 0 から 1 の範囲の有限数である必要があります`);
+      allFinite = false;
+    }
+    return [x, y];
+  });
+  if (!allFinite) return;
+  // 面積ほぼ0（退化四角形）はホモグラフィ計算が特異行列になり得るため拒否する。
+  // シューレース公式は境界を一周する順（TL→TR→BR→BL）で評価する必要があるため
+  // corners のラスタ順（TL,TR,BL,BR）から並べ替える。
+  const [tl, tr, bl, br] = points;
+  const ring = [tl, tr, br, bl];
+  let area2 = 0;
+  for (let i = 0; i < ring.length; i += 1) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[(i + 1) % ring.length];
+    area2 += x1 * y2 - x2 * y1;
+  }
+  if (Math.abs(area2) < 1e-4) {
+    fail(`${label}.corners は退化した四角形（面積がほぼ 0）であってはなりません`);
+  }
+}
+
+// contract-2026-08-09-transform-keyframes-v0.md (layers[].keyframes). Mirrors
+// validateCutFramingKeyframes' t-ascending/no-duplicate discipline, but each point may carry any
+// combination of transform/crop/perspective (or none but t, which is pointless but not invalid --
+// render-cut/preview simply treat it as "no override at this instant", matching the hold semantics
+// documented on #layerKeyframe).
+function validateLayerKeyframes(value, label) {
+  if (!Array.isArray(value) || value.length < 2) {
+    fail(`${label} は 2 件以上の配列である必要があります`);
+    return;
+  }
+  const allowedKeys = new Set(["t", "transform", "crop", "perspective", "easing"]);
+  let previousT = null;
+  value.forEach((point, index) => {
+    const pointLabel = `${label}[${index}]`;
+    if (!isPlainObject(point)) {
+      fail(`${pointLabel} は object である必要があります`);
+      return;
+    }
+    for (const key of Object.keys(point)) {
+      if (!allowedKeys.has(key)) fail(`${pointLabel} に未知のキーがあります: ${key}`);
+    }
+    const hasT = isFiniteNumber(point.t) && point.t >= 0;
+    if (!hasT) {
+      fail(`${pointLabel}.t は 0 以上の有限数である必要があります`);
+    } else if (previousT !== null && point.t <= previousT) {
+      fail(`${label}[].t は昇順かつ重複禁止です（${pointLabel} で違反）`);
+    }
+    if (hasT) previousT = point.t;
+    if (hasOwn(point, "transform")) {
+      validateLayerTransform(point.transform, `${pointLabel}.transform`);
+    }
+    if (hasOwn(point, "crop")) {
+      validateLayerCrop(point.crop, `${pointLabel}.crop`);
+    }
+    if (hasOwn(point, "perspective")) {
+      validateLayerPerspective(point.perspective, `${pointLabel}.perspective`);
+    }
+    if (hasOwn(point, "easing") && !LAYER_KEYFRAME_EASINGS.has(point.easing)) {
+      fail(`${pointLabel}.easing は ${[...LAYER_KEYFRAME_EASINGS].join("/")} のいずれかである必要があります`);
+    }
+  });
 }
 
 function validateLayerChromaKey(value, label) {
@@ -422,6 +583,11 @@ function validateMaster(value) {
   if (hasOwn(value, "loudnorm")) {
     if (!isFiniteNumber(value.loudnorm) || value.loudnorm < -70 || value.loudnorm > 0) {
       fail("audio.master.loudnorm は -70 から 0 の範囲の有限数である必要があります");
+    }
+  }
+  if (hasOwn(value, "true_peak_dbtp")) {
+    if (!isFiniteNumber(value.true_peak_dbtp) || value.true_peak_dbtp < -9 || value.true_peak_dbtp > 0) {
+      fail("audio.master.true_peak_dbtp は -9 から 0 の範囲の有限数である必要があります");
     }
   }
 }
@@ -551,6 +717,22 @@ function validateOutput(value) {
     }
   }
   validateLook(value.look);
+  validateEncoding(value.encoding);
+}
+
+function validateEncoding(value) {
+  if (value === undefined) return;
+  if (!isPlainObject(value)) {
+    fail("output.encoding は object である必要があります");
+    return;
+  }
+  for (const key of Object.keys(value)) if (key !== "quality" && key !== "encoder") fail(`output.encoding に未知のキーがあります: ${key}`);
+  if (hasOwn(value, "quality") && !["master", "high", "standard", "light"].includes(value.quality)) {
+    fail("output.encoding.quality は master/high/standard/light のいずれかである必要があります");
+  }
+  if (hasOwn(value, "encoder") && !["auto", "videotoolbox", "x264"].includes(value.encoder)) {
+    fail("output.encoding.encoder は auto/videotoolbox/x264 のいずれかである必要があります");
+  }
 }
 
 function validateLook(value) {
@@ -674,6 +856,172 @@ function validateCuts(value, version, sources) {
       validateCutTransform(cut.transform, `${label}.transform`);
     }
     validateTransitionOut(cut.transition_out, `${label}.transition_out`);
+    if (hasOwn(cut, "framing")) {
+      validateCutFraming(cut.framing, `${label}.framing`);
+    }
+    validateCutFreeze(cut, label);
+    if (hasOwn(cut, "fx")) {
+      validateCutFxList(cut.fx, `${label}.fx`);
+    }
+  }
+}
+
+// docs/contract-2026-08-05-fx-v0.md: cuts[].fx = [{id, intensity, params?}]。2026-08-11 撤去
+// 以降、id は enum ではなく空でない文字列（presets/fx/ の FX_BUILDERS に未登録の id は
+// render 側が警告 + no-op で通す — ここでは形だけを検証する）。intensity 省略時は render 側の
+// 既定 1 を使うため、ここでは範囲だけを検証する。
+function validateCutFxList(value, label) {
+  if (!Array.isArray(value)) {
+    fail(`${label} は配列である必要があります`);
+    return;
+  }
+  value.forEach((item, index) => validateCutFx(item, `${label}[${index}]`));
+}
+
+function validateCutFx(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  const allowedKeys = new Set(["id", "intensity", "params"]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) {
+      fail(`${label} に未知のキーがあります: ${key}`);
+    }
+  }
+  if (!isNonEmptyString(value.id)) {
+    fail(`${label}.id は空でない文字列である必要があります`);
+  }
+  if (hasOwn(value, "intensity") && (!isFiniteNumber(value.intensity) || value.intensity < 0 || value.intensity > 1)) {
+    fail(`${label}.intensity は 0 から 1 の範囲の有限数である必要があります`);
+  }
+  if (hasOwn(value, "params")) {
+    if (!isPlainObject(value.params)) {
+      fail(`${label}.params は object である必要があります`);
+    } else {
+      if (hasOwn(value.params, "color") && !isNonEmptyString(value.params.color)) {
+        fail(`${label}.params.color は空でない文字列である必要があります`);
+      }
+      for (const key of Object.keys(value.params)) {
+        if (key !== "color") {
+          fail(`${label}.params に未知のキーがあります: ${key}`);
+        }
+      }
+    }
+  }
+}
+
+// docs/contract-2026-07-22-render-basics.md #6 (cuts[].framing). Mirrors validateCutTransform's
+// convention: the schema marks framing/crop/each keyframe point additionalProperties:false, and
+// this hand-written unknown-key loop is what actually enforces it (validate-edit.mjs does not
+// run edit.schema.json through a JSON Schema validator -- see the header comment -- so every
+// constraint the schema documents must also be reproduced here by hand).
+function validateCutFraming(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  const allowedKeys = new Set(["crop", "keyframes"]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) fail(`${label} に未知のキーがあります: ${key}`);
+  }
+  if (hasOwn(value, "crop")) {
+    validateCutCrop(value.crop, `${label}.crop`);
+  }
+  if (hasOwn(value, "keyframes")) {
+    validateCutFramingKeyframes(value.keyframes, `${label}.keyframes`);
+  }
+}
+
+function validateCutCrop(value, label) {
+  if (!isPlainObject(value)) {
+    fail(`${label} は object である必要があります`);
+    return;
+  }
+  const allowedKeys = new Set(["x", "y", "w", "h"]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) fail(`${label} に未知のキーがあります: ${key}`);
+  }
+  for (const field of ["x", "y"]) {
+    if (!isFiniteNumber(value[field]) || value[field] < 0 || value[field] > 1) {
+      fail(`${label}.${field} は 0 から 1 の範囲の有限数である必要があります`);
+    }
+  }
+  for (const field of ["w", "h"]) {
+    if (!isFiniteNumber(value[field]) || value[field] <= 0 || value[field] > 1) {
+      fail(`${label}.${field} は 0 より大きく 1 以下の有限数である必要があります`);
+    }
+  }
+  if (isFiniteNumber(value.x) && isFiniteNumber(value.w) && value.x + value.w > 1 + 1e-9) {
+    fail(`${label} は x + w <= 1（クロップ窓がキャンバス内に収まる）を満たす必要があります`);
+  }
+  if (isFiniteNumber(value.y) && isFiniteNumber(value.h) && value.y + value.h > 1 + 1e-9) {
+    fail(`${label} は y + h <= 1（クロップ窓がキャンバス内に収まる）を満たす必要があります`);
+  }
+}
+
+function validateCutFramingKeyframes(value, label) {
+  if (!Array.isArray(value) || value.length < 2) {
+    fail(`${label} は 2 件以上の配列である必要があります（2 点でズーム・3 点以上で段階縮小）`);
+    return;
+  }
+  const allowedKeys = new Set(["t", "scale", "cx", "cy"]);
+  let previousT = null;
+  value.forEach((point, index) => {
+    const pointLabel = `${label}[${index}]`;
+    if (!isPlainObject(point)) {
+      fail(`${pointLabel} は object である必要があります`);
+      return;
+    }
+    for (const key of Object.keys(point)) {
+      if (!allowedKeys.has(key)) fail(`${pointLabel} に未知のキーがあります: ${key}`);
+    }
+    const hasT = isFiniteNumber(point.t) && point.t >= 0;
+    if (!hasT) {
+      fail(`${pointLabel}.t は 0 以上の有限数である必要があります`);
+    } else if (previousT !== null && point.t <= previousT) {
+      fail(`${label}[].t は昇順かつ重複禁止です（${pointLabel} で違反）`);
+    }
+    if (hasT) previousT = point.t;
+    if (!isFiniteNumber(point.scale) || point.scale <= 0) {
+      fail(`${pointLabel}.scale は 0 より大きい有限数である必要があります`);
+    }
+    for (const field of ["cx", "cy"]) {
+      if (hasOwn(point, field) && (!isFiniteNumber(point[field]) || point[field] < 0 || point[field] > 1)) {
+        fail(`${pointLabel}.${field} は 0 から 1 の範囲の有限数である必要があります`);
+      }
+    }
+  });
+}
+
+// docs/contract-2026-07-22-render-basics.md #7 (cuts[].freeze). at_sec must not exceed the
+// cut's own playable duration -- a sibling-value comparison against in/out/speed that JSON
+// Schema cannot express on its own (mirrors cutSpeed's default in render-cut's
+// cut-timeline.mjs: speed omitted -> 1, so the same default is used here for parity).
+function validateCutFreeze(cut, label) {
+  const value = cut.freeze;
+  if (value === undefined || value === null) return;
+  if (!isPlainObject(value)) {
+    fail(`${label}.freeze は object である必要があります`);
+    return;
+  }
+  const allowedKeys = new Set(["at_sec", "duration_sec"]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) fail(`${label}.freeze に未知のキーがあります: ${key}`);
+  }
+  const hasAt = isFiniteNumber(value.at_sec) && value.at_sec >= 0;
+  if (!hasAt) {
+    fail(`${label}.freeze.at_sec は 0 以上の有限数である必要があります`);
+  }
+  if (!isFiniteNumber(value.duration_sec) || value.duration_sec <= 0) {
+    fail(`${label}.freeze.duration_sec は 0 より大きい有限数である必要があります`);
+  }
+  if (hasAt && isFiniteNumber(cut.in) && isFiniteNumber(cut.out) && cut.out > cut.in) {
+    const speed = isFiniteNumber(cut.speed) && cut.speed > 0 ? cut.speed : 1;
+    const base = (cut.out - cut.in) / speed;
+    if (value.at_sec > base + 1e-9) {
+      fail(`${label}.freeze.at_sec はカットの再生尺（${base}秒）を超えられません`);
+    }
   }
 }
 

@@ -2,7 +2,7 @@
 
 # Skills Catalog
 
-The agent-side workflow of AKARI Video is split into **19 skills** (one per production stage, plus two cross-cutting ones). This page is the single map: what each skill owns, when it triggers, and which external tools and runtimes it connects to.
+The agent-side workflow of AKARI Video is split into **22 skills** (one per production stage, plus two cross-cutting ones). This page is the single map: what each skill owns, when it triggers, and which external tools and runtimes it connects to.
 
 The canonical source for each skill is its `skills/<name>/SKILL.md`. This page is an index; for procedures and hard rules, follow each SKILL.md and the related contracts ([Reference](./README.md#reference)).
 
@@ -21,9 +21,12 @@ The canonical source for each skill is its `skills/<name>/SKILL.md`. This page i
 | [create-project](../skills/create-project/SKILL.md) | Headless project creation (template copy, creation report) | git (initialized only when safe) |
 | [setup-library](../skills/setup-library/SKILL.md) | First-run setup: tool checks → starter-pack proposal → fetch, place, verify | ffmpeg / whisper-cli / headless Chrome (presence checks) |
 | [setup-audio-library](../skills/setup-audio-library/SKILL.md) | Semi-automated BGM / SFX intake (candidate list → manual-download matching → listen and keep/drop) | Free audio sources (humans download) |
+| [declare-audio](../skills/declare-audio/SKILL.md) | Declaring "where the chorus, hits, and beats are" on your own audio, by ear (a browser timeline UI → `declarations.json`). The BGM auto-suggester reads these declarations and cues the chorus | Browser (a human decides the declarations) |
 | [setup-remote](../skills/setup-remote/SKILL.md) | Remote setup: Tailscale doctor → guided install (human-in-the-loop) → tailnet-only HTTPS for the preview server → Taildrop delivery into the workspace inbox → end-to-end check. Never exposes anything to the public internet by default | Tailscale / Taildrop (install & login are done by the human) |
+| [setup-chat-approval](../skills/setup-chat-approval/SKILL.md) | Chat approval setup: doctor → BotFather token issued and stored in credentials.env (human-in-the-loop) → chat-ID allow-list → notification with buttons → a tap updates `decisions.json`. Long polling only: no public endpoint, and free-text messages are never treated as instructions | Telegram Bot API (the token is issued and stored by the human) |
 | [harvest-asset](../skills/harvest-asset/SKILL.md) | Harvesting high-cost deliverables into the asset library | — |
 | [bake-3d](../skills/bake-3d/SKILL.md) | Baking 3D scenes into footage (clips). Creating, tuning, and re-baking `scene.py` recipes | **Blender** (headless, bpy) |
+| [beat-sync-edit](../skills/beat-sync-edit/SKILL.md) | Machine-generating a beat-snapped edit.json plus its overlay set from a "generator", using the declared beats / hits / sections of the audio as the only time source (PVs and showcases where the picture moves with the music) | ffmpeg / ffprobe (declarations are made by a human via declare-audio) |
 
 ### Analysis
 
@@ -68,10 +71,16 @@ The canonical source for each skill is its `skills/<name>/SKILL.md`. This page i
 
 | Path | Purpose | Runtime | Entry point |
 |---|---|---|---|
-| A: Three.js overlay | Live 3D **layered on top of** footage (spinning logos, VideoTexture screens, …) | Transparent canvas + declarative JSON + bundled Three.js | [overlay-authoring/3d.md](../skills/overlay-authoring/3d.md) |
-| B: Blender bake | Animating a 3D scene to produce **footage (a clip) itself** | None (the baked mp4 is ordinary footage) | [bake-3d](../skills/bake-3d/SKILL.md) |
+| A: Three.js overlay (**default**) | 3D in general — composites transparently, can play video on a screen, animates via clips baked into the glb | Transparent canvas + declarative JSON + bundled Three.js | [overlay-authoring/3d.md](../skills/overlay-authoring/3d.md) |
+| B: Blender bake | Looks A cannot produce, cutting the simultaneous scene count, delivering a reusable library clip | None (the baked mp4 is ordinary footage) | [bake-3d](../skills/bake-3d/SKILL.md) |
 
-Routing rule: **if it sits on the timeline as a clip, it's B; if it layers on top of footage, it's A.**
+Routing rule: **A is the default. Choose by the capability you need, not by where the result sits**
+("I want it on the timeline as a clip" is not a reason for B). Pick B only when (1) you need a look the
+declarative runtime cannot produce (depth of field, motion blur, ray-traced reflections, GI, particles),
+(2) you must drop below ~2 simultaneous 3D scenes to stay inside the export's performance budget, or
+(3) you are delivering a reusable clip to the asset library. A baked clip always carries an opaque
+background and costs ~10 minutes to re-bake, so when in doubt start with A and fall back only once
+you are stuck (confirmed in production on 2026-08-04).
 
 Why path B uses Blender (from the contract):
 
@@ -97,6 +106,18 @@ Only runtimes that pass both gates are on board.
 | Lottie / Anime.js / GSAP / TypeGPU / others | ❌ not supported | No generic JS seek hook yet. Any addition is expected to follow the "declarative + trusted runtime" shape (same as the Three.js overlay) |
 
 Note: among the unsupported group, Lottie fits the shape best (assets carry their own timeline and expose an externally controllable playhead). No adoption timeline is set.
+
+## Search the shipped capability surface
+
+Use `akari capability <query> --json` to search the actual tracked skill leaves, contracts, package
+READMEs/manifests, and manifest-declared public CLI entries. Search includes nested Markdown leaves,
+so a query such as `beat-sync` reaches `skills/edit-plan/beat-sync.md`, not only SKILL.md frontmatter.
+
+When a query has zero text matches, `--record-miss` may record the inspected source-set hashes under
+the current project's `.akari/reports/absence/`. Its fixed verdict requires review and always carries
+`approved_to_build:false`; it is evidence of no text match, never permission to add a new capability.
+The CLI works in a checkout and in the npm tarball. A copied Claude plugin without the CLI reports
+capability search as unsupported instead of inventing a second catalog.
 
 ## Related pages
 

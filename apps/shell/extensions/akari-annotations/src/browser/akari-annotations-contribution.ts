@@ -10,6 +10,7 @@ import { DisposableCollection } from '@theia/core/lib/common/disposable';
 import {
     ApplicationShell,
     CommonMenus,
+    FrontendApplication,
     FrontendApplicationContribution,
     WidgetManager
 } from '@theia/core/lib/browser';
@@ -20,6 +21,7 @@ import { WorkspaceService } from '@theia/workspace/lib/browser/workspace-service
 import { WebviewWidget } from '@theia/plugin-ext/lib/main/browser/webview/webview';
 import { inject, injectable } from '@theia/core/shared/inversify';
 import {
+    ADD_MATERIAL_AT_PLAYHEAD,
     ATTACH_AKARI_ANNOTATIONS_PASSIVE,
     OPEN_AKARI_ANNOTATIONS,
     OPEN_AKARI_CANVAS,
@@ -38,6 +40,7 @@ import { AkariInspectorWidget } from './akari-inspector-widget';
 import { AkariReviewBoardWidget } from './akari-review-board-widget';
 import { AkariReviewPanelWidget } from './akari-review-panel-widget';
 import { ProjectLocation } from './project-location';
+import { installRightPanelTabStyle } from './right-panel-tab-style';
 import { ReviewModel } from './review-model';
 
 export { OPEN_AKARI_ANNOTATIONS, OPEN_AKARI_CANVAS, OPEN_AKARI_INSPECTOR, OPEN_AKARI_REVIEW_BOARD, OPEN_AKARI_REVIEW_PANEL };
@@ -45,13 +48,30 @@ export { OPEN_AKARI_ANNOTATIONS, OPEN_AKARI_CANVAS, OPEN_AKARI_INSPECTOR, OPEN_A
 /** キャンバスのアスペクトが取れない場合の既定値（task.md 指示 1）。 */
 const DEFAULT_CANVAS_ASPECT = { w: 1920, h: 1080 };
 
-const SKIPPED_DIRECTORIES = new Set(['.git', '.akari', 'node_modules']);
+// ドットディレクトリ（.git/.akari/.claude 等）と node_modules は名前探索の対象外。
+// スキル同梱の開発用フィクスチャ（.claude/skills/**/dev-fixtures/）を拾わないための除外。
+const isSkippedSearchDirectory = (name: string): boolean => name.startsWith('.') || name === 'node_modules';
 const CANONICAL_ANALYSIS_SUFFIX = '.analysis/analysis.json';
 // akari-preview 側の PREVIEW_PLAYBACK_TICK_EVENT とミラー。
 const PREVIEW_PLAYBACK_TICK_EVENT = 'akari.preview.playbackTick';
 const PREVIEW_OVERLAY_SELECTED_EVENT = 'akari.preview.overlaySelected';
 // akari-preview 側の PREVIEW_LAYER_SELECTED_EVENT とミラー（CF-select）。
 const PREVIEW_LAYER_SELECTED_EVENT = 'akari.preview.layerSelected';
+
+// akari-annotations-widget.ts の同名定数とミラー（拡張内で完結させ、他拡張への npm 依存を作らない）。
+const PARTNER_WIDGET_ID = 'akari-partner-onboarding';
+// 縦アイコンバー固定配置（task.md 指示2）: 注釈を AI とインスペクターの間の rank に置く。
+const REVIEW_PANEL_RANK = 150;
+const INSPECTOR_PANEL_RANK = 200;
+// Theia の SidePanelHandler.setLayoutData()（node_modules/@theia/core 実装を実測）は保存済み
+// レイアウトのタブ順をそのまま tabBar.addTab() で再生するだけで、rank による再ソートをしない。
+// そのため rank 指定だけでは、注釈タブを知らない古い保存済みレイアウトを持つ既存ユーザーで
+// 並びが崩れる（reconcileRightPanelOrder で起動のたびに明示的に揃え直す）。
+const RIGHT_PANEL_FIXED_ORDER: readonly string[] = [
+    PARTNER_WIDGET_ID,
+    AkariReviewPanelWidget.FACTORY_ID,
+    AkariInspectorWidget.FACTORY_ID
+];
 
 interface PreviewOverlaySelection {
     videoUri?: string;
@@ -108,10 +128,12 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
     protected lastPushedAnnotations?: readonly Annotation[];
 
     async onStart(): Promise<void> {
+        installRightPanelTabStyle(this.shell.rightPanelHandler.tabBar);
         await this.workspaceService.ready;
         for (const root of await this.workspaceService.roots) {
             await this.watchForReview(root.resource);
         }
+        await this.ensureReviewPanelTab();
         this.widgetManager.onDidCreateWidget(event => {
             if (event.factoryId !== WebviewWidget.FACTORY_ID || !(event.widget instanceof WebviewWidget)) {
                 return;
@@ -151,6 +173,20 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
         }
     }
 
+    /**
+     * task.md 指示2・制約「アイコンの並び位置は毎回変わらないこと」。rank だけでは保存済み
+     * レイアウトの復元後に順序を保証できない（reconcileRightPanelOrder の JSDoc 参照）ため、
+     * レイアウト初期化の直後と、対象 widget が追加されるたびに明示的に並べ直す。
+     */
+    onDidInitializeLayout(app: FrontendApplication): void {
+        this.reconcileRightPanelOrder();
+        app.shell.onDidAddWidget(widget => {
+            if (RIGHT_PANEL_FIXED_ORDER.includes(widget.id)) {
+                this.reconcileRightPanelOrder();
+            }
+        });
+    }
+
     registerCommands(commands: CommandRegistry): void {
         commands.registerCommand(OPEN_AKARI_ANNOTATIONS, {
             execute: () => this.open()
@@ -175,6 +211,9 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
         });
         commands.registerCommand(SELECT_IMAGE_BLOCK, {
             execute: (blockId: unknown, imageSrc: unknown) => this.handleSelectImageBlock(blockId, imageSrc)
+        });
+        commands.registerCommand(ADD_MATERIAL_AT_PLAYHEAD, {
+            execute: (request: unknown) => this.addMaterialAtPlayhead(request)
         });
         const onPlaybackTick = (event: Event): void => {
             const request = (event as CustomEvent<PreviewPlaybackTick>).detail;
@@ -227,6 +266,39 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
             label: OPEN_AKARI_CANVAS.label,
             order: 'z23'
         });
+    }
+
+    /**
+     * 注釈パネルのタブを縦アイコンバーへ常時固定する（task.md 指示2）。プロジェクトの有無に
+     * 関わらずアイコン自体は毎回同じ位置に存在させ、クリックで開閉できる状態にする —
+     * データ読み込み（location 解決）は開いた後に ReviewModel 側で解決される（widget 側は
+     * location 未設定を許容する設計、akari-review-panel-widget.ts 参照）。activate はしない
+     * （AI パネルの既定表示を奪わない — 排他切り替えの維持、task.md 指示3）。
+     */
+    protected async ensureReviewPanelTab(): Promise<AkariReviewPanelWidget> {
+        const widget = await this.widgetManager.getOrCreateWidget<AkariReviewPanelWidget>(AkariReviewPanelWidget.FACTORY_ID);
+        if (!widget.isAttached) {
+            this.shell.addWidget(widget, { area: 'right', rank: REVIEW_PANEL_RANK });
+        }
+        return widget;
+    }
+
+    /**
+     * 縦アイコンバーの並び順を [AI, 注釈, インスペクター] に固定する（RIGHT_PANEL_FIXED_ORDER
+     * の JSDoc 参照）。`TabBar.insertTab()`（@lumino/widgets 実装を実測確認）は対象の title が
+     * 既にバーにあれば移動するだけで複製しないため、安全に何度でも呼べる冪等な操作。
+     */
+    protected reconcileRightPanelOrder(): void {
+        const tabBar = this.shell.rightPanelHandler.tabBar;
+        let insertAt = 0;
+        for (const id of RIGHT_PANEL_FIXED_ORDER) {
+            const title = Array.from(tabBar.titles).find(candidate => candidate.owner.id === id && !candidate.owner.isDisposed);
+            if (!title) {
+                continue;
+            }
+            tabBar.insertTab(insertAt, title);
+            insertAt++;
+        }
     }
 
     protected async watchForReview(root: URI): Promise<void> {
@@ -403,6 +475,26 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
     }
 
     /**
+     * 素材追加コマンド（ADD_MATERIAL_AT_PLAYHEAD）の受け側（task 2026-08-10-timeline-clip-menu
+     * 指示4・司令塔裁定6）。widget が未オープンなら `open()`（= akari.annotations.open と同じ経路）
+     * で開いてから挿入する。それでも edit.json のロケーションが取れない場合は widget 側の
+     * addMaterialAtPlayhead が messages.warn 1文で誘導する（ここでは「プロジェクト自体が
+     * 見つからない」場合のみ warn する）。引数の型検証（kind/relativePath）は widget 側で行う
+     * （司令塔裁定4・5）。
+     */
+    protected async addMaterialAtPlayhead(request: unknown): Promise<void> {
+        const payload = request as { relativePath?: unknown; kind?: unknown } | undefined;
+        const relativePath = typeof payload?.relativePath === 'string' ? payload.relativePath : '';
+        const kind = typeof payload?.kind === 'string' ? payload.kind : '';
+        const widget = await this.open();
+        if (!widget) {
+            this.messages.warn('プロジェクトを特定できません。タイムラインを開いてから追加してください。');
+            return;
+        }
+        await widget.addMaterialAtPlayhead(relativePath, kind);
+    }
+
+    /**
      * akari-preview の動画オープンから呼ばれる自動アタッチ。フォーカスは奪わない（reveal のみ）。
      * 既にタイムラインが開いていれば何もしない。ユーザーが直近のセッションで明示的に閉じていた
      * 場合も何もしない（アプリ再起動でリセットされる in-memory フラグで判定）。
@@ -461,10 +553,7 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
         if (!timeline) {
             return undefined;
         }
-        const widget = await this.widgetManager.getOrCreateWidget<AkariReviewPanelWidget>(AkariReviewPanelWidget.FACTORY_ID);
-        if (!widget.isAttached) {
-            this.shell.addWidget(widget, { area: 'right', rank: 100 });
-        }
+        const widget = await this.ensureReviewPanelTab();
         await this.shell.activateWidget(widget.id);
         return widget;
     }
@@ -500,7 +589,7 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
         }
         const widget = await this.widgetManager.getOrCreateWidget<AkariInspectorWidget>(AkariInspectorWidget.FACTORY_ID);
         if (!widget.isAttached) {
-            this.shell.addWidget(widget, { area: 'right', rank: 101 });
+            this.shell.addWidget(widget, { area: 'right', rank: INSPECTOR_PANEL_RANK });
         }
         await this.shell.revealWidget(widget.id);
         return widget;
@@ -640,7 +729,7 @@ export class AkariAnnotationsContribution implements CommandContribution, Fronte
             return stat.resource.path.base === name ? stat.resource : undefined;
         }
         const children = [...(stat.children ?? [])]
-            .filter(child => !SKIPPED_DIRECTORIES.has(child.resource.path.base))
+            .filter(child => !isSkippedSearchDirectory(child.resource.path.base))
             .sort((left, right) => left.resource.toString().localeCompare(right.resource.toString()));
         for (const child of children) {
             const found = await this.findFirstNamed(child.resource, name);

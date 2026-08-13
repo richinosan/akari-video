@@ -6,6 +6,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SOURCE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CAPTURE_TIMEOUT_MS = 60_000;
+// タイムアウト診断で持ち回る量。多すぎるとログが埋まるので直近だけ残す。
+const PAGE_MESSAGE_LIMIT = 20;
+const RECENT_FRAME_LIMIT = 5;
+
+// シートに埋まった 3D シーン宣言の数。負荷起因のタイムアウトかを一目で判断する材料。
+function countThreeDimensionalScenes(sheetPath) {
+  try {
+    return readFileSync(sheetPath, "utf8").split("data-akari-3d-scene").length - 1;
+  } catch {
+    return 0;
+  }
+}
 const THREE_BUNDLE_PATH = resolve(
   SOURCE_DIRECTORY,
   "../../overlay-runtime/src/vendor/three-bundle.js",
@@ -13,6 +25,15 @@ const THREE_BUNDLE_PATH = resolve(
 const THREE_RUNTIME_PATH = resolve(
   SOURCE_DIRECTORY,
   "../../overlay-runtime/src/three-runtime.js",
+);
+// texts[]（troika-three-text 経由の 3D テキスト）を含むシートだけ追加で読み込む。
+// 読み込み順は three-bundle.js → vendor-3d-text-bundle.js を厳守する
+// （overlay-runtime/README.md「単一 three インスタンス制約への対応」— troika は
+// vendored three を alias 解決するため、three-bundle.js が先に window.AkariThree.THREE を
+// 作っていないと壊れる）
+const THREE_TEXT_BUNDLE_PATH = resolve(
+  SOURCE_DIRECTORY,
+  "../../overlay-runtime/src/vendor/vendor-3d-text-bundle.js",
 );
 const THREE_SCENE_SCRIPT_PATTERN = /(<script\b(?=[^>]*\btype\s*=\s*(?:"application\/json"|'application\/json'))(?=[^>]*\bdata-akari-3d-scene\b)[^>]*>)([\s\S]*?)(<\/script\s*>)/giu;
 const TEXTURE_MIME_TYPES = new Map([
@@ -37,23 +58,41 @@ const TEXTURE_MIME_TYPES = new Map([
 // 数分ぶんに相当し、実運用のプロキシは通るが 4K マスターは通らない目安。
 // 埋め込みは base64（約 1.37 倍）になり、プレビューは毎 tick これをシークする
 const MAX_VIDEO_TEXTURE_BYTES = 24 * 1024 * 1024;
+// texts[].font の埋め込み用 MIME。troika は XMLHttpRequest(responseType:"arraybuffer") で読んで
+// 自前パーサへ渡すだけなので実行上は無関係だが、data URI の型として正しい値を残す
+const FONT_MIME_TYPES = new Map([
+  [".otf", "font/otf"],
+  [".ttf", "font/ttf"],
+]);
 
 export function renderOverlaySheet({ overlays, edit, projectRoot, duration }) {
   const orderedOverlays = orderOverlaysByTrack(overlays);
   const hasThreeDimensionalOverlay = orderedOverlays.some((overlay) =>
     overlay.html.includes("data-akari-3d-scene"),
   );
+  // texts[] を含む宣言だけ vendor-3d-text-bundle.js（troika-three-text）を追加で読み込む。
+  // 素朴な文字列検査で足りるのは、他フラグ（hasResolvedSingleLineCaption 等）と同じ判断
+  const hasThreeDimensionalTextOverlay = hasThreeDimensionalOverlay
+    && orderedOverlays.some((overlay) =>
+      overlay.html.includes("data-akari-3d-scene") && overlay.html.includes('"texts"'),
+    );
   const sheetOverlays = hasThreeDimensionalOverlay
     ? orderedOverlays.map((overlay) => ({
         ...overlay,
         html: embedThreeModels(overlay.html, projectRoot, overlay.id),
       }))
     : orderedOverlays;
+  const hasResolvedSingleLineCaption = sheetOverlays.some((overlay) =>
+    overlay.html.includes("akari-caption--single-line"),
+  );
   const nodes = sheetOverlays
     .map((overlay, index) => renderOverlayNode(overlay, index))
     .join("\n");
+  const threeTextBundleScript = hasThreeDimensionalTextOverlay
+    ? `\n  <script>${inlineScript(readFileSync(THREE_TEXT_BUNDLE_PATH, "utf8"))}</script>`
+    : "";
   const threeRuntimeScripts = hasThreeDimensionalOverlay
-    ? `\n  <script>${inlineScript(readFileSync(THREE_BUNDLE_PATH, "utf8"))}</script>\n  <script>${inlineScript(readFileSync(THREE_RUNTIME_PATH, "utf8"))}</script>`
+    ? `\n  <script>${inlineScript(readFileSync(THREE_BUNDLE_PATH, "utf8"))}</script>${threeTextBundleScript}\n  <script>${inlineScript(readFileSync(THREE_RUNTIME_PATH, "utf8"))}</script>`
     : "";
   // 3D は「動画テクスチャのシークが終わってから」描く。ここで描いてしまうと <video> がまだ
   // 前フレームの絵のままテクスチャへ上がり、同じ時刻でも直前に何を撮ったかで結果が変わる。
@@ -79,6 +118,9 @@ export function renderOverlaySheet({ overlays, edit, projectRoot, duration }) {
     : "";
   const threeReadyWait = hasThreeDimensionalOverlay
     ? `\n      await Promise.all(threeContainers.map(waitForThreeContainer));`
+    : "";
+  const captionFontReadyWait = hasResolvedSingleLineCaption
+    ? `\n      await document.fonts.load('600 82px "AKARI Noto Sans JP"');\n      if (!document.fonts.check('600 82px "AKARI Noto Sans JP"')) {\n        throw new Error('AKARI caption font did not load');\n      }`
     : "";
   return `<!doctype html>
 <html>
@@ -254,7 +296,7 @@ ${nodes}
       return { warnings };
     };${threeReadySetup}
     window.__akariReady = (async function() {
-      await document.fonts.ready;
+      await document.fonts.ready;${captionFontReadyWait}
       await Promise.all(Array.from(document.images).map((image) => image.decode().catch(() => {})));${threeReadyWait}
       await Promise.all(Array.from(document.querySelectorAll('video')).map((video) =>
         video.readyState >= 2
@@ -301,6 +343,8 @@ export async function captureWithPuppeteer({
   let screenshotMilliseconds = 0;
   let browser = null;
   let watchdogExpired = false;
+  const pageMessages = [];
+  const recentFrameMilliseconds = [];
   try {
     browser = await withTimeout(
       puppeteer.launch({
@@ -323,6 +367,21 @@ export async function captureWithPuppeteer({
     );
     browserLaunched = performance.now();
     const page = await withTimeout(browser.newPage(), timeoutMs, "opening a Puppeteer page");
+    // タイムアウトしたとき「固まった」のか「単に遅い」のかを事後に切り分けられるよう、
+    // ページ側の声と直近フレームの所要時間を握っておく（2026-08-04 PV ドッグフーディングで、
+    // 診断が無いまま同じ症状を 3 回別々の原因に誤診した — 相関で犯人を決めさせないための材料）。
+    if (typeof page.on === "function") {
+      page.on("pageerror", (error) => {
+        pageMessages.push(`pageerror: ${String(error).slice(0, 200)}`);
+        if (pageMessages.length > PAGE_MESSAGE_LIMIT) pageMessages.shift();
+      });
+      page.on("console", (message) => {
+        const type = message.type();
+        if (type !== "error" && type !== "warning") return;
+        pageMessages.push(`console.${type}: ${message.text().slice(0, 200)}`);
+        if (pageMessages.length > PAGE_MESSAGE_LIMIT) pageMessages.shift();
+      });
+    }
     page.setDefaultTimeout(timeoutMs);
     page.setDefaultNavigationTimeout(timeoutMs);
     await withTimeout(
@@ -367,10 +426,28 @@ export async function captureWithPuppeteer({
         `capturing frame ${frame + 1}`,
       );
       screenshotMilliseconds += performance.now() - screenshotStarted;
+      recentFrameMilliseconds.push(Math.round(performance.now() - seekStarted));
+      if (recentFrameMilliseconds.length > RECENT_FRAME_LIMIT) recentFrameMilliseconds.shift();
     }
     frameLoopFinished = performance.now();
   } catch (error) {
     watchdogExpired = isTimeoutError(error);
+    if (watchdogExpired) {
+      // 「遅くて 60 秒に触れた」のか「ページごと固着した」のかは、直前フレームの所要時間が
+      // 伸びていたかどうかで読める。3D シーン数も併記して、負荷起因かを一目で判断できるようにする。
+      const trend = recentFrameMilliseconds.length > 0
+        ? `recent frame times: ${recentFrameMilliseconds.join("ms, ")}ms`
+        : "no frame completed before the timeout";
+      const scenes = countThreeDimensionalScenes(sheetPath);
+      const voices = pageMessages.length > 0
+        ? `; page said: ${pageMessages.slice(-3).join(" | ")}`
+        : "; the page reported no errors or warnings";
+      onWarning?.(
+        `rasterizer timed out (${trend}; 3D scenes: ${scenes}${voices}). `
+        + "Rising frame times mean the composition is too heavy for this machine's software WebGL — "
+        + "reduce simultaneous 3D scenes or the output resolution.",
+      );
+    }
     throw error;
   } finally {
     await terminateBrowser(browser, { force: watchdogExpired, timeoutMs });
@@ -549,11 +626,11 @@ export async function compositeAnimatedOverlay({
     "-i",
     overlayPath,
     "-filter_complex",
-    "[0:v][1:v]overlay=0:0:format=auto:shortest=1[outv]",
+    "[0:v][1:v]overlay=0:0:format=auto:shortest=1[composited];[composited]scale=out_range=tv[outv]",
     "-map",
     "[outv]",
     ...(hasAudio ? ["-map", "0:a:0"] : []),
-    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
     "-pix_fmt",
     "yuv420p",
     ...(hasAudio ? ["-c:a", "copy"] : ["-an"]),
@@ -590,15 +667,16 @@ export async function compositeStaticOverlays({
     );
     previous = next;
   }
+  filters.push(`${previous}scale=out_range=tv[outv]`);
   args.push(
     "-filter_complex",
     filters.join(";"),
     "-map",
-    previous,
+    "[outv]",
     ...(hasAudio ? ["-map", "0:a:0"] : []),
     "-t",
     formatNumber(duration),
-    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
     "-pix_fmt",
     "yuv420p",
     ...(hasAudio ? ["-c:a", "copy"] : ["-an"]),
@@ -696,13 +774,25 @@ export function parseFfmpegOutTime(value) {
 
 function renderOverlayNode(overlay, index) {
   const transform = overlay.transform ?? {};
+  // 2026-08-07 オーナー裁定: role==="background" は
+  // ずらせない・必ずフレームを埋める種別。--x/--y/--scale/--rotate を無条件で恒等値へ
+  // ロックする（transform も vars 経由の抜け道も無視する。edit-lint が同じ 2 条件を
+  // データ側で弾くが、host 側でも二重にロックして「事故で黒が出る」を構造的に潰す。
+  // preview-server の app.js / shell の overlay-runtime.js の mount と同じロック）。
+  const isBackground = overlay.role === "background";
   const variables = {
-    "--x": `${transform.x ?? 0}px`,
-    "--y": `${transform.y ?? 0}px`,
-    "--scale": String(transform.scale ?? 1),
-    "--rotate": `${transform.rotate ?? 0}deg`,
+    "--x": isBackground ? "0px" : `${transform.x ?? 0}px`,
+    "--y": isBackground ? "0px" : `${transform.y ?? 0}px`,
+    "--scale": isBackground ? "1" : String(transform.scale ?? 1),
+    "--rotate": isBackground ? "0deg" : `${transform.rotate ?? 0}deg`,
     ...(overlay.vars ?? {}),
   };
+  if (isBackground) {
+    variables["--x"] = "0px";
+    variables["--y"] = "0px";
+    variables["--scale"] = "1";
+    variables["--rotate"] = "0deg";
+  }
   const style = Object.entries(variables)
     .map(([name, value]) => `${name}:${String(value).replaceAll(";", "")}`)
     .join(";");
@@ -727,18 +817,51 @@ function embedThreeModels(html, projectRoot, overlayId) {
       if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) {
         throw new TypeError(`3D overlay ${overlayId} scene declaration must be a JSON object`);
       }
-      if (typeof descriptor.model !== "string" || descriptor.model.length === 0) {
+      // texts[] があれば model は任意（three-runtime.js readDescriptor と同じ緩和。
+      // contract-2026-08-12-3d-text-rail.md §3.1）
+      const hasTexts = Array.isArray(descriptor.texts) && descriptor.texts.length > 0;
+      if (descriptor.model !== undefined
+        && (typeof descriptor.model !== "string" || descriptor.model.length === 0)) {
         throw new TypeError(`3D overlay ${overlayId} scene model must be a relative path`);
       }
-      if (descriptor.model.startsWith("/") || /^[a-z][a-z\d+.-]*:/i.test(descriptor.model)) {
+      if (descriptor.model === undefined && !hasTexts) {
         throw new TypeError(`3D overlay ${overlayId} scene model must be a relative path`);
       }
-      const modelPath = resolve(projectRoot, descriptor.model);
-      const model = readFileSync(modelPath);
-      const embeddedDescriptor = {
-        ...descriptor,
-        model: `data:model/gltf-binary;base64,${model.toString("base64")}`,
-      };
+      if (typeof descriptor.model === "string"
+        && (descriptor.model.startsWith("/") || /^[a-z][a-z\d+.-]*:/i.test(descriptor.model))) {
+        throw new TypeError(`3D overlay ${overlayId} scene model must be a relative path`);
+      }
+      const embeddedDescriptor = { ...descriptor };
+      if (typeof descriptor.model === "string") {
+        const modelPath = resolve(projectRoot, descriptor.model);
+        const model = readFileSync(modelPath);
+        embeddedDescriptor.model = `data:model/gltf-binary;base64,${model.toString("base64")}`;
+      }
+      if (hasTexts) {
+        embeddedDescriptor.texts = descriptor.texts.map((textDescriptor) => {
+          const font = textDescriptor.font;
+          if (typeof font !== "string"
+            || font.length === 0
+            || font.startsWith("/")
+            || /^[a-z][a-z\d+.-]*:/i.test(font)) {
+            throw new TypeError(
+              `3D overlay ${overlayId} texts.${textDescriptor.id}.font must be a relative path`,
+            );
+          }
+          const extension = extname(font).toLowerCase();
+          const mimeType = FONT_MIME_TYPES.get(extension);
+          if (!mimeType) {
+            throw new TypeError(
+              `3D overlay ${overlayId} texts.${textDescriptor.id}.font has an unsupported type: ${extension || "none"}`,
+            );
+          }
+          const fontFile = readFileSync(resolve(projectRoot, font));
+          return {
+            ...textDescriptor,
+            font: `data:${mimeType};base64,${fontFile.toString("base64")}`,
+          };
+        });
+      }
       if (descriptor.environment?.map !== undefined) {
         const map = descriptor.environment.map;
         if (typeof map !== "string"

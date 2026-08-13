@@ -4,6 +4,7 @@ import { dirname, resolve } from 'path';
 import { pathToFileURL } from 'url';
 import URI from '@theia/core/lib/common/uri';
 import { AkariNewProjectService } from '../common/akari-new-project-protocol';
+import { detectTools } from './tool-detection';
 
 /** `packages/project-scaffold/src/index.mjs` が export する部分のうち、このサービスが使う範囲だけの型。 */
 interface ProjectScaffoldModule {
@@ -16,7 +17,8 @@ interface ProjectScaffoldModule {
 
 /**
  * `packages/creator-root/src/index.mjs` が export する部分のうち、adopt メソッド
- * （U5・task 2026-08-03-home-v5-terms）が使う範囲だけの型。
+ * （U5・task 2026-08-03-home-v5-terms）と ensure メソッド（無 root 対応・
+ * task 2026-08-04-home-no-root-flow）が使う範囲だけの型。
  */
 interface CreatorRootModule {
     adoptProject(
@@ -24,6 +26,16 @@ interface CreatorRootModule {
         projectDir: string,
         options?: { channel?: string }
     ): Promise<{ destinationDir: string; channel: string; moveMethod: string }>;
+    defaultRootPath(env?: NodeJS.ProcessEnv, options?: { platform?: NodeJS.Platform }): string;
+    createCreatorRoot(
+        targetDir: string,
+        options?: { channelName?: string }
+    ): Promise<{ rootDir: string; manifest: unknown; created: boolean }>;
+    updateMachinePointer(
+        rootDir: string,
+        env?: NodeJS.ProcessEnv,
+        options?: { platform?: NodeJS.Platform }
+    ): Promise<{ lastRoot: string; updatedAt: string }>;
 }
 
 /**
@@ -107,6 +119,56 @@ export class AkariNewProjectServiceImpl implements AkariNewProjectService {
         return importEsm<CreatorRootModule>(pathToFileURL(candidate).toString());
     }
 
+    // --- 無 root 対応（task 2026-08-04-home-no-root-flow） ----------------------
+
+    /**
+     * 作業場が 1 つも解決できない状態で「チャンネルに入れる」が押されたときの ensure。
+     * `packages/creator-root` の `createCreatorRoot(defaultRootPath())` +
+     * `updateMachinePointer()` を、`adoptProject` と同じ動的 import の流儀でそのまま
+     * 呼ぶだけ（ロジックは複製しない・creator-root は読み取り専用の契約は不変）。
+     * 既に有効な作業場が既定パスにあれば `createCreatorRoot` 自体が冪等に no-op で
+     * 返す（新規作成の場合と同じ経路で安全に呼べる）。
+     * 成功時は作成/解決した作業場ルートの `file://` URI 文字列を返す。
+     */
+    async ensureCreatorRoot(): Promise<string> {
+        const creatorRoot = await this.loadCreatorRootModule();
+        try {
+            const targetDir = creatorRoot.defaultRootPath();
+            const createResult = await creatorRoot.createCreatorRoot(targetDir);
+            await creatorRoot.updateMachinePointer(createResult.rootDir);
+            return pathToFileURL(createResult.rootDir).toString();
+        } catch (error) {
+            throw new Error(this.describeEnsureError(error));
+        }
+    }
+
+    async checkTools() {
+        return detectTools();
+    }
+
+    /**
+     * `CreatorRootError.code` を 1 行の日本語メッセージへ変換する（`describeAdoptError`
+     * と同型）。UI から「作業場」の語を追放する裁定（U1）にあわせ、ここでは
+     * 「チャンネルの置き場」と呼ぶ。
+     */
+    protected describeEnsureError(error: unknown): string {
+        const code = typeof error === 'object' && error !== null && 'code' in error
+            ? String((error as { code?: unknown }).code)
+            : undefined;
+        switch (code) {
+            case 'ROOT_MANIFEST_INVALID_JSON':
+            case 'ROOT_MANIFEST_UNKNOWN_SCHEMA':
+                return 'チャンネルの置き場を確認できませんでした（データの場所の中身を確認してください）。';
+            case 'EACCES':
+            case 'EPERM':
+                return 'チャンネルの置き場を作る権限がありませんでした。';
+            default:
+                return error instanceof Error
+                    ? `チャンネルの置き場の作成に失敗しました（${error.message}）。`
+                    : 'チャンネルの置き場の作成に失敗しました。';
+        }
+    }
+
     /**
      * `packages/creator-root` の `CreatorRootError.code`（判別可能なエラーコード）を
      * 1 行の日本語メッセージへ変換する。未知のコード・素の fs エラー（`EBUSY` 等）は
@@ -151,8 +213,17 @@ export class AkariNewProjectServiceImpl implements AkariNewProjectService {
         return marker ? resolve(dirname(marker), '..') : undefined;
     }
 
+    /**
+     * スキーマ原本の場所。リポジトリでは `packages/schemas/`、パッケージ済み .app では
+     * `prepackage`（copy-native-helpers.mjs）が写した `lib/schemas/` に居る
+     * （`packages/` 階層は付かない = 前者のパターンでは当たらない）。両方を試す。
+     * 見つからないと `createProject` は analysis.schema.json の同梱だけを黙って
+     * 落とす（project-scaffold の installProjectSkills 側の契約）ため、ここが
+     * 空振りしても作成自体は成功してしまう — だからこそ後段の検知が難しい。
+     */
     protected async resolveSchemasDir(): Promise<string | undefined> {
-        const marker = await this.findUpwardFile('packages/schemas/analysis.schema.json');
+        const marker = (await this.findUpwardFile('packages/schemas/analysis.schema.json'))
+            ?? (await this.findUpwardFile('schemas/analysis.schema.json'));
         return marker ? dirname(marker) : undefined;
     }
 

@@ -1,3 +1,5 @@
+import { ReviewToolMode } from './review-tool-mode';
+
 export const AKARI_PREVIEW_SERVICE_PATH = '/services/akari-preview';
 export const AkariPreviewService = Symbol('AkariPreviewService');
 
@@ -52,10 +54,33 @@ export interface ResolveHevcProxyRequest {
     projectRootUri: string;
 }
 
+export interface ProbeAudioPresenceRequest {
+    videoUri: string;
+}
+
+// hasAudio is undefined when ffprobe is unavailable or the probe itself failed — the caller
+// must not treat "unknown" as "silent" (see hevc-proxy.ts's probeHasAudioStream doc comment).
+export interface ProbeAudioPresenceResult {
+    hasAudio: boolean | undefined;
+}
+
 export type ReviewSessionTransportEvent =
     | { recT: number; type: 'play' | 'pause' | 'tick'; timelineT: number }
     | { recT: number; type: 'seek'; from: number; to: number }
     | { recT: number; type: 'rate'; value: number };
+
+// docs/contract-2026-08-11-review-session-ui-events.md #1: passive UI recording (M1) + M2 tool
+// mode. target follows the #2 vocabulary (panel:<id> / tab:<id> / timeline:cut:<n> /
+// timeline:overlay:<id> / asset:<path>). intent is set true only while the select tool (M2,
+// ReviewToolMode 'select') is active -- see ReviewSessionRecorder.handleUiClick. tool.mode fires
+// once per actual mode switch (ReviewSessionRecorder.setToolMode).
+export type ReviewSessionUiEvent =
+    | { recT: number; type: 'ui.click'; target: string; label: string; intent?: boolean }
+    | { recT: number; type: 'ui.tab'; target: string; label: string }
+    | { recT: number; type: 'ui.panel'; target: string; label: string }
+    | { recT: number; type: 'tool.mode'; mode: ReviewToolMode };
+
+export type ReviewSessionEvent = ReviewSessionTransportEvent | ReviewSessionUiEvent;
 
 export interface StartReviewSessionRequest {
     projectRootUri: string;
@@ -73,7 +98,7 @@ export interface StartReviewSessionResult {
 
 export interface AppendReviewSessionEventRequest {
     sessionDir: string;
-    event: ReviewSessionTransportEvent;
+    event: ReviewSessionEvent;
 }
 
 export interface AppendReviewSessionAudioRequest {
@@ -87,15 +112,31 @@ export interface ReviewStrokeFrame {
     cutIndex: number | null;
 }
 
-export interface ReviewStroke {
+interface ReviewStrokeBase {
     id: string;
-    tool: 'pen';
     space: 'content-rect';
     recTStart: number;
     recTEnd: number;
     frame: ReviewStrokeFrame;
+}
+
+export interface ReviewPenStroke extends ReviewStrokeBase {
+    tool: 'pen';
     points: Array<[number, number]>;
 }
+
+// task.md 指示4: the rect tool lands through the same session stroke pipeline as pen (additive
+// `tool` discriminant), using box: [x,y,w,h] normalized 0-1 -- the same shape as review.json's
+// region.box (docs/contract-2026-07-20-review-json-v1-annotation-model.md §2), so a future
+// landing into an annotation record's targetKind:"region" needs no reshaping. Choice documented
+// in report.md: session-level capture only for M2 (no automatic review.json annotation record --
+// matches how pen strokes already work today).
+export interface ReviewRectStroke extends ReviewStrokeBase {
+    tool: 'rect';
+    box: [number, number, number, number];
+}
+
+export type ReviewStroke = ReviewPenStroke | ReviewRectStroke;
 
 export interface AppendReviewSessionStrokeRequest {
     sessionDir: string;
@@ -124,11 +165,14 @@ export interface ReviewSessionSummary {
 }
 
 // HEVC (H.265) is not reliably decodable on Windows without a paid Store add-on (see the
-// win portability audit §HEVC プレビュー in the internal repo), so
-// akari-preview lazily transcodes a local H.264 proxy on first preview request and reuses it on
-// a size+mtime cache hit. This runs on all platforms (not just win32) so the behavior is
-// identical everywhere and macOS gets the same test coverage as the platform that actually needs
-// it.
+// win portability audit §HEVC プレビュー in the internal repo). task/2026-08-09-drop-hevc-proxy:
+// measurement showed <video> hardware-decodes HEVC fine on the platforms tested, so this is no
+// longer invoked proactively on open — resolveHevcProxy is called exactly once per source, only
+// after the browser side observes an actual <video> playback failure (MEDIA_ERR_DECODE /
+// MEDIA_ERR_SRC_NOT_SUPPORTED). See AkariPreviewOpenHandler.handleHevcFallbackRequest. The
+// resulting proxy is cached (size+mtime keyed) and reused for the rest of the app session. This
+// runs on all platforms (not just win32) so the behavior is identical everywhere and macOS gets
+// the same test coverage as the platform that actually needs it.
 export type ResolveHevcProxyUnavailableReason =
     | 'ffprobe-not-found'
     | 'ffmpeg-not-found'
@@ -159,6 +203,24 @@ export interface LintEditCandidateResult {
     errors: string[];
 }
 
+export interface ResolveCaptionDisplayRequest {
+    captionsUri: string;
+    editUri: string;
+}
+
+export interface ResolvedCaptionDisplayPayload {
+    schema: 'caption-layout/v1';
+    captions: Array<{
+        id: string;
+        source_cue_id: string;
+        start: number;
+        end: number;
+        text: string;
+        text_style?: Record<string, unknown>;
+        style_vars?: Record<string, string>;
+    }>;
+}
+
 export interface AkariPreviewService {
     getOverlayRuntimeAssets(): Promise<OverlayRuntimeAssets>;
     createVideoStream(request: VideoStreamRequest): Promise<VideoStreamReference>;
@@ -168,6 +230,7 @@ export interface AkariPreviewService {
     transcodeAudioToWav(request: TranscodeAudioRequest): Promise<TranscodeAudioResult>;
     disposeTranscodedAudioStream(id: string): Promise<void>;
     resolveHevcProxy(request: ResolveHevcProxyRequest): Promise<ResolveHevcProxyResult>;
+    probeAudioPresence(request: ProbeAudioPresenceRequest): Promise<ProbeAudioPresenceResult>;
     startReviewSession(request: StartReviewSessionRequest): Promise<StartReviewSessionResult>;
     appendReviewSessionEvent(request: AppendReviewSessionEventRequest): Promise<void>;
     appendReviewSessionAudio(request: AppendReviewSessionAudioRequest): Promise<void>;
@@ -175,4 +238,5 @@ export interface AkariPreviewService {
     endReviewSession(request: EndReviewSessionRequest): Promise<void>;
     listReviewSessions(request: ListReviewSessionsRequest): Promise<ReviewSessionSummary[]>;
     lintEditCandidate(request: LintEditCandidateRequest): Promise<LintEditCandidateResult>;
+    resolveCaptionDisplay(request: ResolveCaptionDisplayRequest): Promise<ResolvedCaptionDisplayPayload | null>;
 }

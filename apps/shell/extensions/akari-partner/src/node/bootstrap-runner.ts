@@ -66,6 +66,36 @@ export function bootstrapRunner(): void {
         ];
     }
 
+    function scriptInstallCandidates(executableName: string, extraCandidates: string[] = []): string[] {
+        const pathDirectories = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+        const pathNames = process.platform === 'win32'
+            ? (process.env.PATHEXT ?? '')
+                .split(';')
+                .map(extension => extension.trim())
+                .filter(Boolean)
+                .map(extension => `${executableName}${extension.toLowerCase()}`)
+            : [executableName];
+        const candidateNames = pathNames.length > 0
+            ? pathNames
+            : [`${executableName}.exe`, `${executableName}.cmd`, `${executableName}.bat`];
+        const candidates = candidateNames.map(name => path.join(os.homedir(), '.local', 'bin', name));
+        for (const extraCandidate of extraCandidates) {
+            if (process.platform === 'win32' && path.extname(extraCandidate) === '') {
+                for (const name of candidateNames) {
+                    candidates.push(path.join(path.dirname(extraCandidate), name));
+                }
+            } else {
+                candidates.push(extraCandidate);
+            }
+        }
+        for (const directory of pathDirectories) {
+            for (const name of candidateNames) {
+                candidates.push(path.join(directory, name));
+            }
+        }
+        return candidates;
+    }
+
     async function request(url: string, accept = 'application/octet-stream'): Promise<Buffer> {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -174,6 +204,120 @@ export function bootstrapRunner(): void {
         }
         console.log(`Codex を ${executable} にインストールしました`);
         return { executablePath: executable, reused: false };
+    }
+
+    type ScriptInstallAgent = 'opencode' | 'copilot' | 'cursor' | 'antigravity' | 'grok';
+
+    interface ScriptInstallAgentConfig {
+        agent: ScriptInstallAgent;
+        executableName: string;
+        installUrlEnvVar: string;
+        defaultInstallUrl: string;
+        defaultInstallUrlWin32?: string;
+        extraCandidatePaths: string[];
+        manualInstallCommand: string;
+    }
+
+    const scriptInstallAgentConfigs: Record<ScriptInstallAgent, ScriptInstallAgentConfig> = {
+        opencode: {
+            agent: 'opencode',
+            executableName: 'opencode',
+            installUrlEnvVar: 'AKARI_PARTNER_OPENCODE_INSTALL_URL',
+            defaultInstallUrl: 'https://opencode.ai/install',
+            extraCandidatePaths: [path.join(os.homedir(), '.opencode', 'bin', 'opencode')],
+            manualInstallCommand: 'curl -fsSL https://opencode.ai/install | bash（または npm install -g opencode-ai）'
+        },
+        copilot: {
+            agent: 'copilot',
+            executableName: 'copilot',
+            installUrlEnvVar: 'AKARI_PARTNER_COPILOT_INSTALL_URL',
+            defaultInstallUrl: 'https://gh.io/copilot-install',
+            extraCandidatePaths: [],
+            manualInstallCommand: 'npm install -g @github/copilot'
+        },
+        cursor: {
+            agent: 'cursor',
+            executableName: 'cursor-agent',
+            installUrlEnvVar: 'AKARI_PARTNER_CURSOR_INSTALL_URL',
+            defaultInstallUrl: 'https://cursor.com/install',
+            extraCandidatePaths: [],
+            manualInstallCommand: 'curl https://cursor.com/install -fsS | bash'
+        },
+        antigravity: {
+            agent: 'antigravity',
+            executableName: 'agy',
+            installUrlEnvVar: 'AKARI_PARTNER_ANTIGRAVITY_INSTALL_URL',
+            defaultInstallUrl: 'https://antigravity.google/cli/install.sh',
+            defaultInstallUrlWin32: 'https://antigravity.google/cli/install.ps1',
+            extraCandidatePaths: [],
+            manualInstallCommand: 'curl -fsSL https://antigravity.google/cli/install.sh | bash'
+        },
+        grok: {
+            agent: 'grok',
+            executableName: 'grok',
+            installUrlEnvVar: 'AKARI_PARTNER_GROK_INSTALL_URL',
+            defaultInstallUrl: 'https://x.ai/cli/install.sh',
+            defaultInstallUrlWin32: 'https://x.ai/cli/install.ps1',
+            extraCandidatePaths: [],
+            manualInstallCommand: 'curl -fsSL https://x.ai/cli/install.sh | bash（または npm install -g @xai-official/grok）'
+        }
+    };
+
+    async function runScriptInstaller(config: ScriptInstallAgentConfig): Promise<BootstrapOutcome> {
+        const candidates = scriptInstallCandidates(config.executableName, config.extraCandidatePaths);
+        if (!forceReinstall) {
+            const existing = await firstExecutable(candidates);
+            if (existing) {
+                console.log(`既存の ${config.agent} を検出: ${existing}`);
+                return { executablePath: existing, reused: true };
+            }
+        }
+        const installUrl = process.env[config.installUrlEnvVar]
+            || (process.platform === 'win32' ? config.defaultInstallUrlWin32 : config.defaultInstallUrl);
+        if (!installUrl) {
+            throw new Error(`${config.agent} はこの環境で自動インストールできません。手動でインストールしてください: ${config.manualInstallCommand}`);
+        }
+
+        console.log(`${config.agent} installer を取得しています: ${installUrl}`);
+        let script: Buffer;
+        try {
+            script = await request(installUrl, 'text/plain');
+        } catch (error) {
+            throw new Error(`${config.agent} のインストーラー取得に失敗しました。手動でインストールしてください: ${config.manualInstallCommand} (${error instanceof Error ? error.message : String(error)})`);
+        }
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `akari-${config.agent}-`));
+        try {
+            console.log(`${config.agent} をユーザー領域へインストールしています`);
+            try {
+                if (process.platform === 'win32') {
+                    const installer = path.join(tempDir, 'install.ps1');
+                    await fs.writeFile(installer, script);
+                    const powershell = path.join(
+                        process.env.SystemRoot || 'C:\\Windows',
+                        'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'
+                    );
+                    await run(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', installer], {
+                        ...process.env
+                    });
+                } else {
+                    const installer = path.join(tempDir, 'install.sh');
+                    await fs.writeFile(installer, script, { mode: 0o700 });
+                    await run('/bin/sh', [installer], {
+                        ...process.env,
+                        PATH: explicitSystemPath
+                    });
+                }
+            } catch (error) {
+                throw new Error(`${config.agent} のインストールに失敗しました。手動でインストールしてください: ${config.manualInstallCommand} (${error instanceof Error ? error.message : String(error)})`);
+            }
+            const executable = await firstExecutable(candidates);
+            if (!executable) {
+                throw new Error(`インストールスクリプトは完了しましたが実行ファイルが見つかりませんでした。手動でインストールしてください: ${config.manualInstallCommand}`);
+            }
+            return { executablePath: executable, reused: false };
+        } finally {
+            await fs.rm(tempDir, { recursive: true, force: true });
+        }
     }
 
     function codexAssetName(): string {
@@ -312,10 +456,18 @@ export function bootstrapRunner(): void {
 
     async function main(): Promise<void> {
         const agent = process.argv[process.argv.length - 1];
-        if (agent !== 'claude' && agent !== 'codex') {
-            throw new Error('expected bootstrap target: claude or codex');
+        if (agent !== 'claude' && agent !== 'codex' && agent !== 'opencode'
+            && agent !== 'copilot' && agent !== 'cursor' && agent !== 'antigravity' && agent !== 'grok') {
+            throw new Error('expected bootstrap target: claude, codex, opencode, copilot, cursor, antigravity, or grok');
         }
-        const outcome = agent === 'claude' ? await runClaudeInstaller() : await installCodexBinary();
+        let outcome: BootstrapOutcome;
+        if (agent === 'claude') {
+            outcome = await runClaudeInstaller();
+        } else if (agent === 'codex') {
+            outcome = await installCodexBinary();
+        } else {
+            outcome = await runScriptInstaller(scriptInstallAgentConfigs[agent]);
+        }
         if (agent === 'claude') {
             try {
                 await wirePluginSkills(outcome.executablePath);

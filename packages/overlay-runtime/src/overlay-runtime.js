@@ -6,6 +6,12 @@ window.akari.runtime = (() => {
   const mountedOverlays = [];
   let mountedStage = null;
 
+  // packages/overlay-runtime/package.json の version と同期させる。ブラウザに
+  // <script> で直接読み込まれるホスト（npm 解決を経ない）が、mount 済みの
+  // window.akari.runtime.version から機能検出できるようにする（例: 0.2.0 以降 =
+  // 多層テキスト断片の data-mirror 同期に対応。P0-R 契約 §4）。
+  const RUNTIME_VERSION = "0.2.0";
+
   function finiteNumber(value, fallback) {
     const number = Number(value);
     return Number.isFinite(number) ? number : fallback;
@@ -43,9 +49,18 @@ window.akari.runtime = (() => {
       const transform = overlay.transform ?? {};
       const container = document.createElement("div");
 
+      // 2026-08-07 オーナー裁定: role==="background" は
+      // ずらせない・必ずフレームを埋める種別。--x/--y/--scale/--rotate を無条件で恒等値へ
+      // ロックする（transform も vars 経由の抜け道も無視する。preview-server の app.js の
+      // mount・render-cut の rasterize.mjs の renderOverlayNode と同じロック）。
+      const isBackground = overlay.role === "background";
+
       container.dataset.overlayId = String(overlay.id);
       container.dataset.start = String(start);
       container.dataset.duration = String(duration);
+      if (overlay.role !== undefined && overlay.role !== null) {
+        container.dataset.role = String(overlay.role);
+      }
       container.style.position = "absolute";
       container.style.inset = "0";
       container.style.pointerEvents = "auto";
@@ -57,15 +72,25 @@ window.akari.runtime = (() => {
         }
       }
 
-      container.style.setProperty("--x", `${finiteNumber(transform.x, 0)}px`);
-      container.style.setProperty("--y", `${finiteNumber(transform.y, 0)}px`);
-      container.style.setProperty("--scale", String(finiteNumber(transform.scale, 1)));
-      container.style.setProperty("--rotate", `${finiteNumber(transform.rotate, 0)}deg`);
+      container.style.setProperty("--x", isBackground ? "0px" : `${finiteNumber(transform.x, 0)}px`);
+      container.style.setProperty("--y", isBackground ? "0px" : `${finiteNumber(transform.y, 0)}px`);
+      container.style.setProperty("--scale", isBackground ? "1" : String(finiteNumber(transform.scale, 1)));
+      container.style.setProperty("--rotate", isBackground ? "0deg" : `${finiteNumber(transform.rotate, 0)}deg`);
       container.style.transform =
         "translate(var(--x,0px), var(--y,0px)) " +
         "scale(var(--scale,1)) rotate(var(--rotate,0deg))";
 
       container.innerHTML = overlay.html ?? "";
+
+      // 多層テキスト断片のミラー層（縁取り・影・裏打ち等でテキストを複製した層。
+      // interaction.js のテキスト編集同期対象）を支援技術・検索から隠す。断片は
+      // script を持たない前提のため、mount 時にランタイムが一括付与する
+      // （skills/overlay-authoring/telop.md「多層テキスト断片と data-mirror 規約」・
+      // P0-R 契約 §2）。
+      for (const mirror of container.querySelectorAll('[data-mirror="text"]')) {
+        mirror.setAttribute("aria-hidden", "true");
+      }
+
       fragment.appendChild(container);
       mountedOverlays.push({
         container,
@@ -143,5 +168,5 @@ window.akari.runtime = (() => {
     }
   }
 
-  return { mount, tick, unmount };
+  return { mount, tick, unmount, version: RUNTIME_VERSION };
 })();

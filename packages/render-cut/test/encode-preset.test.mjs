@@ -7,6 +7,7 @@ import {
   QUALITY_PRESETS,
   resetVideotoolboxCacheForTests,
   resolveEncoderChoice,
+  resolveEncodingPolicy,
 } from "../src/encode-preset.mjs";
 
 function fakeSpawnSync({ hasEncoder = true, smokeOk = true } = {}) {
@@ -29,10 +30,48 @@ test("buildVideoEncodeArgs returns null (keep legacy literal args) when neither 
   assert.equal(buildVideoEncodeArgs({ quality: undefined, encoderChoice: null }), null);
 });
 
+test("resolveEncodingPolicy keeps legacy null and records per-field CLI/edit precedence", () => {
+  assert.equal(resolveEncodingPolicy({ edit: { output: {} } }), null);
+  const policy = resolveEncodingPolicy({
+    cli: { quality: "high" },
+    edit: { output: { encoding: { quality: "light", encoder: "x264" } } },
+    capabilities: { ffmpegCommand: "unused" },
+  });
+  assert.deepEqual(policy.requested.quality, { value: "high", origin: "cli" });
+  assert.deepEqual(policy.requested.encoder, { value: "x264", origin: "edit" });
+  assert.match(policy.video_encode_args.join(" "), /-crf 18/u);
+});
+
+test("only output.encoding opts in; an unknown root encoding field is never used as a policy backdoor", () => {
+  assert.equal(resolveEncodingPolicy({
+    edit: { encoding: { quality: "master", encoder: "x264" }, output: {} },
+  }), null);
+  const policy = resolveEncodingPolicy({
+    edit: {
+      encoding: { quality: "light", encoder: "videotoolbox" },
+      output: { encoding: { quality: "master", encoder: "x264" } },
+    },
+  });
+  assert.deepEqual(policy.requested, {
+    quality: { value: "master", origin: "edit" },
+    encoder: { value: "x264", origin: "edit" },
+  });
+  assert.deepEqual(policy.video_encode_args, ["-c:v", "libx264", "-profile:v", "high", "-preset", "slow", "-crf", "15", "-color_range", "tv"]);
+});
+
+test("master is x264 CRF15 slow and rejects explicit auto/videotoolbox", () => {
+  const policy = resolveEncodingPolicy({ edit: { output: { encoding: { quality: "master" } } } });
+  assert.deepEqual(policy.effective.encoder, { value: "x264", origin: "master-required" });
+  assert.deepEqual(policy.video_encode_args, ["-c:v", "libx264", "-profile:v", "high", "-preset", "slow", "-crf", "15", "-color_range", "tv"]);
+  for (const encoder of ["auto", "videotoolbox"]) {
+    assert.throws(() => resolveEncodingPolicy({ cli: { quality: "master", encoder }, edit: { output: {} } }), /requires x264/u);
+  }
+});
+
 test("buildVideoEncodeArgs standard quality matches libx264's own defaults (crf 23 / preset medium)", () => {
   assert.equal(QUALITY_PRESETS.standard.crf, 23);
   const args = buildVideoEncodeArgs({ quality: "standard", encoderChoice: null });
-  assert.deepEqual(args, ["-c:v", "libx264", "-profile:v", "high", "-preset", "medium", "-crf", "23"]);
+  assert.deepEqual(args, ["-c:v", "libx264", "-profile:v", "high", "-preset", "medium", "-crf", "23", "-color_range", "tv"]);
 });
 
 test("buildVideoEncodeArgs high/light quality map to crf 18/26", () => {
@@ -46,7 +85,7 @@ test("buildVideoEncodeArgs high/light quality map to crf 18/26", () => {
 
 test("buildVideoEncodeArgs videotoolbox engine uses bitrate instead of crf/preset", () => {
   const args = buildVideoEncodeArgs({ quality: "high", encoderChoice: { engine: "videotoolbox" } });
-  assert.deepEqual(args, ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-b:v", "12M", "-profile:v", "high"]);
+  assert.deepEqual(args, ["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-b:v", "12M", "-profile:v", "high", "-color_range", "tv"]);
   assert.ok(!args.includes("-crf"));
   assert.ok(!args.includes("-preset"));
 });

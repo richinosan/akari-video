@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "@akari-video/shell",
-  "version": "0.1.3",
+  "version": "0.1.9",
   "description": "AKARI Video shell — Theia Electron app, S-A shell foundation (tabshell v0 contract).",
   "dependencies": {
     "@theia/core": "1.73.1",
@@ -28,7 +28,8 @@
     "akari-preview": "file:./extensions/akari-preview",
     "akari-transcript": "file:./extensions/akari-transcript",
     "akari-annotations": "file:./extensions/akari-annotations",
-    "akari-theme": "file:./extensions/akari-theme"
+    "akari-theme": "file:./extensions/akari-theme",
+    "electron-updater": "^6.8.9"
   },
   "devDependencies": {
     "@electron/asar": "^3.4.1",
@@ -69,7 +70,7 @@
   },
   "scripts": {
     "prebuild": "node resources/scripts/ensure-file-deps-linked.mjs",
-    "build:ext": "tsc -b extensions/akari-shell-strip extensions/akari-surfaces extensions/akari-project extensions/akari-partner extensions/akari-tabs extensions/akari-preview extensions/akari-annotations extensions/akari-transcript extensions/akari-theme",
+    "build:ext": "tsc -b extensions/akari-shell-strip extensions/akari-project extensions/akari-surfaces extensions/akari-partner extensions/akari-tabs extensions/akari-preview extensions/akari-annotations extensions/akari-transcript extensions/akari-theme",
     "build": "npm run build:ext && theia build --mode production",
     "lint": "eslint \"extensions/*/src/**/*.{ts,tsx}\"",
     "start": "theia start --plugins=local-dir:plugins",
@@ -131,8 +132,44 @@
         ]
       },
       {
+        "from": "../../packages/asset-resolver",
+        "to": "packages/asset-resolver",
+        "filter": [
+          "package.json",
+          "bin/**/*",
+          "src/**/*"
+        ]
+      },
+      {
         "from": "resources/vendor-ffmpeg",
         "to": "media-bin"
+      },
+      {
+        "from": "../../packages/audio-library-setup/shared",
+        "to": "packages/audio-library-setup/shared"
+      },
+      {
+        "from": "../../packages/media-bin/src",
+        "to": "packages/media-bin/src"
+      },
+      {
+        "from": "../../packages/edit-store/lib",
+        "to": "packages/edit-store/lib"
+      },
+      {
+        "from": "../../packages/schemas",
+        "to": "packages/schemas",
+        "filter": [
+          "captions.schema.json",
+          "bin/validate-asset.mjs"
+        ]
+      },
+      {
+        "from": "../../presets/textanim",
+        "to": "presets/textanim",
+        "filter": [
+          "index.jsonl"
+        ]
       }
     ],
     "mac": {
@@ -141,7 +178,8 @@
       "entitlements": "resources/entitlements.mac.plist",
       "entitlementsInherit": "resources/entitlements.mac.plist",
       "target": "dir",
-      "category": "public.app-category.video"
+      "category": "public.app-category.video",
+      "artifactName": "shell-mac.${ext}"
     },
     "win": {
       "icon": "resources/icons/icon.png",
@@ -151,12 +189,30 @@
       "oneClick": true,
       "perMachine": false,
       "runAfterFinish": true,
-      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "artifactName": "shell-win-setup.${ext}",
       "shortcutName": "AKARI Video"
     },
     "linux": {
       "icon": "resources/icons/icon.png",
       "target": "dir"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "AkariLabs",
+      "repo": "akari-video"
     }
+  },
+  "allowScripts": {
+    "electron@39.8.7": true,
+    "drivelist@12.0.2": true,
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.24.2": true,
+    "keytar@7.9.0": true,
+    "msgpackr-extract@3.0.4": true,
+    "native-keymap@2.5.0": true,
+    "node-pty@1.2.0-beta.12": true,
+    "puppeteer@25.1.0": true,
+    "@parcel/watcher@2.6.0": true,
+    "@theia/ffmpeg@1.73.1": true
   }
 }

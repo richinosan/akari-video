@@ -8,13 +8,21 @@
 
 - **BGM・ジングルは全量 AKARI Sounds**。外部フリー配布元の BGM 候補は廃止しました
 - **効果音は AKARI Sounds が既定 + 外部で補完**。AKARI Sounds に無い系統（拍手・歓声 / 失敗音の日本のお約束 / 和風・バトル打撃 / フォーリー）だけ外部候補・既存エントリを使います
-- 自社 GitHub Release が配布主体のため**一括ダウンロード可**。動線は `akari` 初回起動時の
-  [Y/n] 1 問（既定 Yes・生涯 1 回）または `akari sounds`
-  （実体: `node packages/audio-library-setup/bin/fetch-akari-sounds.mjs`。
+- 自社 GitHub Release が配布主体のため**一括ダウンロード可**。既定の動線は**必要な曲だけの
+  オンデマンド取得**（`packages/asset-resolver` の `akari-assets fetch <id>`。2026-08-04 に
+  初回起動の [Y/n] 一括取得を廃止 — 初期 400MB を落とさない）。一括で欲しい場合は
+  `akari sounds`（実体: `node packages/audio-library-setup/bin/fetch-akari-sounds.mjs`。
   手順: [`skills/setup-audio-library/first-party.md`](../../skills/setup-audio-library/first-party.md)）
 - **BGM の選曲は自動提案 CLI が起点**: `node packages/audio-library-setup/bin/suggest-bgm.mjs --tone <トーン>`
   （表現選定と同じ 8 語彙 × 系統対応表 × 体感 BPM の決定論ランキング。編集フローでの使い方:
   [`skills/edit-plan/report-guide.md`](../../skills/edit-plan/report-guide.md) §素材計画）
+- **宣言（サビ・キメ・拍）は自分で付けられる**: `node packages/audio-library-setup/bin/declare-helper.mjs`
+  → ブラウザのタイムライン画面で耳で付けて `<ライブラリ>/declarations.json` へ保存
+  （スキル: [`skills/declare-audio/`](../../skills/declare-audio/SKILL.md)）。
+  AKARI Sounds の曲は AKARI Store の宣言パック（耳検証済み・版ごと買い切り）でも入る
+- **効果音・ジングルは「場面の意味」から**: `node packages/audio-library-setup/bin/suggest-sfx.mjs --meaning <意味>`
+  （14 語の意味語彙 → 宣言表。AKARI Sounds に無い意味は本カタログの外部補完エントリへ誘導。
+  対応表の耳レビューは `bin/review-sfx-mapping.mjs`）
 
 ## 音源セットアップ（補完分・半自動ドロップフォルダ方式）
 

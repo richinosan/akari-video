@@ -31,11 +31,44 @@ akari
         （PATH に opencode が無ければ、インストール案内を出して終了する）
 ```
 
-サブコマンド: `akari update`（更新確認）/ `akari init`（作業場の作成・確認のみ）/
-`akari sounds [--variant wav] [--force]`（公式音源の一括ダウンロード。プロンプトなし・headless 可）。
+install.sh 経由インストール（`~/.akari/app`）では、新版の検知・裏 staging DL・sha256 検証・
+次回起動時の自動適用がすべて既定で走る（`AKARI_NO_AUTO_UPDATE=1` で無効化可）。起動を
+ブロックすることは無く、適用は次回起動の頭でアトミックにスワップする（`src/update-check.mjs`
+の `maybeStageInBackground` / `maybeApplyPendingUpdateOnLaunch`、実体は `src/self-update.mjs`
+の `stageSelfUpdate` / `swapStagedApp`）。
+
+サブコマンド: `akari update`（オンデマンドの確認・適用。install.sh 経由インストールなら
+DL・sha256 検証・適用まで実行。それ以外（npm グローバル / git checkout）や旧フィードでは
+更新案内のみ表示。`--rollback` で直前 1 世代へ戻す。`src/self-update.mjs`）/
+`akari init`（作業場の作成・確認のみ）/
+`akari new <target-dir> [--template <path>]`（新規プロジェクト作成）/
+`akari narration generate ...`（VOICEVOX / fal-qwen3 ナレーション生成）/
+`akari internal beat-sync-<beatmap|probe-frame|render-when-idle> ...`（beat-sync-edit 内部実行物）/
+`akari sounds [--variant wav] [--force]`（公式音源の一括ダウンロード。プロンプトなし・headless 可）/
+`akari store <connect|status|download|disconnect>`（AKARI Store 連携。マイページで発行した
+接続トークンを `~/.akari/store-credentials.json`（0600）に保存し、購入済み一覧の確認と
+配布物の取得ができる。`src/store-command.mjs`）/
+`akari assets <list|fetch|sync|...>`（素材カタログの一覧・取得・同期。
+`packages/asset-resolver` の CLI への薄い委譲で、カタログ合成・entitlements 判定・
+sha256 検証・fail-closed は resolver 側の責務のまま。`src/assets-command.mjs`）。
 
 `akari` に渡した引数はそのまま `opencode` に転送する（例: `akari --continue` は
 `opencode --continue` を起動する）。
+
+## 状態・受理・能力検索
+
+```sh
+akari status [project-path] --json
+akari status [project-path] --full --json
+akari accept [project-path]                         # 実 TTY でのみ対話記録
+akari capability <query> --json
+akari capability <query> --record-miss --json      # 0 hit のときだけ absence receipt
+```
+
+fast status は現在工程を決定的に返すが、最終受理を true にしない。full status だけが immutable
+render receipt の全 input / output と人間受理 event を再検証し、`release.accepted:true` を返せる。
+`accept` が作るのは協調的ローカル運用の人間操作記録であり、暗号学的な本人署名ではない。
+capability の 0 hit receipt は `approved_to_build:false` 固定で、新設許可を意味しない。
 
 ## 3 入口の対応表
 
@@ -49,7 +82,7 @@ AKARI Video は「同じファイル契約（`.akari/` 配下の JSON）に収�
 | アプリ | 接続ボタン（AKARI Video アプリ） | アプリの「はじめる」画面から接続 → はじめかた選択 |
 
 3 つとも最終的に同じもの（`.akari/connections.json` / `.akari/intake.json` /
-`skills/create-project`）を読み書きするため、どの入口から始めても続きは他の入口から
+`akari new` が使う共通 project-scaffold）を読み書きするため、どの入口から始めても続きは他の入口から
 再開できる。
 
 ## インストール
@@ -71,18 +104,11 @@ npm i -g akari-video && akari
 npx akari-video
 ```
 
-`package.json` は `"private": true` のままにしてある（誤って publish されることを防ぐ
-セーフティネット）。実際に npm へ配信する契約が別途 approve されたときに、まず
-この 1 行を外すところから始める。
-
 ## 既知の制約
 
-- **配布パッケージとしての自己完結性は未整備**: `akari` はスキル正本・
-  `templates/project-default`・`packages/schemas` を、自分の checkout 位置からの
-  相対パスで解決する（`skills/create-project/bin/create-project.mjs` と同じ方式）。
-  これはこのリポジトリの checkout 内で実行される前提であり、npm レジストリ経由で
-  単体インストールされた場合にこれらのアセットを同梱する build/vendor 手順はまだ
-  実装していない（マーケットプレイス配布・審査は上位契約 §7 でスコープ外）。
+- npm tarball は追跡済み skills・雛形・schemas と capability source set を `vendor/` に同梱する。
+  Claude plugin の status は単体コピーでも動くが、skill symlink と CLI capability は checkout / CLI
+  の有無に依存し、利用不能なら明示的に unsupported とする。
 - Windows での動作は未検証（`claude.exe` / `claude.cmd` の探索ロジックはあるが
   実機確認していない）。
 

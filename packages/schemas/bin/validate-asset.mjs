@@ -24,6 +24,11 @@ const metaPath = path.join(assetDir, "meta.json");
 const previewPath = path.join(assetDir, "preview.png");
 const errors = [];
 
+// fragment.html 内の <script type="application/json" data-akari-3d-scene> 宣言を抽出する
+// （属性の順序は問わない。packages/render-cut/src/render-inputs.mjs の THREE_SCENE_SCRIPT_PATTERN と同じ流儀）。
+const SCENE_DECLARATION_PATTERN =
+  /<script\b(?=[^>]*\btype\s*=\s*(?:"application\/json"|'application\/json'))(?=[^>]*\bdata-akari-3d-scene\b)[^>]*>([\s\S]*?)<\/script\s*>/iu;
+
 if (!isDirectory(assetDir)) {
   fail(`素材ディレクトリが見つかりません: ${assetDir}`);
   finish();
@@ -68,9 +73,19 @@ function validateMeta(value) {
     "license",
     "price",
   ];
-  // source / remote / matched_by / version / min_app_version は任意フィールド。
-  // 後方互換のため必須フィールドには加えない（version は 2026-07-30 導入で、既存エントリは未設定）。
-  const optionalFields = ["source", "remote", "matched_by", "version", "min_app_version"];
+  // source / remote / matched_by / version / min_app_version / min_overlay_runtime_version / motion_presets は
+  // 任意フィールド。後方互換のため必須フィールドには加えない（version は 2026-07-30 導入で、既存エントリは未設定。
+  // min_overlay_runtime_version は 2026-08-06 層ミラー規約の導入で新設。motion_presets は同日 laptop-live-asset
+  // タスクで新設 — scene3d ライブ経路の glb 内蔵クリップ一覧を機械可読にする）。
+  const optionalFields = [
+    "source",
+    "remote",
+    "matched_by",
+    "version",
+    "min_app_version",
+    "min_overlay_runtime_version",
+    "motion_presets",
+  ];
   const allowedFields = [...requiredFields, ...optionalFields];
   for (const field of requiredFields) {
     if (!hasOwn(value, field)) fail(`必須フィールドがありません: ${field}`);
@@ -114,6 +129,13 @@ function validateMeta(value) {
     fail("min_app_version は x.y.z 形式である必要があります");
   }
 
+  if (
+    hasOwn(value, "min_overlay_runtime_version") &&
+    !/^\d+\.\d+\.\d+$/.test(String(value.min_overlay_runtime_version))
+  ) {
+    fail("min_overlay_runtime_version は x.y.z 形式である必要があります");
+  }
+
   const matchedByValues = new Set(["title-normalized"]);
   if (hasOwn(value, "matched_by") && !matchedByValues.has(value.matched_by)) {
     fail(`matched_by は ${[...matchedByValues].join(" / ")} のいずれかである必要があります`);
@@ -129,6 +151,34 @@ function validateMeta(value) {
   if (isRemote && !hasOwn(value, "source")) {
     fail("remote: true のエントリには source ブロックが必須です");
   }
+
+  if (hasOwn(value, "motion_presets")) {
+    validateMotionPresets(value.motion_presets);
+  }
+}
+
+function validateMotionPresets(motionPresets) {
+  if (!Array.isArray(motionPresets) || motionPresets.length === 0) {
+    fail("motion_presets は 1 件以上の配列である必要があります");
+    return;
+  }
+
+  const presetFields = ["clip", "label", "note"];
+  motionPresets.forEach((preset, index) => {
+    if (!isPlainObject(preset)) {
+      fail(`motion_presets[${index}] は object である必要があります`);
+      return;
+    }
+    for (const field of presetFields) {
+      if (!hasOwn(preset, field)) fail(`motion_presets[${index}].${field} は必須です`);
+    }
+    for (const field of Object.keys(preset)) {
+      if (!presetFields.includes(field)) fail(`motion_presets[${index}].${field} は未定義のフィールドです`);
+    }
+    validateNonEmptyString(preset.clip, `motion_presets[${index}].clip`);
+    validateNonEmptyString(preset.label, `motion_presets[${index}].label`);
+    validateNonEmptyString(preset.note, `motion_presets[${index}].note`);
+  });
 }
 
 function validateSource(source) {
@@ -357,7 +407,11 @@ function validateFiles() {
     if (hasFragment === hasScene) {
       fail("scene3d 素材は fragment.html（オーバーレイ）か scene.py（ベイクレシピ）のどちらか一方を実体に持つ必要があります");
     }
-    if (hasFragment && !payloadFiles.some((filePath) => /\.(?:glb|gltf)$/i.test(filePath))) {
+    if (
+      hasFragment &&
+      requiresGltfModel(path.join(assetDir, "fragment.html")) &&
+      !payloadFiles.some((filePath) => /\.(?:glb|gltf)$/i.test(filePath))
+    ) {
       fail("scene3d 素材には glTF 実体（.glb または .gltf）が必要です");
     }
   }
@@ -366,6 +420,47 @@ function validateFiles() {
     if (/\.(?:html?|css|svg|m?js|cjs)$/i.test(filePath)) validateLocalReferences(filePath);
     else if (/\.gltf$/i.test(filePath)) validateGltfReferences(filePath);
   }
+}
+
+// data-akari-3d-scene 宣言が model を持たず、かつ非空の texts[] を持つときだけ glb を任意化する
+// （overlay-runtime/src/three-runtime.js の readDescriptor と同じ判定。texts[] も model も
+// 無い宣言・宣言を読めない場合は従来どおり glb を必須のまま扱う＝安全側デフォルト）。
+function requiresGltfModel(fragmentPath) {
+  const descriptor = readSceneDeclaration(fragmentPath);
+  if (descriptor === null) return true;
+  const hasModel = descriptor.model !== undefined;
+  const hasNonEmptyTexts = Array.isArray(descriptor.texts) && descriptor.texts.length > 0;
+  return hasModel || !hasNonEmptyTexts;
+}
+
+function readSceneDeclaration(fragmentPath) {
+  let source;
+  try {
+    source = fs.readFileSync(fragmentPath, "utf8");
+  } catch (error) {
+    fail(`fragment.html を読めません: ${messageOf(error)}`);
+    return null;
+  }
+
+  const match = source.match(SCENE_DECLARATION_PATTERN);
+  if (!match) {
+    fail('fragment.html に <script type="application/json" data-akari-3d-scene> 宣言が見つかりません');
+    return null;
+  }
+
+  let descriptor;
+  try {
+    descriptor = JSON.parse(match[1]);
+  } catch (error) {
+    fail(`data-akari-3d-scene の JSON を読めません: ${messageOf(error)}`);
+    return null;
+  }
+
+  if (!isPlainObject(descriptor)) {
+    fail("data-akari-3d-scene は JSON object である必要があります");
+    return null;
+  }
+  return descriptor;
 }
 
 function validatePng(filePath) {

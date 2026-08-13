@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import {
   access,
   mkdir,
@@ -8,16 +8,42 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import os from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { createRequire } from "node:module";
 
 import { renderLintReport } from "./report.mjs";
+import { deriveTracks } from "./derive-tracks.mjs";
+import { musicGrid } from "../../audio-library-setup/shared/beat-grid.mjs";
 import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
+
+const { resolveCaptionDisplay } = createRequire(import.meta.url)("../../edit-store/lib/index.js");
 
 const VERSION = 1;
 const EPSILON = 1e-6;
+const CAPTIONS_SCHEMA = JSON.parse(readFileSync(
+  new URL("../../schemas/captions.schema.json", import.meta.url),
+  "utf8",
+));
+const CAPTION_TEXT_STYLE_FIELDS = new Set(
+  Object.keys(CAPTIONS_SCHEMA.$defs.textStyle.properties),
+);
+const CAPTION_ANIMATION_SLOTS = new Set(
+  Object.keys(CAPTIONS_SCHEMA.$defs.textAnimation.properties),
+);
+const CAPTION_ANIMATION_SLOT_FIELDS = new Set(
+  Object.keys(CAPTIONS_SCHEMA.$defs.textAnimationSlot.properties),
+);
+const CAPTION_TEXTANIM_IDS = new Set(
+  readFileSync(new URL("../../../presets/textanim/index.jsonl", import.meta.url), "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line).id),
+);
 const USAGE = `Usage: edit-lint <project-root|edit.json path> [--media] [--json]
        [--silence-error-seconds N] [--max-volume-error-db N]
        [--caption-silence-warn-percent N]
+       [--declarations PATH]
 
 Exit codes: 0 PASS, 1 FAIL, 2 execution error`;
 
@@ -158,6 +184,12 @@ export async function lintProject(input, options = {}) {
   const structure = validateEditStructure(edit, findings, paths);
   const sourcePath = structure.sourcePath;
   const referenceState = await validateReferences(edit, findings, paths);
+  // docs/contract-2026-08-12-still-image-cut-source-v0.md: ffprobe never reports format.duration
+  // for a bare still image, so probeDuration() below would throw ExecutionError (a positive-
+  // duration assertion) and crash the whole lint run with exit code 2 instead of a normal
+  // PASS/FAIL verdict. Skip the probe for a still-image source entirely; sourceDuration staying
+  // null is exactly what validateCuts already treats as "no source-duration bound to check".
+  const sourceIsStillImage = edit?.version === 0 && isImageCutSourcePath(edit?.source?.path);
   let sourceDuration =
     edit?.version === 0 ? extractAnalysisDuration(analysisState.value) : null;
 
@@ -165,7 +197,8 @@ export async function lintProject(input, options = {}) {
     edit?.version === 0 &&
     sourceDuration === null &&
     sourcePath &&
-    referenceState.sourceExists
+    referenceState.sourceExists &&
+    !sourceIsStillImage
   ) {
     sourceDuration = probeDuration(sourcePath, options.ffprobeCommand);
   }
@@ -173,7 +206,9 @@ export async function lintProject(input, options = {}) {
     addSkipped(
       skipped,
       "cuts.source-duration",
-      sourcePath
+      sourceIsStillImage
+        ? "source duration is unavailable because source.path is a still image (no intrinsic duration; declare the display duration via cuts)"
+        : sourcePath
         ? "source duration is unavailable because the source reference cannot be read"
         : "source duration is unavailable because source.path is invalid",
     );
@@ -189,6 +224,7 @@ export async function lintProject(input, options = {}) {
   );
   validateCutTrackFields(edit.cuts, findings);
   validateCutTransformFields(edit.cuts, findings);
+  validateStillImageCuts(edit, findings);
   const cutTrackSegments = computeCutTrackSegments(edit.cuts);
   for (const segment of findTrackOverlaps(cutTrackSegments)) {
     addFinding(findings, {
@@ -199,18 +235,31 @@ export async function lintProject(input, options = {}) {
       range: { start: segment.start, end: segment.end },
     });
   }
+  validateCutTrackRenderSupport(edit, cutTrackSegments, findings);
   validateDurationMaximum(edit.outputs, timeline, findings, paths);
   validateOutputAxisDurationMax(edit.outputs, cutTrackSegments, findings);
   await validateOverlays(edit.overlays, timeline, findings, paths);
+  validateOverlayBackgroundRole(edit.overlays, findings);
   await validateNarration(edit?.audio?.narration, timeline, findings, paths);
   await validateBgmSfx(edit?.audio?.bgm, edit?.audio?.sfx, timeline, findings, paths);
+  await validateMusicGrid(
+    edit?.audio?.bgm,
+    edit?.audio?.sfx,
+    timeline,
+    findings,
+    skipped,
+    paths,
+    options,
+  );
   validateSfxTracks(edit?.audio?.sfx, findings);
   validateAudioMaster(edit?.audio?.master, findings, "edit.json#audio.master");
+  validateOutputEncoding(edit?.output?.encoding, findings, "edit.json#output.encoding");
   validateLayerTracks(edit.layers, findings);
   validateBeats(edit.beats, edit.version, structure.sourceIds, findings);
   validateEmphasisWords(edit.emphasis_words, edit.version, structure.sourceIds, findings);
   validateDirection(edit.direction, findings);
   validateTimelineTracks(edit, findings);
+  validateTrackTransitionOutCompatibility(edit, findings);
 
   if (captionsState.value !== undefined) {
     validateCaptions(
@@ -240,7 +289,7 @@ export async function lintProject(input, options = {}) {
     } else if (!sourcePath || !referenceState.sourceExists) {
       addSkipped(skipped, "media", "media checks require a readable source.path");
     } else {
-      runMediaChecks(sourcePath, findings, paths, options, captionsState.value);
+      runMediaChecks(sourcePath, findings, skipped, paths, options, captionsState.value);
     }
   } else {
     addSkipped(skipped, "media", "media checks require --media");
@@ -286,6 +335,7 @@ export function parseArguments(argv) {
     silenceErrorSeconds: null,
     maxVolumeErrorDb: null,
     captionSilenceWarnPercent: null,
+    declarationsPath: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -330,6 +380,22 @@ export function parseArguments(argv) {
         argument.slice("--caption-silence-warn-percent=".length),
         "--caption-silence-warn-percent",
       );
+      continue;
+    }
+    if (argument === "--declarations") {
+      const value = argv[++index];
+      if (!isNonEmptyString(value)) {
+        throw new ExecutionError("--declarations requires a path");
+      }
+      options.declarationsPath = resolve(value);
+      continue;
+    }
+    if (argument.startsWith("--declarations=")) {
+      const value = argument.slice("--declarations=".length);
+      if (!isNonEmptyString(value)) {
+        throw new ExecutionError("--declarations requires a path");
+      }
+      options.declarationsPath = resolve(value);
       continue;
     }
     if (argument.startsWith("-")) {
@@ -556,6 +622,29 @@ function validateAudioMaster(value, findings, path) {
   ) {
     addFinding(findings, { severity: "error", check: "audio.master.loudnorm", message: "loudnorm must be a finite number within [-70, 0]", path });
   }
+  if (
+    Object.hasOwn(value, "true_peak_dbtp") &&
+    (!isFiniteNumber(value.true_peak_dbtp) || value.true_peak_dbtp < -9 || value.true_peak_dbtp > 0)
+  ) {
+    addFinding(findings, { severity: "error", check: "audio.master.true-peak", message: "true_peak_dbtp must be a finite number within [-9, 0]", path });
+  }
+}
+
+function validateOutputEncoding(value, findings, path) {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    addFinding(findings, { severity: "error", check: "output.encoding.structure", message: "encoding must be an object", path });
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "quality" && key !== "encoder") addFinding(findings, { severity: "error", check: "output.encoding.structure", message: `${key} is not defined by output.encoding`, path });
+  }
+  if (Object.hasOwn(value, "quality") && !["master", "high", "standard", "light"].includes(value.quality)) {
+    addFinding(findings, { severity: "error", check: "output.encoding.quality", message: "quality must be master/high/standard/light", path });
+  }
+  if (Object.hasOwn(value, "encoder") && !["auto", "videotoolbox", "x264"].includes(value.encoder)) {
+    addFinding(findings, { severity: "error", check: "output.encoding.encoder", message: "encoder must be auto/videotoolbox/x264", path });
+  }
 }
 
 // at 省略 = 同一 track 内で直前カットの直後（既存ファイルは全カット track 省略=0・
@@ -579,6 +668,46 @@ function computeCutTrackSegments(cuts) {
     segments.push({ index, track, start, end });
   }
   return segments;
+}
+
+// edit.json v1（sources[] 形式）の書き出しは buildMultiSourceCutCommand を通り、
+// そこは cuts[] を配列順に連結するだけで track / at を見ない（v0 単一ソース経路にだけ
+// gap-aware / track-aware の合成がある）。宣言だけ通って絵が消えるのが最悪なので、
+// 「lint は通ったのに映像層が丸ごと無い動画が焼ける」前に error で止める。
+// 実測（2026-08-04 PV ドッグフーディング）: track 1 のカットは合成されず出力尺へ連結され、
+// 一度も画面に出ないまま尺だけ伸びた mp4 が PASS で焼き上がった。
+function validateCutTrackRenderSupport(edit, segments, findings) {
+  if (edit?.version !== 1 || !Array.isArray(edit.cuts)) return;
+  const cursorByTrack = new Map();
+  for (const segment of segments) {
+    const cut = edit.cuts[segment.index];
+    if (!isRecord(cut)) continue;
+    const cursor = cursorByTrack.get(segment.track) ?? 0;
+    cursorByTrack.set(segment.track, segment.end);
+    if (segment.track > 0) {
+      addFinding(findings, {
+        severity: "warning",
+        check: "cuts.track-render-unsupported",
+        message:
+          `cuts[].track >= 1 is declared but the v1 (sources[]) render path concatenates cuts instead of compositing them; `
+          + `the clip never appears on screen. Pre-composite the upper track into one source, or move it to overlays[] / layers[].`,
+        path: `edit.json#cuts[${segment.index}]`,
+        range: { start: segment.start, end: segment.end },
+      });
+      continue;
+    }
+    if (Math.abs(segment.start - cursor) > EPSILON) {
+      addFinding(findings, {
+        severity: "warning",
+        check: "cuts.at-render-unsupported",
+        message:
+          `cuts[].at leaves a gap/overlap on track 0, but the v1 (sources[]) render path ignores at and concatenates cuts; `
+          + `the rendered timing will not match this declaration.`,
+        path: `edit.json#cuts[${segment.index}]`,
+        range: { start: segment.start, end: segment.end },
+      });
+    }
+  }
 }
 
 function findTrackOverlaps(segments) {
@@ -678,6 +807,94 @@ function validateCutTransformFields(cuts, findings) {
         path: `${path}.transform.scale`,
       });
     }
+  }
+}
+
+// docs/contract-2026-08-12-still-image-cut-source-v0.md 裁定1: 判定は拡張子のみ。同じ集合
+// (png/jpe?g/webp/bmp/gif, 大小無視) を packages/render-cut/src/layers.mjs の
+// IMAGE_LAYER_SOURCE_PATTERN / plan.mjs の chroma_key 背景判定と揃える。edit-lint はスキーマ
+// パッケージから独立しているため、ここでは同じパターンを別リテラルとして持つ（3面パリティ
+// テストと同じ流儀: packages/preview-server/test/image-layer-source.test.mjs 参照）。
+const IMAGE_CUT_SOURCE_PATTERN = /\.(png|jpe?g|webp|bmp|gif)$/iu;
+
+function isImageCutSourcePath(pathValue) {
+  return typeof pathValue === "string" && IMAGE_CUT_SOURCE_PATTERN.test(pathValue);
+}
+
+// 裁定3〜5（in/out 意味論・freeze/speed 警告・v0 空 cuts 拒否）。source が静止画のときだけ発火する。
+function validateStillImageCuts(edit, findings) {
+  if (!isRecord(edit)) return;
+  const cuts = Array.isArray(edit.cuts) ? edit.cuts : [];
+
+  if (edit.version === 0) {
+    if (!isRecord(edit.source) || !isImageCutSourcePath(edit.source.path)) return;
+    if (cuts.length === 0) {
+      addFinding(findings, {
+        severity: "error",
+        check: "cuts.still-image-cuts-required",
+        message:
+          "source.path is a still image, which has no intrinsic duration, so v0's \"empty cuts = whole "
+            + "source\" shortcut does not apply. Declare at least one cut with an explicit out to state the "
+            + "display duration.",
+        path: "edit.json#cuts",
+      });
+      return;
+    }
+    for (const [index, cut] of cuts.entries()) {
+      validateStillImageCutFields(cut, index, findings);
+    }
+    return;
+  }
+
+  if (edit.version !== 1) return;
+  const imageSourceIds = new Set(
+    (Array.isArray(edit.sources) ? edit.sources : [])
+      .filter((source) => isRecord(source) && isImageCutSourcePath(source.path))
+      .map((source) => source.id),
+  );
+  if (imageSourceIds.size === 0) return;
+  for (const [index, cut] of cuts.entries()) {
+    if (!isRecord(cut) || !imageSourceIds.has(cut.src)) continue;
+    validateStillImageCutFields(cut, index, findings);
+  }
+}
+
+function validateStillImageCutFields(cut, index, findings) {
+  if (!isRecord(cut)) return;
+  const path = `edit.json#cuts[${index}]`;
+  if (isFiniteNumber(cut.in) && Math.abs(cut.in) > EPSILON) {
+    addFinding(findings, {
+      severity: "warning",
+      check: "cuts.still-image-in",
+      message:
+        "cut.in has no source to seek into for a still image -- only out - in (the display duration) is used "
+          + "by render; 0 is recommended for cut.in here",
+      path: `${path}.in`,
+    });
+  }
+  if (Object.hasOwn(cut, "freeze") && isRecord(cut.freeze)) {
+    addFinding(findings, {
+      severity: "warning",
+      check: "cuts.still-image-freeze",
+      message:
+        "freeze on a still image source is a no-op visually (the source frame never changes) -- it only adds "
+          + "hold time; extending out achieves the same result more directly",
+      path: `${path}.freeze`,
+    });
+  }
+  if (
+    Object.hasOwn(cut, "speed") &&
+    isPositiveNumber(cut.speed) &&
+    Math.abs(cut.speed - 1) > EPSILON
+  ) {
+    addFinding(findings, {
+      severity: "warning",
+      check: "cuts.still-image-speed",
+      message:
+        "speed on a still image source has no visual effect (the source frame never changes) -- it only "
+          + "rescales the display duration",
+      path: `${path}.speed`,
+    });
   }
 }
 
@@ -914,6 +1131,70 @@ function validateTimelineTracks(edit, findings) {
       });
     }
   }
+}
+
+// task 2026-08-07-track-transition-lint-guard (following up on task 2026-08-07-render-frame-accounting's
+// track-compose.mjs sweep, task #14): gap-aware track compositing (a non-default timeline.tracks
+// declaration, which routes v1 through buildTrackStackPlan/resolveCutTrackRanges instead of the
+// plain sequential render path) does not compose with cuts[].transition_out. resolveCutTrackRanges's
+// gap-aware placement is built on resolveCutSegments/computeVideoRuns, which assume same-track
+// adjacent cuts occupy separate, non-overlapping windows -- an xfade's whole point is to blend two
+// cuts into one overlapping region, so that assumption mechanically splits one continuous
+// dissolve into two separately-windowed composites. Verified with a real render (2026-08-07,
+// v1, a "cuts" track holding lime -> [0.5s dissolve] -> magenta, composited via an explicit
+// non-default timeline.tracks order): the second cut's window pointed 0.5s past where the
+// actually-xfade-shrunk clip's real content lives, so playback showed the base track's plain
+// background leaking through for the tail 0.5s where the dissolved clip should still have been
+// visible. Properly supporting this would mean teaching resolveCutSegments/computeVideoRuns
+// about overlap, and those are shared by v0's own at/track placement and layers placement --
+// too wide a blast radius to take on speculatively, especially with no evidence anyone needs the
+// combination. Reject it instead: it fails loudly and specifically, rather than rendering a
+// broken video with a phantom black flash that's very hard to trace back to its cause.
+function validateTrackTransitionOutCompatibility(edit, findings) {
+  if (edit?.version !== 1 || !Array.isArray(edit.cuts)) return;
+  const tracks = edit?.timeline?.tracks;
+  if (!Array.isArray(tracks)) return; // malformed timeline.tracks is already reported by validateTimelineTracks
+  if (usesDefaultTrackOrder(edit, tracks)) return; // cuts[].track has no compositing effect here (flat concat; see cuts.track-render-unsupported)
+
+  const cutsTrackRefs = new Set(
+    tracks
+      .filter((item) => isRecord(item) && item.kind === "cuts" && Number.isInteger(item.ref) && item.ref >= 0)
+      .map((item) => item.ref),
+  );
+  for (const ref of cutsTrackRefs) {
+    const trackCuts = edit.cuts
+      .map((cut, index) => ({ cut, index }))
+      .filter(({ cut }) => isRecord(cut) && (cut.track ?? 0) === ref);
+    // The last cut on a track has no following same-track cut to blend into, so its own
+    // transition_out (if any) never renders -- mirrors buildMultiSourceCutCommand's own
+    // hasAnyTransition check (plan.mjs) and predictedDuration's overlap accounting.
+    for (const { cut, index } of trackCuts.slice(0, -1)) {
+      if (!cut.transition_out) continue;
+      addFinding(findings, {
+        severity: "error",
+        check: "cuts.track-transition-unsupported",
+        message:
+          `cuts[].transition_out is declared on track ${ref}, which timeline.tracks composites through the `
+          + `gap-aware track engine. That engine treats adjacent same-track cuts as separate, non-overlapping `
+          + `windows, so it cannot represent an xfade's intentional overlap -- the composited window and the `
+          + `actually-shrunk clip diverge, and content disappears early (verified with a real render: the base `
+          + `track's background visibly leaked through where the dissolved clip should still have been `
+          + `playing). Remove transition_out from this track's cuts, or drop the custom timeline.tracks order `
+          + `for this track so it renders through the plain sequential path instead.`,
+        path: `edit.json#cuts[${index}]`,
+      });
+    }
+  }
+}
+
+// Local port of render-cut/src/track-order.mjs's usesDefaultTrackOrder: edit-lint is a lower-level
+// package render-cut depends on, so it duplicates this small comparison rather than importing
+// back from render-cut. deriveTracks itself stays the single shared source of the "default" order.
+function usesDefaultTrackOrder(edit, tracks) {
+  const trackKey = (track) => `${track?.kind ?? ""}:${Number.isInteger(track?.ref) ? track.ref : ""}`;
+  const resolved = tracks.map(trackKey);
+  const derived = deriveTracks(edit).map(trackKey);
+  return resolved.length === derived.length && resolved.every((value, index) => value === derived[index]);
 }
 
 function collectActualTrackNumbers(items) {
@@ -1174,6 +1455,77 @@ async function validateOverlays(overlays, timeline, findings, paths) {
         });
       }
     }
+  }
+}
+
+// 2026-08-07 オーナー裁定・確定: overlays[].role==="background"
+// は「動かせない・必ずフレームを埋める」種別で、取りうる状態のほぼ全部が正しくなければならない。
+// host（preview-server の app.js / shell の overlay-runtime.js の mount・render-cut の
+// rasterize.mjs の renderOverlayNode）は role==="background" のとき --x/--y/--scale/--rotate を
+// 無条件で恒等値へロックするため実害は出ないが、死んだ／誤解を招くデータ（動かないのに
+// transform を持つ・vars 経由の抜け道・重なった区間）を保存させない最後の砦として、
+// JSON Schema では表現できない 3 条件（vars の自由形・区間の重なりは兄弟要素比較）をここで弾く。
+const BACKGROUND_LOCKED_VARS = new Set(["--x", "--y", "--scale", "--rotate"]);
+
+function validateOverlayBackgroundRole(overlays, findings) {
+  if (!Array.isArray(overlays)) return;
+  const segments = [];
+  overlays.forEach((overlay, index) => {
+    if (!isRecord(overlay) || !Object.hasOwn(overlay, "role")) return;
+    const path = `edit.json#overlays[${index}]`;
+
+    if (overlay.role !== "background") {
+      addFinding(findings, {
+        severity: "error",
+        check: "overlays.role",
+        message: 'overlay role must be "background" when present',
+        path: `${path}.role`,
+      });
+      return;
+    }
+
+    if (Object.hasOwn(overlay, "transform")) {
+      addFinding(findings, {
+        severity: "error",
+        check: "overlays.role.transform",
+        message: "background overlay must not declare transform (position is locked to the output frame)",
+        path: `${path}.transform`,
+      });
+    }
+
+    if (isRecord(overlay.vars)) {
+      for (const key of Object.keys(overlay.vars)) {
+        if (BACKGROUND_LOCKED_VARS.has(key)) {
+          addFinding(findings, {
+            severity: "error",
+            check: "overlays.role.vars",
+            message: `background overlay must not override ${key} via vars (would move the background off the output frame)`,
+            path: `${path}.vars`,
+          });
+        }
+      }
+    }
+
+    if (isFiniteNumber(overlay.start) && isPositiveNumber(overlay.duration)) {
+      // 背景は「今どの場面か」を表す 1 枚地の差し替え物なので、track の値に関係なく
+      // 同時に 2 枚以上表示できてはいけない（cuts.track-overlap と同じ error 重大度）。
+      segments.push({
+        index,
+        track: "background",
+        start: overlay.start,
+        end: overlay.start + overlay.duration,
+      });
+    }
+  });
+
+  for (const segment of findTrackOverlaps(segments)) {
+    addFinding(findings, {
+      severity: "error",
+      check: "overlays.role.overlap",
+      message: "background overlay overlaps another background overlay (only one background may be visible at a time)",
+      path: `edit.json#overlays[${segment.index}]`,
+      range: { start: segment.start, end: segment.end },
+    });
   }
 }
 
@@ -1773,6 +2125,193 @@ async function validateBgmSfx(bgm, sfx, timeline, findings, paths) {
   }
 }
 
+async function validateMusicGrid(bgm, sfx, timeline, findings, skipped, paths, options) {
+  if (!isRecord(bgm) || !isNonEmptyString(bgm.path)) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      "audio.bgm is absent; music grid checks require audio.bgm.path",
+    );
+    return;
+  }
+  if (!Array.isArray(sfx) || sfx.length === 0) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      "audio.sfx is empty; nothing to check against the music grid",
+    );
+    return;
+  }
+
+  const {
+    declarations,
+    source: declarationsSource,
+    error: declarationsError,
+  } = await loadMusicDeclarations(options);
+  if (declarationsError) {
+    addSkipped(skipped, "audio.music-grid", declarationsError);
+    return;
+  }
+  if (!declarations) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      "no declarations file found (declarations are optional)",
+    );
+    return;
+  }
+
+  const trackId = resolveBgmTrackId(bgm.path, declarations);
+  const declaration = declarations[trackId];
+  if (!declaration) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      `no declaration for bgm track "${trackId}" (declarations source: ${declarationsSource})`,
+    );
+    return;
+  }
+
+  if (timeline === null || !(timeline > 0)) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      "timeline duration is unavailable (cuts are invalid or empty)",
+    );
+    return;
+  }
+
+  const filePath = resolveReference(paths.editPath, bgm.path);
+  const probed = await probeAudioDuration(filePath, options.ffprobeCommand);
+  if (probed.duration === null) {
+    addSkipped(
+      skipped,
+      "audio.music-grid",
+      `bgm track duration is unavailable (${probed.reason})`,
+    );
+    return;
+  }
+
+  const bgmIn = isFiniteNumber(bgm.in) ? bgm.in : 0;
+  const grid = musicGrid({
+    declaration,
+    trackDuration: probed.duration,
+    bgmIn,
+    timelineDuration: timeline,
+  });
+  const snapWindow = 0.12;
+  const seamWindow = 0.3;
+
+  for (const [index, item] of sfx.entries()) {
+    if (!isRecord(item) || !isFiniteNumber(item.t)) continue;
+    const itemPath = `edit.json#audio.sfx[${index}]`;
+    const nearest = nearestGridPoint(item.t, grid);
+    if (nearest && Math.abs(nearest.delta) > snapWindow + EPSILON) {
+      addFinding(findings, {
+        severity: "warning",
+        check: "audio.sfx.music-grid",
+        message: `t ${formatNumber(item.t)}s is ${formatNumber(Math.abs(nearest.delta))}s off the nearest ${nearest.kind} at ${formatNumber(nearest.t)}s (window ±${snapWindow}s)`,
+        path: itemPath,
+        range: { start: item.t, end: item.t },
+      });
+    }
+
+    for (const seam of grid.seams) {
+      if (Math.abs(item.t - seam) <= seamWindow + EPSILON) {
+        addFinding(findings, {
+          severity: "warning",
+          check: "audio.sfx.music-grid-seam",
+          message: `t ${formatNumber(item.t)}s fires within ${formatNumber(seamWindow)}s of a bgm loop seam at ${formatNumber(seam)}s`,
+          path: itemPath,
+          range: { start: item.t, end: item.t },
+        });
+      }
+    }
+  }
+}
+
+const GRID_KIND_ORDER = ["hit", "downbeat", "beat"];
+const GRID_KIND_KEYS = {
+  hit: "hits",
+  downbeat: "downbeats",
+  beat: "beats",
+};
+
+function nearestGridPoint(t, grid) {
+  let best = null;
+  for (const kind of GRID_KIND_ORDER) {
+    for (const candidate of grid[GRID_KIND_KEYS[kind]] ?? []) {
+      const delta = candidate - t;
+      const absDelta = Math.abs(delta);
+      const better =
+        best === null ||
+        absDelta < best.absDelta - 1e-9 ||
+        (absDelta <= best.absDelta + 1e-9 &&
+          GRID_KIND_ORDER.indexOf(kind) < GRID_KIND_ORDER.indexOf(best.kind));
+      if (better) best = { t: candidate, kind, delta, absDelta };
+    }
+  }
+  return best;
+}
+
+function resolveMusicLibraryRoot(env = process.env) {
+  const home = env.AKARI_HOME || join(os.homedir(), ".akari");
+  return join(home, "assets", "audio");
+}
+
+async function loadMusicDeclarations(options) {
+  const fromEnv = process.env.AKARI_SOUNDS_DECLARATIONS
+    ? resolve(process.env.AKARI_SOUNDS_DECLARATIONS)
+    : null;
+  const candidate =
+    options.declarationsPath ??
+    fromEnv ??
+    join(resolveMusicLibraryRoot(), "declarations.json");
+  try {
+    await access(candidate, fsConstants.R_OK);
+  } catch {
+    return { declarations: null, source: null, error: null };
+  }
+
+  let text;
+  try {
+    text = await readFile(candidate, "utf8");
+  } catch (error) {
+    return {
+      declarations: null,
+      source: candidate,
+      error: `declarations file could not be read: ${candidate} (${messageOf(error)})`,
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return {
+      declarations: null,
+      source: candidate,
+      error: `declarations file is not valid JSON: ${candidate} (${messageOf(error)})`,
+    };
+  }
+  if (!isRecord(parsed)) {
+    return {
+      declarations: null,
+      source: candidate,
+      error: `declarations file must be a JSON object: ${candidate}`,
+    };
+  }
+  return { declarations: parsed, source: candidate, error: null };
+}
+
+function resolveBgmTrackId(bgmPath, declarations) {
+  const baseNoExt = basename(bgmPath).replace(/\.[^./]+$/, "");
+  if (Object.hasOwn(declarations, baseNoExt)) return baseNoExt;
+  const parentDir = basename(dirname(bgmPath));
+  if (Object.hasOwn(declarations, parentDir)) return parentDir;
+  return baseNoExt;
+}
+
 async function validateReferences(edit, findings, paths) {
   const references = [];
   if (isRecord(edit?.source)) {
@@ -1836,6 +2375,8 @@ async function validateReferences(edit, findings, paths) {
 
 function validateCaptions(captions, edit, analysis, findings, paths) {
   const captionPath = relativePath(paths.projectRoot, paths.captionsPath);
+  const captionsRoot = captions;
+  let displayPolicy;
   if (!Array.isArray(captions)) {
     if (!isRecord(captions)) {
       addFinding(findings, {
@@ -1847,7 +2388,7 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
       return;
     }
     for (const field of Object.keys(captions)) {
-      if (field !== "default_text_style" && field !== "captions") {
+      if (field !== "default_text_style" && field !== "display_policy" && field !== "captions") {
         captionFinding(
           findings,
           "captions.schema",
@@ -1856,6 +2397,7 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
         );
       }
     }
+    displayPolicy = captions.display_policy;
     if (Object.hasOwn(captions, "default_text_style")) {
       validateTextStyle(
         captions.default_text_style,
@@ -1876,11 +2418,14 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
     captions = captions.captions;
   }
   const ids = new Set();
-  const overlayIds = new Set(
-    Array.isArray(edit?.overlays)
-      ? edit.overlays.filter(isRecord).map((overlay) => overlay.id)
-      : [],
-  );
+  // ここには以前 `captions.overlay-link`（caption の id と一致する overlays[].id が無ければ警告）
+  // があったが、2026-08-07 に撤去した。字幕のオーバーレイは消費側が captions[] から合成する
+  // （render-cut の generateCaptionOverlays）ので、edit.json の overlays[] に手書きで
+  // 対応物を並べる設計ではない。実際、このリポジトリ自身の字幕フィクスチャ 6/6 で
+  // 全字幕に 1 件ずつ発火し、通るプロジェクトが 1 つも存在しなかった。docs/ にも skills/ にも
+  // 意図を説明する記述がなく、テストも 1 件も無い（= 消しても何も落ちない）状態だった。
+  // 常に全件発火する警告は本物の指摘を埋めるだけなので、規則ごと落とすのが正しい。
+  // 撤去の証跡は edit-lint.test.mjs の "captions.overlay-link は発火しない" で固定してある。
   let previousStart = -Infinity;
 
   for (const [index, caption] of captions.entries()) {
@@ -1890,7 +2435,7 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
       continue;
     }
     const required = ["id", "start", "end", "text", "speaker", "sourceRef", "edited"];
-    const optional = ["src", "words", "style", "display_text", "text_style"];
+    const optional = ["src", "words", "style", "display_text", "display_fragments", "text_style"];
     for (const field of required) {
       if (!Object.hasOwn(caption, field)) {
         captionFinding(findings, "captions.schema", `${field} is required`, itemPath);
@@ -1954,11 +2499,12 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
     if (Object.hasOwn(caption, "style")) {
       if (caption.style !== "karaoke"
         && caption.style !== "pop"
-        && caption.style !== "reveal") {
+        && caption.style !== "reveal"
+        && caption.style !== "reveal-word") {
         captionFinding(
           findings,
           "captions.schema",
-          'style must be "karaoke", "pop", or "reveal"',
+          'style must be "karaoke", "pop", "reveal", or "reveal-word"',
           itemPath,
         );
       }
@@ -1970,6 +2516,9 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
         "display_text must be a string when present",
         itemPath,
       );
+    }
+    if (Object.hasOwn(caption, "display_fragments") && !Array.isArray(caption.display_fragments)) {
+      captionFinding(findings, "captions.schema", "display_fragments must be an array when present", itemPath);
     }
     if (Object.hasOwn(caption, "text_style")) {
       validateTextStyle(caption.text_style, "text_style", findings, itemPath);
@@ -2048,13 +2597,23 @@ function validateCaptions(captions, edit, analysis, findings, paths) {
         );
       }
     }
-    if (typeof caption.id === "string" && !overlayIds.has(caption.id)) {
-      addFinding(findings, {
-        severity: "warning",
-        check: "captions.overlay-link",
-        message: "caption id has no matching overlay id",
-        path: itemPath,
-      });
+  }
+
+  if (displayPolicy !== undefined) {
+    const policyCaptions = Array.isArray(captionsRoot?.captions) ? captionsRoot.captions : [];
+    const emphasis = Array.isArray(edit?.emphasis_words) ? edit.emphasis_words : [];
+    for (const [index, caption] of policyCaptions.entries()) {
+      if (!isRecord(caption)) continue;
+      const conflict = emphasis.some(word => isRecord(word)
+        && (!isNonEmptyString(word.src) || !isNonEmptyString(caption.src) || word.src === caption.src)
+        && isFiniteNumber(word.t_start) && isFiniteNumber(word.t_end)
+        && word.t_end > caption.start && word.t_start < caption.end);
+      if (conflict) captionFinding(findings, "captions.display-policy-emphasis", "emphasis_words cannot act on a cue under display_policy v1", `captions.json#[${index}]`);
+    }
+    try {
+      resolveCaptionDisplay(captionsRoot, edit);
+    } catch (error) {
+      captionFinding(findings, "captions.display-policy", error instanceof Error ? error.message : String(error), captionPath);
     }
   }
 }
@@ -2134,9 +2693,8 @@ function validateTextStyle(value, label, findings, path) {
     captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
     return;
   }
-  const allowed = ["color", "size_px", "stroke", "background", "zone"];
   for (const field of Object.keys(value)) {
-    if (!allowed.includes(field)) {
+    if (!CAPTION_TEXT_STYLE_FIELDS.has(field)) {
       captionFinding(
         findings,
         "captions.text-style",
@@ -2145,6 +2703,7 @@ function validateTextStyle(value, label, findings, path) {
       );
     }
   }
+  validateTextStyleV0Fields(value, label, findings, path);
   if (Object.hasOwn(value, "color")) {
     validateCaptionHexColor(value.color, `${label}.color`, findings, path);
   }
@@ -2159,11 +2718,20 @@ function validateTextStyle(value, label, findings, path) {
       path,
     );
   }
+  if (Object.hasOwn(value, "font_weight") && (!Number.isInteger(value.font_weight) || value.font_weight < 1 || value.font_weight > 1000)) {
+    captionFinding(findings, "captions.text-style", `${label}.font_weight must be an integer within [1, 1000]`, path);
+  }
+  if (Object.hasOwn(value, "line_height") && (!isFiniteNumber(value.line_height) || value.line_height <= 0)) {
+    captionFinding(findings, "captions.text-style", `${label}.line_height must be a positive finite number`, path);
+  }
   if (Object.hasOwn(value, "stroke")) {
     validateCaptionStrokeStyle(value.stroke, `${label}.stroke`, findings, path);
   }
   if (Object.hasOwn(value, "background")) {
     validateCaptionBackgroundStyle(value.background, `${label}.background`, findings, path);
+  }
+  if (Object.hasOwn(value, "animation")) {
+    validateCaptionAnimation(value.animation, `${label}.animation`, findings, path);
   }
   if (Object.hasOwn(value, "zone") && !CAPTION_TEXT_STYLE_ZONES.has(value.zone)) {
     captionFinding(
@@ -2173,6 +2741,191 @@ function validateTextStyle(value, label, findings, path) {
       path,
     );
   }
+  if (Object.hasOwn(value, "layout")) validateCaptionReferenceLayout(value.layout, `${label}.layout`, findings, path);
+  if (Object.hasOwn(value, "zone") && Object.hasOwn(value, "layout")) {
+    captionFinding(
+      findings,
+      "captions.text-style",
+      `${label} cannot contain both zone and layout`,
+      path,
+    );
+  }
+}
+
+function validateCaptionAnimation(value, label, findings, path) {
+  if (!isRecord(value)) {
+    captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
+    return;
+  }
+  if (Object.keys(value).length === 0) {
+    captionFinding(findings, "captions.text-style", `${label} must contain at least one slot`, path);
+  }
+  for (const slot of Object.keys(value)) {
+    if (!CAPTION_ANIMATION_SLOTS.has(slot)) {
+      captionFinding(
+        findings,
+        "captions.text-style",
+        `${label}.${slot} is not defined by the animation contract`,
+        path,
+      );
+      continue;
+    }
+    validateCaptionAnimationSlot(value[slot], `${label}.${slot}`, findings, path);
+  }
+}
+
+function validateCaptionAnimationSlot(value, label, findings, path) {
+  if (!isRecord(value)) {
+    captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
+    return;
+  }
+  for (const field of Object.keys(value)) {
+    if (!CAPTION_ANIMATION_SLOT_FIELDS.has(field)) {
+      captionFinding(
+        findings,
+        "captions.text-style",
+        `${label}.${field} is not defined by the animation slot contract`,
+        path,
+      );
+    }
+  }
+  if (!Object.hasOwn(value, "id")) {
+    captionFinding(findings, "captions.text-style", `${label}.id is required`, path);
+  } else if (!CAPTION_TEXTANIM_IDS.has(value.id)) {
+    captionFinding(
+      findings,
+      "captions.text-style",
+      `${label}.id is not defined in presets/textanim/index.jsonl: ${String(value.id)}`,
+      path,
+    );
+  }
+  if (
+    Object.hasOwn(value, "duration_sec")
+    && (!isFiniteNumber(value.duration_sec) || value.duration_sec <= 0)
+  ) {
+    captionFinding(
+      findings,
+      "captions.text-style",
+      `${label}.duration_sec must be a positive finite number`,
+      path,
+    );
+  }
+  if (
+    Object.hasOwn(value, "ease")
+    && value.ease !== null
+    && !isNonEmptyString(value.ease)
+  ) {
+    captionFinding(
+      findings,
+      "captions.text-style",
+      `${label}.ease must be null or a non-empty string`,
+      path,
+    );
+  }
+  if (
+    Object.hasOwn(value, "amp")
+    && value.amp !== null
+    && (!isFiniteNumber(value.amp) || value.amp <= 0)
+  ) {
+    captionFinding(
+      findings,
+      "captions.text-style",
+      `${label}.amp must be null or a positive finite number`,
+      path,
+    );
+  }
+}
+
+const CAPTION_ALIGN_VALUES = new Set(["left", "center", "right"]);
+const CAPTION_VERTICAL_ALIGN_VALUES = new Set(["top", "middle", "bottom"]);
+const CAPTION_TEXT_TRANSFORM_VALUES = new Set([
+  "upper", "uppercase", "lower", "lowercase", "title", "capitalize", "none",
+]);
+const CAPTION_TEXT_ANCHOR_VALUES = new Set(["tl", "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br"]);
+const CAPTION_SHADOW_KEYS = ["color", "opacity", "blur_px", "distance_px", "angle_deg"];
+const CAPTION_GLOW_KEYS = ["color", "density", "spread", "offset_x", "offset_y"];
+const CAPTION_NON_NEGATIVE_SHADOW_KEYS = ["blur_px", "distance_px", "density", "spread"];
+
+
+// textstyle v0 のフィールド検証。edit-store の validateTextStyleV0 と同じ規則を張る
+// （どちらか片方だけが緩いと、lint が通ったのに保存で弾かれる/その逆が起きる）。
+function validateTextStyleV0Fields(value, label, findings, path) {
+  const has = (key) => Object.hasOwn(value, key);
+  const flag = (message) => captionFinding(findings, "captions.text-style", `${label}.${message}`, path);
+  if (has("font_family") && (typeof value.font_family !== "string" || value.font_family === "")) {
+    flag("font_family must be a non-empty string");
+  }
+  if (has("weight") && (!Number.isInteger(value.weight) || value.weight < 100 || value.weight > 900)) {
+    flag("weight must be an integer within [100, 900]");
+  }
+  if (has("italic") && typeof value.italic !== "boolean") flag("italic must be a boolean");
+  if (has("underline") && typeof value.underline !== "boolean") flag("underline must be a boolean");
+  if (has("letter_spacing_em") && !isFiniteNumber(value.letter_spacing_em)) {
+    flag("letter_spacing_em must be a finite number");
+  }
+  if (has("align") && !CAPTION_ALIGN_VALUES.has(value.align)) flag("align must be one of left, center, right");
+  if (has("vertical_align") && !CAPTION_VERTICAL_ALIGN_VALUES.has(value.vertical_align)) {
+    flag("vertical_align must be one of top, middle, bottom");
+  }
+  if (has("vertical") && typeof value.vertical !== "boolean") flag("vertical must be a boolean");
+  if (has("text_transform") && !CAPTION_TEXT_TRANSFORM_VALUES.has(value.text_transform)) {
+    flag("text_transform must be one of upper, uppercase, lower, lowercase, title, capitalize, none");
+  }
+  if (has("max_width_pct")
+    && (!isFiniteNumber(value.max_width_pct) || value.max_width_pct <= 0 || value.max_width_pct >= 100)) {
+    flag("max_width_pct must be a finite number within (0, 100)");
+  }
+  if (has("text_anchor") && !CAPTION_TEXT_ANCHOR_VALUES.has(value.text_anchor)) {
+    flag("text_anchor must be one of the nine anchor codes");
+  }
+  if (has("position")) {
+    if (!isRecord(value.position)) {
+      flag("position must be an object");
+    } else {
+      for (const field of Object.keys(value.position)) {
+        if (field !== "x" && field !== "y") flag(`position.${field} is not defined by the text style contract`);
+      }
+      for (const axis of ["x", "y"]) {
+        if (Object.hasOwn(value.position, axis) && !isFiniteNumber(value.position[axis])) {
+          flag(`position.${axis} must be a finite number`);
+        }
+      }
+    }
+  }
+  if (has("shadow")) validateCaptionShadowLike(value.shadow, CAPTION_SHADOW_KEYS, `${label}.shadow`, findings, path);
+  if (has("glow")) validateCaptionShadowLike(value.glow, CAPTION_GLOW_KEYS, `${label}.glow`, findings, path);
+  if (has("animation")) validateCaptionAnimation(value.animation, `${label}.animation`, findings, path);
+}
+
+// shadow / glow は「color 必須 + 残りは数値」の同型。color を任意にすると消費側が
+// 影を組めず無言で落ちるため必須で揃える。
+function validateCaptionShadowLike(value, keys, label, findings, path) {
+  if (!isRecord(value)) return captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
+  for (const field of Object.keys(value)) {
+    if (!keys.includes(field)) {
+      captionFinding(findings, "captions.text-style", `${label}.${field} is not defined by the text style contract`, path);
+    }
+  }
+  if (!Object.hasOwn(value, "color")) {
+    captionFinding(findings, "captions.text-style", `${label}.color is required`, path);
+  } else {
+    validateCaptionHexColor(value.color, `${label}.color`, findings, path);
+  }
+  for (const key of keys) {
+    if (key === "color" || !Object.hasOwn(value, key)) continue;
+    if (!isFiniteNumber(value[key])) {
+      captionFinding(findings, "captions.text-style", `${label}.${key} must be a finite number`, path);
+      continue;
+    }
+    if (key === "opacity" && (value[key] < 0 || value[key] > 1)) {
+      captionFinding(findings, "captions.text-style", `${label}.opacity must be within [0, 1]`, path);
+    }
+    // 非負なのは長さ・量のみ。angle_deg は向きなので負値が正当（-90 = 真上）、
+    // offset_* も両方向へ動かせる。
+    if (CAPTION_NON_NEGATIVE_SHADOW_KEYS.includes(key) && value[key] < 0) {
+      captionFinding(findings, "captions.text-style", `${label}.${key} must be non-negative`, path);
+    }
+  }
 }
 
 function validateCaptionStrokeStyle(value, label, findings, path) {
@@ -2181,7 +2934,7 @@ function validateCaptionStrokeStyle(value, label, findings, path) {
     return;
   }
   for (const field of Object.keys(value)) {
-    if (field !== "color" && field !== "width_px") {
+    if (field !== "method" && field !== "color" && field !== "width_px") {
       captionFinding(
         findings,
         "captions.text-style",
@@ -2189,6 +2942,9 @@ function validateCaptionStrokeStyle(value, label, findings, path) {
         path,
       );
     }
+  }
+  if (Object.hasOwn(value, "method") && value.method !== "webkit-outline") {
+    captionFinding(findings, "captions.text-style", `${label}.method must be webkit-outline`, path);
   }
   if (Object.hasOwn(value, "color")) {
     validateCaptionHexColor(value.color, `${label}.color`, findings, path);
@@ -2206,12 +2962,32 @@ function validateCaptionStrokeStyle(value, label, findings, path) {
   }
 }
 
+function validateCaptionReferenceLayout(value, label, findings, path) {
+  if (!isRecord(value)) return captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
+  const keys = ["mode", "reference_width_px", "reference_height_px", "left_px", "width_px", "bottom_px", "text_align", "max_lines"];
+  for (const field of Object.keys(value)) if (!keys.includes(field)) captionFinding(findings, "captions.text-style", `${label}.${field} is not defined by reference-pixel layout`, path);
+  for (const field of keys) if (!Object.hasOwn(value, field)) captionFinding(findings, "captions.text-style", `${label}.${field} is required`, path);
+  const valid = value.mode === "reference-pixel"
+    && Number.isInteger(value.reference_width_px) && value.reference_width_px > 0
+    && Number.isInteger(value.reference_height_px) && value.reference_height_px > 0
+    && isFiniteNumber(value.left_px) && value.left_px >= 0
+    && isFiniteNumber(value.width_px) && value.width_px > 0
+    && value.left_px + value.width_px <= value.reference_width_px
+    && isFiniteNumber(value.bottom_px) && value.bottom_px >= 0
+    && value.text_align === "center" && value.max_lines === 1;
+  if (!valid) captionFinding(findings, "captions.text-style", `${label} must be a bounded reference-pixel layout with center/max_lines=1`, path);
+}
+
 function validateCaptionBackgroundStyle(value, label, findings, path) {
   if (!isRecord(value)) {
     captionFinding(findings, "captions.text-style", `${label} must be an object`, path);
     return;
   }
-  const allowed = ["color", "opacity", "radius_px", "mode"];
+  const allowed = [
+    "color", "opacity", "radius_px", "mode",
+    // textstyle v0 の座布団拡張: 一律余白 / 文字box比での拡張 / 座布団だけの平行移動
+    "padding_px", "width_pct", "height_pct", "offset_x", "offset_y",
+  ];
   for (const field of Object.keys(value)) {
     if (!allowed.includes(field)) {
       captionFinding(
@@ -2220,6 +2996,16 @@ function validateCaptionBackgroundStyle(value, label, findings, path) {
         `${label}.${field} is not defined by the background style contract`,
         path,
       );
+    }
+  }
+  for (const key of ["padding_px", "width_pct", "height_pct"]) {
+    if (Object.hasOwn(value, key) && (!isFiniteNumber(value[key]) || value[key] < 0)) {
+      captionFinding(findings, "captions.text-style", `${label}.${key} must be a non-negative finite number`, path);
+    }
+  }
+  for (const key of ["offset_x", "offset_y"]) {
+    if (Object.hasOwn(value, key) && !isFiniteNumber(value[key])) {
+      captionFinding(findings, "captions.text-style", `${label}.${key} must be a finite number`, path);
     }
   }
   if (Object.hasOwn(value, "color")) {
@@ -2273,6 +3059,12 @@ function validateCaptionHexColor(value, label, findings, path) {
 }
 
 const REVIEW_TARGET_KINDS = new Set(["instant", "range", "region", "asset", "insert"]);
+const REVIEW_INPUTS = new Set(["typed", "voice", "session"]);
+const REVIEW_STATUSES = new Set(["open", "addressed", "resolved"]);
+const REVIEW_STROKE_SPACES = new Set(["content-rect", "image-rect", "canvas-rect"]);
+const REVIEW_DOC_TARGET_PATTERN = /^doc:(.+)#(.+)$/;
+const REVIEW_IMAGE_TARGET_PATTERN = /^image:(.+)$/;
+const REVIEW_CANVAS_TARGET_PATTERN = /^canvas:(c-\d{4,})$/;
 const REVIEW_REQUIRED_FIELDS = ["id", "createdAt", "sourceT", "text", "input", "status"];
 const REVIEW_OPTIONAL_FIELDS = [
   "src",
@@ -2357,17 +3149,35 @@ async function validateReview(review, edit, findings, paths, skipped) {
     } else if (Object.hasOwn(annotation, "id")) {
       reviewFinding(findings, "review.schema", "id must be a non-empty string", itemPath);
     }
-    if (
-      Object.hasOwn(annotation, "sourceT") &&
-      (!isFiniteNumber(annotation.sourceT) || annotation.sourceT < 0)
-    ) {
+    if (Object.hasOwn(annotation, "createdAt") && typeof annotation.createdAt !== "string") {
+      reviewFinding(findings, "review.schema", "createdAt must be a string", itemPath);
+    }
+    const nonVideoTarget = isNonVideoReviewTarget(annotation.target);
+    if (Object.hasOwn(annotation, "sourceT") && annotation.sourceT === null && !nonVideoTarget) {
       reviewFinding(
         findings,
         "review.schema",
-        "sourceT must be a non-negative finite number (source seconds)",
+        "sourceT may be null only for doc:, image:, or canvas: targets",
         itemPath,
       );
+    } else if (
+      Object.hasOwn(annotation, "sourceT") &&
+      annotation.sourceT !== null &&
+      (!isFiniteNumber(annotation.sourceT) || annotation.sourceT < 0)
+    ) {
+      reviewFinding(findings, "review.schema", "sourceT must be null or a non-negative finite number (source seconds)", itemPath);
     }
+    validateReviewTarget(annotation.target, findings, itemPath);
+    if (Object.hasOwn(annotation, "text") && typeof annotation.text !== "string") {
+      reviewFinding(findings, "review.schema", "text must be a string", itemPath);
+    }
+    if (Object.hasOwn(annotation, "input") && !REVIEW_INPUTS.has(annotation.input)) {
+      reviewFinding(findings, "review.schema", "input must be typed / voice / session", itemPath);
+    }
+    if (Object.hasOwn(annotation, "status") && !REVIEW_STATUSES.has(annotation.status)) {
+      reviewFinding(findings, "review.schema", "status must be open / addressed / resolved", itemPath);
+    }
+    validateReviewResponse(annotation.response, findings, itemPath);
     if (annotation.sourceRange !== undefined && annotation.sourceRange !== null) {
       const range = annotation.sourceRange;
       if (
@@ -2517,25 +3327,84 @@ function validateReviewStrokes(strokes, findings, itemPath) {
   const valid =
     Array.isArray(strokes) &&
     strokes.length > 0 &&
-    strokes.every(
-      (stroke) =>
-        Array.isArray(stroke) &&
-        stroke.length >= 2 &&
-        stroke.every(
-          (point) =>
-            Array.isArray(point) &&
-            point.length === 2 &&
-            point.every((entry) => isFiniteNumber(entry) && entry >= 0 && entry <= 1),
-        ),
-    );
+    strokes.every((stroke) => validateReviewStroke(stroke));
   if (valid) return strokes;
   reviewFinding(
     findings,
     "review.schema",
-    "strokes must be null or an array of [x, y] paths (2+ points, normalized to the source frame)",
+    "strokes must be null or object strokes with tool, space, and normalized points",
     itemPath,
   );
   return null;
+}
+
+function validateReviewStroke(stroke) {
+  if (!isRecord(stroke) || stroke.tool !== "pen" || !REVIEW_STROKE_SPACES.has(stroke.space)) {
+    return false;
+  }
+  if (
+    !Array.isArray(stroke.points) ||
+    stroke.points.length < 2 ||
+    !stroke.points.every(
+      (point) =>
+        Array.isArray(point) &&
+        point.length === 2 &&
+        point.every((entry) => isFiniteNumber(entry) && entry >= 0 && entry <= 1),
+    )
+  ) {
+    return false;
+  }
+  if (stroke.space === "content-rect") {
+    return isRecord(stroke.frame)
+      && isFiniteNumber(stroke.frame.sourceT)
+      && stroke.frame.sourceT >= 0
+      && (!Object.hasOwn(stroke.frame, "cutIndex")
+        || stroke.frame.cutIndex === null
+        || (Number.isInteger(stroke.frame.cutIndex) && stroke.frame.cutIndex >= 0))
+      && isNonEmptyString(stroke.sessionRef);
+  }
+  if (Object.hasOwn(stroke, "frame")) return false;
+  if (stroke.space === "image-rect") {
+    return !Object.hasOwn(stroke, "sessionRef") || isNonEmptyString(stroke.sessionRef);
+  }
+  return !Object.hasOwn(stroke, "canvasRef") || isNonEmptyString(stroke.canvasRef);
+}
+
+function isNonVideoReviewTarget(value) {
+  return typeof value === "string"
+    && (REVIEW_DOC_TARGET_PATTERN.test(value)
+      || REVIEW_IMAGE_TARGET_PATTERN.test(value)
+      || REVIEW_CANVAS_TARGET_PATTERN.test(value));
+}
+
+function validateReviewTarget(value, findings, itemPath) {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string" || value === "") {
+    reviewFinding(findings, "review.schema", "target must be null or a non-empty string", itemPath);
+  } else if (value.startsWith("doc:") && !REVIEW_DOC_TARGET_PATTERN.test(value)) {
+    reviewFinding(findings, "review.schema", "target must use doc:<project-relative-path>#<block-id>", itemPath);
+  } else if (value.startsWith("image:") && !REVIEW_IMAGE_TARGET_PATTERN.test(value)) {
+    reviewFinding(findings, "review.schema", "target must use image:<project-relative-path>", itemPath);
+  } else if (value.startsWith("canvas:") && !REVIEW_CANVAS_TARGET_PATTERN.test(value)) {
+    reviewFinding(findings, "review.schema", "target must use canvas:<c-NNNN>", itemPath);
+  }
+}
+
+function validateReviewResponse(value, findings, itemPath) {
+  if (value === undefined || value === null) return;
+  if (
+    !isRecord(value)
+    || typeof value.summary !== "string"
+    || (value.action !== "edited" && value.action !== "declined")
+    || typeof value.respondedAt !== "string"
+  ) {
+    reviewFinding(
+      findings,
+      "review.schema",
+      "response must be null or { summary, action: edited|declined, respondedAt }",
+      itemPath,
+    );
+  }
 }
 
 async function validateReviewRefs(refs, edit, sourceIds, findings, paths, itemPath) {
@@ -2650,7 +3519,23 @@ const INTAKE_TASK_IDS = new Set([
 ]);
 const INTAKE_AUTONOMY_VALUES = new Set(["full-auto", "checkpoint", "collaborative"]);
 const INTAKE_STATUS_VALUES = new Set(["draft", "submitted"]);
-const INTAKE_ROOT_FIELDS = ["version", "tasks", "target", "autonomy", "status", "submitted_at"];
+export const INTAKE_ROOT_FIELDS = [
+  "version",
+  "title",
+  "tasks",
+  "target",
+  "autonomy",
+  "status",
+  "submitted_at",
+];
+const INTAKE_REQUIRED_ROOT_FIELDS = [
+  "version",
+  "tasks",
+  "target",
+  "autonomy",
+  "status",
+  "submitted_at",
+];
 const INTAKE_TARGET_FIELDS = ["duration_s", "keep_length", "taste"];
 
 // intake.schema.json（packages/schemas/intake.schema.json）を手書きで再検証する。
@@ -2672,7 +3557,7 @@ function validateIntake(intake, findings, paths) {
     return;
   }
 
-  for (const field of INTAKE_ROOT_FIELDS) {
+  for (const field of INTAKE_REQUIRED_ROOT_FIELDS) {
     if (!Object.hasOwn(intake, field)) {
       intakeFinding(findings, "intake.schema", `${field} is required`, intakeRelative);
     }
@@ -2682,7 +3567,7 @@ function validateIntake(intake, findings, paths) {
       intakeFinding(
         findings,
         "intake.schema",
-        `${field} is not defined by intake v1`,
+        `${field} is not defined by intake.schema.json`,
         intakeRelative,
         "warning",
       );
@@ -2766,7 +3651,7 @@ function validateIntakeTarget(target, findings, itemPath) {
       intakeFinding(
         findings,
         "intake.schema",
-        `target.${field} is not defined by intake v1`,
+        `target.${field} is not defined by intake.schema.json`,
         itemPath,
         "warning",
       );
@@ -2807,22 +3692,29 @@ function isIsoDateTime(value) {
   return typeof value === "string" && Number.isFinite(timestamp) && /^\d{4}-\d{2}-\d{2}T/.test(value);
 }
 
-function runMediaChecks(sourcePath, findings, paths, options, captions) {
-  const command = options.ffmpegCommand ?? process.env.FFMPEG ?? resolveFfmpeg();
+function runMediaChecks(sourcePath, findings, skipped, paths, options, captions) {
   const sourceRelative = relativePath(paths.projectRoot, sourcePath);
-  const silence = runCommand(command, [
-    "-hide_banner",
-    "-nostdin",
-    "-i",
-    sourcePath,
-    "-vn",
-    "-af",
-    "silencedetect=noise=-50dB:d=0.5",
-    "-f",
-    "null",
-    "-",
-  ]);
-  const silenceIntervals = parseSilenceIntervals(silence.stderr);
+  const audioStream = probeAudioStream(sourcePath, options.ffprobeCommand);
+  let command = null;
+  let silenceIntervals = [];
+  if (audioStream.hasAudio === true) {
+    command = options.ffmpegCommand ?? process.env.FFMPEG ?? resolveFfmpeg();
+    const silence = runCommand(command, [
+      "-hide_banner",
+      "-nostdin",
+      "-i",
+      sourcePath,
+      "-vn",
+      "-af",
+      "silencedetect=noise=-50dB:d=0.5",
+      "-f",
+      "null",
+      "-",
+    ]);
+    silenceIntervals = parseSilenceIntervals(silence.stderr);
+  } else {
+    addSkipped(skipped, "media.silence", audioStream.reason);
+  }
   for (const interval of silenceIntervals) {
     const severity =
       options.silenceErrorSeconds !== null &&
@@ -2880,6 +3772,11 @@ function runMediaChecks(sourcePath, findings, paths, options, captions) {
     }
   }
 
+  if (audioStream.hasAudio !== true) {
+    addSkipped(skipped, "media.volume", audioStream.reason);
+    return;
+  }
+
   const volume = runCommand(command, [
     "-hide_banner",
     "-nostdin",
@@ -2914,6 +3811,50 @@ function runMediaChecks(sourcePath, findings, paths, options, captions) {
   }
 }
 
+function probeAudioStream(sourcePath, configuredCommand) {
+  let command;
+  try {
+    command = configuredCommand ?? process.env.FFPROBE ?? resolveFfprobe();
+  } catch (error) {
+    return {
+      hasAudio: null,
+      reason: `audio stream detection unavailable: ${messageOf(error)}`,
+    };
+  }
+  const result = spawnSync(
+    command,
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "a",
+      "-show_entries",
+      "stream=index",
+      "-of",
+      "csv=p=0",
+      sourcePath,
+    ],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  if (result.error) {
+    return {
+      hasAudio: null,
+      reason: `audio stream detection unavailable: ${messageOf(result.error)}`,
+    };
+  }
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || "").trim().split("\n").at(-1);
+    return {
+      hasAudio: null,
+      reason: `audio stream detection unavailable: ${detail || `ffprobe exited with status ${result.status}`}`,
+    };
+  }
+  if (String(result.stdout ?? "").trim() === "") {
+    return { hasAudio: false, reason: "source has no audio stream" };
+  }
+  return { hasAudio: true, reason: null };
+}
+
 function probeDuration(sourcePath, configuredCommand) {
   const command = configuredCommand ?? process.env.FFPROBE ?? resolveFfprobe();
   const result = runCommand(command, [
@@ -2930,6 +3871,41 @@ function probeDuration(sourcePath, configuredCommand) {
     throw new ExecutionError("ffprobe did not return a positive source duration");
   }
   return duration;
+}
+
+async function probeAudioDuration(filePath, configuredCommand) {
+  let command;
+  try {
+    command = configuredCommand ?? process.env.FFPROBE ?? resolveFfprobe();
+  } catch (error) {
+    return { duration: null, reason: messageOf(error) };
+  }
+  const result = spawnSync(
+    command,
+    [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  if (result.error) return { duration: null, reason: messageOf(result.error) };
+  if (result.status !== 0) {
+    const detail = String(result.stderr ?? result.stdout ?? "").trim().split("\n").at(-1);
+    return {
+      duration: null,
+      reason: detail || `ffprobe exited with status ${result.status}`,
+    };
+  }
+  const duration = Number(String(result.stdout ?? "").trim());
+  if (!isPositiveNumber(duration)) {
+    return { duration: null, reason: "ffprobe did not return a positive duration" };
+  }
+  return { duration, reason: null };
 }
 
 function runCommand(command, args) {

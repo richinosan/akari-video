@@ -27,6 +27,23 @@
 export const AKARI_NEW_PROJECT_SERVICE_PATH = '/services/akari-surfaces-new-project';
 export const AkariNewProjectService = Symbol('AkariNewProjectService');
 
+export type AkariToolId = 'ffmpeg' | 'whisper' | 'chrome' | 'yt-dlp' | 'voicevox' | 'blender' | 'xcode-clt';
+export type AkariToolTier = 'required' | 'advanced' | 'recommended';
+
+export interface AkariToolCheckResult {
+    id: AkariToolId;
+    tier: AkariToolTier;
+    available: boolean;
+    version?: string;
+    executable?: string;
+}
+
+export interface AkariToolCheckResponse {
+    platform: NodeJS.Platform;
+    checkedAt: string;
+    tools: AkariToolCheckResult[];
+}
+
 export interface AkariNewProjectService {
     /**
      * 空のフォルダーへプロジェクト雛形を作成する
@@ -46,4 +63,21 @@ export interface AkariNewProjectService {
      * （元プロジェクトは残ったまま — creator-root の adoptProject 自身の契約）。
      */
     adoptProject(rootUri: string, projectUri: string, channel: string): Promise<string>;
+
+    /**
+     * 無 root 対応（task 2026-08-04-home-no-root-flow）: 作業場が 1 つも解決できない
+     * 状態で「チャンネルに入れる」が押されたときの ensure。既定パス
+     * （`defaultRootPath()`）に作業場を作成し、マシンポインタを更新する。実処理は
+     * `packages/creator-root` の `createCreatorRoot()` + `updateMachinePointer()` を
+     * そのまま呼ぶだけで、ロジックは複製しない。成功時は作成/解決した作業場ルートの
+     * URI 文字列を返す。失敗時は、そのまま表示できる 1 行の日本語メッセージを持つ
+     * `Error` を投げる（元プロジェクトには一切触れていないので、失敗しても何も壊れない）。
+     */
+    ensureCreatorRoot(): Promise<string>;
+
+    /**
+     * 初回セットアップ面の道具チェック。存在を推測せず、実行可能ファイルを実測する。
+     * macOS の Command Line Tools は `git` shim を叩かず `xcode-select -p` だけで判定する。
+     */
+    checkTools(): Promise<AkariToolCheckResponse>;
 }

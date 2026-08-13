@@ -2,7 +2,7 @@
 
 # スキルカタログ
 
-AKARI Video のエージェント側ワークフローは **19 のスキル**に分割されている（工程ごとに 1 つ + 横断 2 つ）。このページはその一枚地図 — 各スキルが何を担当し、いつ発動し、どの外部ツール・ランタイムに接続するかをまとめる。
+AKARI Video のエージェント側ワークフローは **22 のスキル**に分割されている（工程ごとに 1 つ + 横断 2 つ）。このページはその一枚地図 — 各スキルが何を担当し、いつ発動し、どの外部ツール・ランタイムに接続するかをまとめる。
 
 正本は各 `skills/<name>/SKILL.md`。ここは索引であり、手順・ハードルールの詳細は各 SKILL.md と関連契約（[Reference](./README.ja.md#reference)）に従う。
 
@@ -21,9 +21,12 @@ AKARI Video のエージェント側ワークフローは **19 のスキル**に
 | [create-project](../skills/create-project/SKILL.md) | 新規プロジェクトの headless 作成（雛形コピー・作成レポート） | git（安全な場合のみ初期化） |
 | [setup-library](../skills/setup-library/SKILL.md) | 初回セットアップ。道具チェック → スターターパック提案 → 取得・配置・検証 | ffmpeg / whisper-cli / headless Chrome（存在検査） |
 | [setup-audio-library](../skills/setup-audio-library/SKILL.md) | BGM・SFX の半自動入庫（候補リスト → 手動 DL 照合 → 試聴 keep/drop） | フリー音源配布元（ダウンロードは人間） |
+| [declare-audio](../skills/declare-audio/SKILL.md) | 手元の音源に「サビ・キメ・拍」を自分の耳で付ける宣言づけ（ブラウザのタイムライン画面 → `declarations.json`）。付けた宣言は BGM 自動提案がサビ頭出し付きで読む | ブラウザ（宣言を決めるのは人間） |
 | [setup-remote](../skills/setup-remote/SKILL.md) | 遠隔セットアップ。Tailscale doctor → 導入ガイド（人間手番）→ プレビューサーバーの tailnet 限定 HTTPS 化 → Taildrop 受信を作業場 inbox/ へ接続 → 疎通確認。公開インターネットへは既定で一切出さない | Tailscale / Taildrop（導入・ログインは人間） |
+| [setup-chat-approval](../skills/setup-chat-approval/SKILL.md) | チャット承認セットアップ。doctor → BotFather でのトークン発行と credentials.env 登録（人間手番）→ chat ID 許可リスト → 通知 + ボタン → タップで `decisions.json` 更新。long polling のみで公開エンドポイントを作らず、自由文は指示として扱わない | Telegram Bot API（トークンの発行・登録は人間） |
 | [harvest-asset](../skills/harvest-asset/SKILL.md) | 案件で作った高コスト成果物の素材ライブラリ入庫 | — |
 | [bake-3d](../skills/bake-3d/SKILL.md) | 3D シーンを映像素材（クリップ）に焼く。レシピ `scene.py` の作成・調整・再ベイク | **Blender**（ヘッドレス・bpy） |
+| [beat-sync-edit](../skills/beat-sync-edit/SKILL.md) | 宣言済み音源の拍・キメ・区間を唯一の時刻ソースにして、拍にスナップした edit.json とオーバーレイ一式を「生成器」から機械生成する（音に合わせて画面が動く PV・ショーケース） | ffmpeg / ffprobe（宣言は declare-audio で人間が付ける） |
 
 ### 分析
 
@@ -68,10 +71,14 @@ AKARI Video のエージェント側ワークフローは **19 のスキル**に
 
 | 経路 | 用途 | ランタイム | 入口 |
 |---|---|---|---|
-| A: Three.js オーバーレイ | 映像の**上に重なる**ライブ 3D（ロゴ回転・VideoTexture スクリーン等） | 透明 canvas + 宣言型 JSON + 同梱 Three.js | [overlay-authoring/3d.md](../skills/overlay-authoring/3d.md) |
-| B: Blender ベイク | 3D シーンを動かして**映像素材（クリップ）そのもの**を作る | なし（焼いた mp4 は通常素材） | [bake-3d](../skills/bake-3d/SKILL.md) |
+| A: Three.js オーバーレイ（**既定**） | 3D 全般。透過で合成され、画面に動画も差せ、glb 内蔵クリップで動く | 透明 canvas + 宣言型 JSON + 同梱 Three.js | [overlay-authoring/3d.md](../skills/overlay-authoring/3d.md) |
+| B: Blender ベイク | A で出せない絵・同時枚数の削減・素材ライブラリ納品 | なし（焼いた mp4 は通常素材） | [bake-3d](../skills/bake-3d/SKILL.md) |
 
-判定基準: **タイムラインにクリップとして置くなら B、映像の上に重ねるなら A**。
+判定基準: **既定は A。置き場所ではなく必要な能力で選ぶ**（「クリップとして置きたいから B」は誤り）。
+B を選ぶのは (1) 宣言型ランタイムで表現できない絵（被写界深度・モーションブラー・レイトレース反射・
+GI・パーティクル）(2) 同時 3D シーンを 2 枚以下へ減らすための事前焼き (3) 素材ライブラリへの納品、
+のいずれかに当てはまるときだけ。B の出力は不透明背景を連れてくる上に焼き直しが 10 分級なので、
+迷ったら A で試して行き詰まってから落とす方が速い（2026-08-04 の実制作で確認）。
 
 経路 B が Blender である理由（契約より）:
 
@@ -97,6 +104,18 @@ AKARI Video のエージェント側ワークフローは **19 のスキル**に
 | Lottie / Anime.js / GSAP / TypeGPU ほか | ❌ 未対応 | 汎用 JS seek hook は未実装。追加する場合は「宣言型 + 信頼済みランタイム」の型（Three.js オーバーレイと同型）に載せるのが前提 |
 
 補足: 未対応群の中では Lottie が最も型に馴染む候補（アセットが自前のタイムラインを持ち、再生ヘッドを外部制御できるため）。採用時期は未定。
+
+## 同梱 capability surface を検索する
+
+実際に追跡されている skill の leaf、契約、package README / manifest、manifest が宣言する
+公開 CLI entry は `akari capability <query> --json` で検索できる。frontmatter だけでなく nested
+Markdown も対象なので、`beat-sync` は `skills/edit-plan/beat-sync.md` まで到達する。
+
+text match が 0 件のときに限り、`--record-miss` で調べた source set の hash を現在の
+project の `.akari/reports/absence/` に記録できる。固定 verdict は review 必須を表し、
+`approved_to_build:false` である。これは「記述が見つからなかった」証拠であり、新設許可ではない。
+CLI は checkout と npm tarball で動作する。CLI の無い copied Claude plugin は独自 catalog を
+推測せず、capability 検索を unsupported と明示する。
 
 ## 関連ページ
 

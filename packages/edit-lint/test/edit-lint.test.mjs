@@ -6,9 +6,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { INTAKE_ROOT_FIELDS } from "../src/edit-lint.mjs";
+
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = join(packageRoot, "bin", "edit-lint.mjs");
 const fixtureRoot = join(packageRoot, "fixtures");
+const styleParity = JSON.parse(await readFile(join(
+  packageRoot, "../edit-store/test/fixtures/caption-style-validation-parity.json"
+), "utf8"));
+const intakeSchema = JSON.parse(await readFile(
+  join(packageRoot, "../schemas/intake.schema.json"),
+  "utf8",
+));
 
 async function withFixtures(callback) {
   const root = await mkdtemp(join(tmpdir(), "edit-lint-test-"));
@@ -33,6 +42,24 @@ function parseResult(runResult) {
   assert.notEqual(runResult.stdout.trim(), "", runResult.stderr);
   return JSON.parse(runResult.stdout);
 }
+
+function styleRootForCase(item, caption = styleParity.caption) {
+  const root = {
+    display_policy: styleParity.display_policy,
+    default_text_style: styleParity.valid_default_style,
+    captions: [{ ...caption, text_style: { color: "#FFF4D6" } }],
+  };
+  if (Object.hasOwn(item, "default_text_style")) root.default_text_style = item.default_text_style;
+  if (Object.hasOwn(item, "caption_text_style")) root.captions[0].text_style = item.caption_text_style;
+  return root;
+}
+
+test("INTAKE_ROOT_FIELDS matches intake.schema.json properties", () => {
+  assert.deepEqual(
+    new Set(INTAKE_ROOT_FIELDS),
+    new Set(Object.keys(intakeSchema.properties)),
+  );
+});
 
 test("valid fixture passes and writes both reports", async () => {
   await withFixtures(async (fixtures) => {
@@ -173,6 +200,41 @@ for (const [fixture, expectedCheck] of [
   });
 }
 
+for (const [fixture, expectedCheck] of [
+  ["overlays-background-role-invalid", "overlays.role"],
+  ["overlays-background-transform-invalid", "overlays.role.transform"],
+  ["overlays-background-vars-locked-invalid", "overlays.role.vars"],
+  ["overlays-background-overlap-invalid", "overlays.role.overlap"],
+]) {
+  test(`${fixture} fails with ${expectedCheck}`, async () => {
+    await withFixtures(async (fixtures) => {
+      const executed = run(join(fixtures, fixture));
+      assert.equal(executed.status, 1, executed.stderr);
+      const result = parseResult(executed);
+      assert.equal(result.verdict, "fail");
+      assert.ok(
+        result.findings.some(
+          (finding) => finding.check === expectedCheck && finding.severity === "error",
+        ),
+        JSON.stringify(result.findings, null, 2),
+      );
+    });
+  });
+}
+
+test("overlays-background-valid passes with no overlays.role findings", async () => {
+  await withFixtures(async (fixtures) => {
+    const executed = run(join(fixtures, "overlays-background-valid"));
+    assert.equal(executed.status, 0, executed.stderr);
+    const result = parseResult(executed);
+    assert.equal(result.verdict, "pass");
+    assert.ok(
+      !result.findings.some((finding) => finding.check?.startsWith("overlays.role")),
+      JSON.stringify(result.findings, null, 2),
+    );
+  });
+});
+
 test("missing analysis and captions are skipped while ffprobe supplies duration", async () => {
   await withFixtures(async (fixtures, root) => {
     const ffprobe = join(root, "ffprobe-stub");
@@ -246,6 +308,99 @@ test("captions validate source-time visibility and edited metadata", async () =>
   });
 });
 
+test("display policy, reference-pixel style, master encoding, and true peak lint through the shared kernel", async () => {
+  await withFixtures(async (fixtures) => {
+    const project = join(fixtures, "valid");
+    const editPath = join(project, "edit.json");
+    const edit = JSON.parse(await readFile(editPath, "utf8"));
+    edit.output.encoding = { quality: "master", encoder: "x264" };
+    edit.audio = { master: { loudnorm: -14, true_peak_dbtp: -1.7 } };
+    await writeFile(editPath, `${JSON.stringify(edit, null, 2)}\n`, "utf8");
+    await writeFile(join(project, "captions.json"), `${JSON.stringify({
+      display_policy: {
+        mode: "single_line_sequential",
+        algorithm: "a4-ja-two-fragment-v1",
+        unit_metric: "ascii-half-other-one-v1",
+        max_line_units: 8,
+        minimum_fragment_duration_seconds: 0.72,
+        locale: "ja",
+      },
+      default_text_style: {
+        size_px: 82,
+        font_weight: 600,
+        line_height: 1.08,
+        stroke: { method: "webkit-outline", color: "#050505", width_px: 5 },
+        layout: {
+          mode: "reference-pixel", reference_width_px: 1920, reference_height_px: 1080,
+          left_px: 261, width_px: 1120, bottom_px: 29, text_align: "center", max_lines: 1,
+        },
+      },
+      captions: [{
+        id: "c-0001", start: 5, end: 7, text: "正常です", speaker: null,
+        sourceRef: null, edited: true,
+      }],
+    }, null, 2)}\n`, "utf8");
+
+    const valid = run(project);
+    assert.equal(valid.status, 0, valid.stderr);
+    assert.ok(!parseResult(valid).findings.some(finding => finding.severity === "error"));
+
+    edit.emphasis_words = [{
+      id: "e-0001", t_start: 5.1, t_end: 5.2, word: "正", emotion: "emphasis",
+    }];
+    await writeFile(editPath, `${JSON.stringify(edit, null, 2)}\n`, "utf8");
+    const invalid = run(project);
+    assert.equal(invalid.status, 1, invalid.stderr);
+    assert.ok(parseResult(invalid).findings.some(finding => finding.check === "captions.display-policy-emphasis"));
+  });
+});
+
+test("shared opt-in text-style parity matrix matches edit-lint and the kernel gate", async () => {
+  await withFixtures(async (fixtures) => {
+    const project = join(fixtures, "valid");
+    const adjustedCaption = { ...styleParity.caption, start: 5, end: 7 };
+    for (const item of styleParity.valid_style_cases) {
+      await writeFile(join(project, "captions.json"), `${JSON.stringify({
+        display_policy: styleParity.display_policy,
+        default_text_style: item.style,
+        captions: [adjustedCaption],
+      }, null, 2)}\n`, "utf8");
+      const executed = run(project);
+      assert.equal(executed.status, 0, `${item.id}: ${executed.stderr}`);
+    }
+    for (const item of styleParity.invalid_cases) {
+      await writeFile(join(project, "captions.json"), `${JSON.stringify(styleRootForCase(item, adjustedCaption), null, 2)}\n`, "utf8");
+      const executed = run(project);
+      assert.equal(executed.status, 1, `${item.id}: ${executed.stderr}`);
+      assert.ok(parseResult(executed).findings.some(finding =>
+        finding.check === "captions.text-style" || finding.check === "captions.display-policy"
+      ), item.id);
+    }
+  });
+});
+
+test("shared caption-style contract accepts reveal-word and rejects an unknown value", async () => {
+  await withFixtures(async (fixtures) => {
+    const project = join(fixtures, "valid");
+    const captionsPath = join(project, "captions.json");
+    const baseCaption = { ...styleParity.caption, start: 5, end: 7 };
+    await writeFile(captionsPath, `${JSON.stringify([
+      { ...baseCaption, style: styleParity.caption_style_contract.accepted.style },
+    ], null, 2)}\n`, "utf8");
+    const accepted = run(project);
+    assert.equal(accepted.status, 0, accepted.stderr);
+
+    await writeFile(captionsPath, `${JSON.stringify([
+      { ...baseCaption, style: styleParity.caption_style_contract.unknown.style },
+    ], null, 2)}\n`, "utf8");
+    const unknown = run(project);
+    assert.equal(unknown.status, 1, unknown.stderr);
+    assert.ok(parseResult(unknown).findings.some(finding =>
+      finding.check === "captions.schema" && /reveal-word/u.test(finding.message)
+    ));
+  });
+});
+
 test("captions-words-valid fixture (words[] + style: karaoke, id c-0001) passes lint", async () => {
   await withFixtures(async (fixtures) => {
     const executed = run(join(fixtures, "captions-words-valid"));
@@ -284,6 +439,49 @@ test("captions-text-style-record-override-valid accepts root defaults and record
       !result.findings.some((finding) => finding.severity === "error"),
       JSON.stringify(result.findings, null, 2),
     );
+  });
+});
+
+test("caption text animation accepts defaults and per-caption slot overrides", async () => {
+  await withFixtures(async (fixtures) => {
+    const project = join(fixtures, "valid");
+    await writeFile(join(project, "captions.json"), `${JSON.stringify({
+      default_text_style: {
+        animation: {
+          in: { id: "fade-up", duration_sec: 0.4, ease: "ease-out", amp: 1.2 },
+          out: { id: "soft-fade", ease: null, amp: null },
+        },
+      },
+      captions: [{
+        id: "c-0001", start: 5, end: 9, text: "字幕", speaker: null,
+        sourceRef: null, edited: false,
+        text_style: { animation: { loop: { id: "float" } } },
+      }],
+    }, null, 2)}\n`, "utf8");
+
+    const executed = run(project);
+    assert.equal(executed.status, 0, executed.stderr);
+    assert.ok(!parseResult(executed).findings.some((finding) => finding.severity === "error"));
+  });
+});
+
+test("caption text animation rejects ids absent from the textanim index", async () => {
+  await withFixtures(async (fixtures) => {
+    const project = join(fixtures, "valid");
+    await writeFile(join(project, "captions.json"), `${JSON.stringify({
+      default_text_style: { animation: { in: { id: "nonexistent-anim" } } },
+      captions: [{
+        id: "c-0001", start: 5, end: 9, text: "字幕", speaker: null,
+        sourceRef: null, edited: false,
+      }],
+    }, null, 2)}\n`, "utf8");
+
+    const executed = run(project);
+    assert.equal(executed.status, 1, executed.stderr);
+    assert.ok(parseResult(executed).findings.some((finding) =>
+      finding.check === "captions.text-style"
+        && /presets\/textanim\/index\.jsonl/.test(finding.message)
+    ));
   });
 });
 
@@ -937,11 +1135,65 @@ test("media mode reports silence and volume; a configured silence threshold fail
   }
 });
 
+test("media mode skips silence and volume for a source without an audio stream", async (t) => {
+  const available = spawnSync("ffmpeg", ["-version"], { encoding: "utf8" });
+  if (available.status !== 0) {
+    t.skip("ffmpeg is not available");
+    return;
+  }
+
+  const root = await mkdtemp(join(tmpdir(), "edit-lint-media-no-audio-"));
+  try {
+    const mediaPath = join(root, "source.mp4");
+    const generated = spawnSync(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=64x64:rate=10:duration=1",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        mediaPath,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(generated.status, 0, generated.stderr);
+    await writeFile(
+      join(root, "edit.json"),
+      `${JSON.stringify({
+        version: 0,
+        output: { width: 64, height: 64, fps: 10 },
+        source: { path: "source.mp4", proxy: null },
+        cuts: [{ in: 0, out: 1 }],
+        overlays: [],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+    await writeFile(join(root, "analysis.json"), '{"duration":1}\n', "utf8");
+
+    const executed = run(root, ["--media"]);
+    assert.equal(executed.status, 0, executed.stderr);
+    const result = parseResult(executed);
+    assert.ok(result.skipped.some((item) => item.check === "media.silence"));
+    assert.ok(result.skipped.some((item) => item.check === "media.volume"));
+    assert.ok(!result.findings.some((finding) => finding.check === "media.silence"));
+    assert.ok(!result.findings.some((finding) => finding.check === "media.volume"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("caption silence coverage warns only above its configurable threshold in media mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "edit-lint-caption-silence-"));
   try {
     const mediaPath = join(root, "source.wav");
     const ffmpeg = join(root, "ffmpeg-stub");
+    const ffprobe = join(root, "ffprobe-stub");
     await writeFile(mediaPath, "", "utf8");
     await writeFile(
       ffmpeg,
@@ -961,6 +1213,8 @@ exit 0
       "utf8",
     );
     await chmod(ffmpeg, 0o755);
+    await writeFile(ffprobe, "#!/bin/sh\necho 0\n", "utf8");
+    await chmod(ffprobe, 0o755);
     await writeFile(
       join(root, "edit.json"),
       `${JSON.stringify({
@@ -994,20 +1248,21 @@ exit 0
       parseResult(executed).findings.filter(
         (finding) => finding.check === "media.caption-silence-coverage",
       );
+    const mediaEnv = { FFMPEG: ffmpeg, FFPROBE: ffprobe };
 
     await writeCaption(6);
-    const above = run(root, ["--media"], { FFMPEG: ffmpeg });
+    const above = run(root, ["--media"], mediaEnv);
     assert.equal(above.status, 0, above.stderr);
     assert.equal(coverageFindings(above).length, 1);
     assert.match(coverageFindings(above)[0].message, /50\.0%/);
 
     await writeCaption(12);
-    const below = run(root, ["--media"], { FFMPEG: ffmpeg });
+    const below = run(root, ["--media"], mediaEnv);
     assert.equal(below.status, 0, below.stderr);
     assert.equal(coverageFindings(below).length, 0);
 
     await writeCaption(10);
-    const boundary = run(root, ["--media"], { FFMPEG: ffmpeg });
+    const boundary = run(root, ["--media"], mediaEnv);
     assert.equal(boundary.status, 0, boundary.stderr);
     assert.equal(coverageFindings(boundary).length, 0);
 
@@ -1015,7 +1270,7 @@ exit 0
     const raisedThreshold = run(
       root,
       ["--media", "--caption-silence-warn-percent", "50"],
-      { FFMPEG: ffmpeg },
+      mediaEnv,
     );
     assert.equal(raisedThreshold.status, 0, raisedThreshold.stderr);
     assert.equal(coverageFindings(raisedThreshold).length, 0);
@@ -1023,7 +1278,7 @@ exit 0
     const loweredThreshold = run(
       root,
       ["--media", "--caption-silence-warn-percent=49"],
-      { FFMPEG: ffmpeg },
+      mediaEnv,
     );
     assert.equal(loweredThreshold.status, 0, loweredThreshold.stderr);
     assert.equal(coverageFindings(loweredThreshold).length, 1);
@@ -1361,6 +1616,58 @@ test("declared timeline ref without edit data warns without failing", async () =
   });
 });
 
+// task 2026-08-07-track-transition-lint-guard (task #14's finding, verified with a real render:
+// gap-aware track compositing splits an xfade-blended pair of same-track cuts into two separate,
+// non-overlapping composite windows -- the second window points past where the actually-shrunk
+// clip's content ends, and the base track's background visibly leaks through early).
+test("cuts[].transition_out on a track composited through a non-default timeline.tracks order fails lint", async () => {
+  await withFixtures(async (fixtures) => {
+    const executed = run(join(fixtures, "cuts-track-transition-invalid"));
+    assert.equal(executed.status, 1, executed.stderr);
+    const result = parseResult(executed);
+    assert.equal(result.verdict, "fail");
+    const finding = result.findings.find((item) => item.check === "cuts.track-transition-unsupported");
+    assert.ok(finding, JSON.stringify(result.findings, null, 2));
+    assert.equal(finding.severity, "error");
+    assert.equal(finding.path, "edit.json#cuts[0]");
+    assert.match(finding.message, /gap-aware track engine/);
+  });
+});
+
+test("transition_out on the LAST cut of a gap-aware track is a no-op and does not fail lint", async () => {
+  // Mirrors buildMultiSourceCutCommand's own hasAnyTransition check (plan.mjs) and
+  // predictedDuration's overlap accounting: a track's last cut has no following same-track cut
+  // to blend into, so its transition_out never actually renders and isn't a real hazard.
+  await withFixtures(async (fixtures) => {
+    const executed = run(join(fixtures, "cuts-track-transition-last-cut-valid"));
+    assert.equal(executed.status, 0, executed.stderr);
+    const result = parseResult(executed);
+    assert.equal(result.verdict, "pass");
+    assert.ok(
+      !result.findings.some((finding) => finding.check === "cuts.track-transition-unsupported"),
+      JSON.stringify(result.findings, null, 2),
+    );
+  });
+});
+
+test("transition_out on a track whose timeline.tracks order matches the default derived order does not fail lint", async () => {
+  // When the declared order matches what deriveTracks would produce anyway, render-cut never
+  // invokes buildTrackStackPlan/resolveCutTrackRanges (see usesDefaultTrackOrder) -- cuts[].track
+  // has no compositing effect at all here (the plain sequential path concatenates every cut as
+  // one flat timeline, and buildMultiSourceCutCommand's own transition_out handling, task
+  // 2026-08-07-v1-transition-out, is correct there), so this combination is not a hazard.
+  await withFixtures(async (fixtures) => {
+    const executed = run(join(fixtures, "cuts-track-transition-default-order-valid"));
+    assert.equal(executed.status, 0, executed.stderr);
+    const result = parseResult(executed);
+    assert.equal(result.verdict, "pass");
+    assert.ok(
+      !result.findings.some((finding) => finding.check === "cuts.track-transition-unsupported"),
+      JSON.stringify(result.findings, null, 2),
+    );
+  });
+});
+
 test("edit data without a declared timeline track warns when timeline is present", async () => {
   await withFixtures(async (fixtures) => {
     const executed = run(join(fixtures, "timeline-tracks-declaration-missing-warning"));
@@ -1411,5 +1718,23 @@ test("non-zero ref audio timeline track declaration warns neither audio-ref nor 
       ),
       JSON.stringify(result.findings, null, 2),
     );
+  });
+});
+
+// captions.overlay-link 撤去の固定（2026-08-07）。
+// この規則は「caption の id と一致する overlays[].id が無ければ警告」で、edit-lint 初版から
+// 入っていたが、通るプロジェクトが 1 つも存在しなかった（このリポジトリ自身の字幕フィクスチャ
+// 6/6 で全字幕に 1 件ずつ発火）。字幕のオーバーレイは消費側が captions[] から合成するもので、
+// edit.json に手書きで並べる設計ではないため、規則そのものが実装と食い違っていた。
+// 常時全件発火する警告は本物の指摘を埋めるだけなので撤去した。ここで固定しておかないと、
+// 「字幕とオーバーレイを対応させるべきでは」という直感から再導入されうる。
+test("captions.overlay-link は発火しない（撤去済み・字幕は消費側が overlays を合成する）", async () => {
+  await withFixtures(async (fixtures) => {
+    for (const name of ["captions-display-text-valid", "captions-words-valid", "captions-reveal-valid", "captions-text-style-record-override-valid"]) {
+      const project = join(fixtures, name);
+      const result = parseResult(run(project));
+      const linked = result.findings.filter((finding) => finding.check === "captions.overlay-link");
+      assert.deepEqual(linked, [], `${name} に overlay-link が残っている`);
+    }
   });
 });

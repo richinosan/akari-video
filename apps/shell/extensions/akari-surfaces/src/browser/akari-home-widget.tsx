@@ -13,6 +13,7 @@ import { isOSX, isWindows } from '@theia/core/lib/common/os';
 import { FileService } from '@theia/filesystem/lib/browser/file-service';
 import { FileStat } from '@theia/filesystem/lib/common/files';
 import { WorkspaceService } from '@theia/workspace/lib/browser/workspace-service';
+import { WorkspaceCommands } from '@theia/workspace/lib/browser/workspace-commands';
 import { inject, injectable, postConstruct } from '@theia/core/shared/inversify';
 import {
     IntakeAutonomy,
@@ -41,13 +42,30 @@ import {
     withDismissedVersion
 } from '../common/update-feed';
 import {
+    applyShellUpdaterEvent,
+    formatDownloadedBannerText,
+    INITIAL_SHELL_UPDATER_UI_STATE,
+    ShellUpdaterUiState
+} from '../common/shell-update-applier';
+import { ElectronAkariUpdaterApi, ShellUpdaterEvent } from '../electron-common/electron-api';
+import {
     buildReleaseNotesUrl,
     evaluateVersionNotice,
     formatVersionNoticeText,
     parseShellLastVersion,
     withRecordedVersion
 } from '../common/shell-version-notice';
-import { AkariNewProjectService } from '../common/akari-new-project-protocol';
+import {
+    AkariNewProjectService
+} from '../common/akari-new-project-protocol';
+import { FirstRunSetupOpenMode } from '../common/first-run-onboarding';
+import { parseIntakeTitle, resolveProjectDisplayName } from '../common/project-display-name';
+import { AkariFirstRunSetupDialog } from './akari-first-run-setup-dialog';
+import { AkariProjectService } from 'akari-project/lib/common/akari-project-protocol';
+import {
+    StoreConnectionFlowController,
+    StoreConnectionFlowPhase
+} from 'akari-project/lib/common/store-connection-flow';
 
 // ホーム v4（裁定 R1〜R3・notes-2026-08-02-home-v4-minimal）: dashboard の
 // 構成要素を 3 つだけに削る — ①説明（2 動作） ②過去プロジェクト一覧
@@ -72,11 +90,24 @@ const UPDATE_CACHE_FILENAME = 'update-check.json';
 // アプリ単位の「パートナー接続済み」マーカー。akari-partner の node バックエンドが
 // 接続成立時に書く（ファイル契約のみで結合する — 拡張間の import 依存は増やさない）。
 const PARTNER_CONNECTION_FILENAME = 'partner-connection.json';
+// AKARI Store の接続資格情報。内蔵デバイスフローと launcher CLI が共有する。
+const STORE_CREDENTIALS_FILENAME = 'store-credentials.json';
+// ストアの表看板は `/lab`（worker ルートは /lab* と /api/store* のみ。/store/ は 404 —
+// akari-video-store worker/wrangler.jsonc・asset-catalog-view.ts の deriveStoreLabBaseUrl と同じ規約）。
+const STORE_SITE_FALLBACK = 'https://akari-oss.app/lab/';
 // 「AI パートナー接続」のプロジェクト単位 SSOT は connections.json の akari-cloud
 // provider の doctor.status（partner pane が「akari-cloud・接続済み」と表示する対象と同一）。
 const CLOUD_PROVIDER_ID = 'akari-cloud';
 const BEGIN_ONBOARDING_COMMAND = 'akari.partner.beginOnboarding';
 const SEND_TO_PARTNER_COMMAND = 'akari.partner.send';
+// akari-project の akari-reveal-commands.ts とミラー（拡張間 npm 依存を作らない —
+// akari-project-contribution.ts 冒頭コメントと同じ「薄いコマンド境界」流儀。
+// task 2026-08-09-reveal-in-finder）。
+const REVEAL_IN_FILE_MANAGER_COMMAND = 'akari.project.revealInFileManager';
+/** ボタンの title/aria-label 用の一文（「を」の二重化を避けて OS ごとに文型を変える）。 */
+function revealInFileManagerActionLabel(subject: string): string {
+    return isOSX ? `${subject} を Finder で表示` : `${subject} のフォルダを開く`;
+}
 
 // --- D&D 復活（v3 home dropzone からの再利用。bacd7f5 時点の akari-home-widget.tsx） ---
 // workflow.json の roles に assets kind が無いときの既定パス（v3 と同じ既定値）。
@@ -97,7 +128,11 @@ const CREATOR_ROOT_SCHEMA = 'creator-root/v1';
 const CREATOR_ROOT_CHANNELS_DIRNAME = 'channels';
 const CREATOR_ROOT_VIDEOS_DIRNAME = 'videos';
 const CREATOR_ROOT_PROJECT_DISPLAY_LIMIT = 10;
-const CREATOR_ROOT_MISSING_NOTICE = '作業場はまだありません — 右の相棒に頼むか、ターミナルで `akari` を実行すると作れます。';
+// 無 root 時のプロジェクト一覧フォールバック（task 2026-08-04-home-no-root-flow）。
+// v4 時代の独立案内行「作業場はまだありません…」は状態バッジ（U2/U5）と二重表示に
+// なっていたため撤去した — 案内は状態バッジ 1 箇所に集約し、ここは見出し下の薄い
+// 1 行に留める（U1: 「作業場」の語は使わない）。
+const CREATOR_ROOT_LIST_PLACEHOLDER = 'プロジェクトはここに並びます';
 // 既定チャンネル名（packages/creator-root/src/index.mjs の DEFAULT_CHANNEL_NAME と
 // 同じ値。root.json の channels が空/未解決のときのフォールバックにのみ使う —
 // 通常は manifest.channels[0]（誕生時に作られた最初のチャンネル）を使う）。
@@ -119,15 +154,20 @@ const RECENT_WORKSPACES_SCAN_LIMIT = 20;
 const STANDALONE_PROJECT_DISPLAY_LIMIT = 5;
 
 interface CreatorRootProjectEntry {
+    /** フォルダ名（機械の ID。ソート・URI 解決に使う。表示には使わない — 表示は title ?? name）。 */
     name: string;
     channel: string;
     uri: URI;
+    /** `.akari/intake.json` の title（task 2026-08-09-project-display-title）。無ければ null。 */
+    title: string | null;
 }
 
 /** U3: 履歴から拾った「単体」（作業場外）プロジェクト 1 件。 */
 interface StandaloneProjectEntry {
+    /** フォルダ名（機械の ID）。表示は title ?? name。 */
     name: string;
     uri: URI;
+    title: string | null;
 }
 
 /** U3: プロジェクト一覧（唯一のスイッチャー）1 行分。past/current/standalone を統合した表示用の形。 */
@@ -167,6 +207,9 @@ interface IntakeSnapshot {
     duration: IntakeDurationChoice;
     autonomy: IntakeAutonomy;
     taste: string | null;
+    /** 人間向け表示名（task 2026-08-09-project-display-title）。フォームの入力対象ではなく、
+     * エージェントが企画確定時に書く。無い/壊れていれば null（表示側は title ?? フォルダ名）。 */
+    title: string | null;
 }
 
 @injectable()
@@ -203,7 +246,30 @@ export class AkariHomeWidget extends ReactWidget {
     @inject(AkariNewProjectService)
     protected readonly newProjectService: AkariNewProjectService;
 
+    @inject(AkariProjectService)
+    protected readonly storeService: AkariProjectService;
+
     protected watching = false;
+
+    // --- F11 ウェルカム画面（状態 0・task 2026-08-05-welcome-screen） ---
+    // `workspaceService.roots` が空（プロジェクト未選択で起動）のときだけ true。
+    // true の間は render() が renderWelcomeSurface() に分岐し、通常ホームの要素
+    // （状態バッジ・説明・接続カード等）は一切描画しない（task.md §2）。
+    protected welcomeMode = false;
+
+    // 初回オンボーディング本体は専用モーダルが所有する。home は開く配線だけを保持する。
+    protected firstRunSetupDialog: AkariFirstRunSetupDialog | undefined;
+    protected firstRunSetupDialogClosed: Promise<void> | undefined;
+    // セットアップ完了直後はワークスペース root がまだ無くても dashboard へ抜ける。
+    protected showDashboardWithoutProject = false;
+
+    // --- AKARI Store 接続（オーナー要望 2026-08-03「アプリ側でも欲しい」） ---
+    protected storeEmail: string | null = null;
+    protected storeFlowPhase: StoreConnectionFlowPhase = 'idle';
+    protected storeFlowError?: string;
+    protected storeFlowUserCode?: string;
+    protected storeConnectionFlow: StoreConnectionFlowController;
+    protected storeSiteUrl = STORE_SITE_FALLBACK;
 
     // --- D&D 復活: 素材の取り込み（v3 home dropzone から再利用） ---
     protected importing = false;
@@ -260,6 +326,12 @@ export class AkariHomeWidget extends ReactWidget {
     protected updateRawCache: UpdateCache | null = null;
     protected updateStatus: UpdateStatus = { available: false };
 
+    // --- U3 electron-updater（内部リポ契約 update-and-versioning §11）: DL 済み・
+    // 再起動待ちの状態。U2 のリモートフィード比較（updateStatus）とは独立した
+    // 別 SSOT（main プロセスの IPC イベントだけで決まる — shell-update-applier.ts 参照）。
+    protected updaterUiState: ShellUpdaterUiState = INITIAL_SHELL_UPDATER_UI_STATE;
+    protected updaterUnsubscribe: (() => void) | undefined;
+
     @postConstruct()
     protected init(): void {
         this.id = AkariHomeWidget.ID;
@@ -267,14 +339,31 @@ export class AkariHomeWidget extends ReactWidget {
         this.title.caption = 'AKARI プロジェクトホーム';
         this.title.iconClass = 'codicon codicon-home';
         this.title.closable = false;
+        this.storeConnectionFlow = new StoreConnectionFlowController(this.storeService, {
+            openVerificationUrl: url => this.windowService.openNewWindow(url, { external: true }),
+            onChange: state => {
+                this.storeFlowPhase = state.phase;
+                this.storeFlowError = state.error;
+                this.storeFlowUserCode = state.userCode;
+                if (state.connection.connected) {
+                    this.storeEmail = state.connection.email ?? state.connection.identifier ?? '接続済み';
+                }
+                this.update();
+            }
+        });
+        this.toDispose.push({ dispose: () => this.storeConnectionFlow.dispose() });
         this.update();
     }
 
     async start(): Promise<void> {
+        // F11: ウェルカム判定は roots の有無だけを見る軽い判定なので最初に済ませる
+        // （後続のロードが終わるのを待たせない）。
+        await this.refreshWelcomeMode();
         await this.loadHomeFlow();
         await this.loadCreatorRootProjects();
         // U3: 履歴由来の「単体」プロジェクトは creatorRootProjects（重複除外に使う）の後に読む。
         await this.loadStandaloneProjects();
+        await this.initializeFirstRunSetup();
         // U2: 状態バッジの解決（creatorRootUri）の後に読む — 現在地がチャンネルの
         // 内側かどうかの判定に使うため。
         await this.refreshCurrentLocation();
@@ -282,6 +371,10 @@ export class AkariHomeWidget extends ReactWidget {
         // （ローカル I/O のみ・十分高速）、バックグラウンド fetch はここで await しない
         // （loadUpdateStatus 内で fire-and-forget にしてある）。
         await this.loadUpdateStatus();
+        // U3: electron-updater の main プロセスイベント購読（DL 済み・再起動ボタン状態）。
+        // 同期メソッド（内部の IPC 呼び出しは fire-and-forget）— 起動をブロックしない。
+        // 未署名の開発ビルド（`window.electronAkariUpdater` 不在）では何もせず沈黙する。
+        this.initUpdaterEvents();
         // F2: 「更新されました」ポップアップ（U2 のリモートフィード比較とは独立・
         // ローカル前回起動記録のみで判定。起動を待たせないほど重くはないため await する）。
         await this.checkVersionNotice();
@@ -306,10 +399,82 @@ export class AkariHomeWidget extends ReactWidget {
      */
     protected override onAfterShow(msg: Message): void {
         super.onAfterShow(msg);
+        void this.refreshWelcomeMode();
         void this.refreshHomeFlow();
         void this.loadCreatorRootProjects()
             .then(() => this.loadStandaloneProjects())
             .then(() => this.refreshCurrentLocation());
+    }
+
+    /**
+     * F11 ウェルカム判定（task 2026-08-05-welcome-screen）。開いているワークスペース
+     * root が 1 つも無ければウェルカム面へ（`roots.length === 0`）。
+     */
+    protected async refreshWelcomeMode(): Promise<void> {
+        const roots = await this.workspaceService.roots;
+        this.welcomeMode = roots.length === 0;
+        this.update();
+    }
+
+    /** 完全初回だけ、ウェルカム面の上へ専用モーダルを自動表示する。 */
+    protected async initializeFirstRunSetup(): Promise<void> {
+        const roots = await this.workspaceService.roots;
+        const hasProjectHistory = this.creatorRootProjects.length > 0 || this.standaloneProjects.length > 0;
+        const dialog = this.createFirstRunSetupDialog();
+        if (!await dialog.shouldAutoOpen({
+            hasOpenProject: roots.length > 0,
+            hasProjectHistory
+        })) {
+            return;
+        }
+        void this.openFirstRunSetupDialog('automatic', dialog);
+    }
+
+    /** コマンドパレット／ホームの導線から何度でも明示再表示できる。 */
+    openFirstRunSetup = async (): Promise<void> => {
+        this.showDashboardWithoutProject = false;
+        this.update();
+        await this.openFirstRunSetupDialog('manual');
+    };
+
+    protected createFirstRunSetupDialog(): AkariFirstRunSetupDialog {
+        return new AkariFirstRunSetupDialog(
+            {
+                title: '初回セットアップ',
+                onWorkspaceCreated: async () => {
+                    await this.loadCreatorRootProjects();
+                },
+                onFinished: () => {
+                    this.showDashboardWithoutProject = true;
+                    this.update();
+                    void this.refreshHomeFlow();
+                }
+            },
+            this.fileService,
+            this.envVariables,
+            this.newProjectService,
+            this.commands
+        );
+    }
+
+    protected openFirstRunSetupDialog(
+        mode: FirstRunSetupOpenMode,
+        preparedDialog?: AkariFirstRunSetupDialog
+    ): Promise<void> {
+        if (this.firstRunSetupDialog && this.firstRunSetupDialogClosed) {
+            this.firstRunSetupDialog.activate();
+            return this.firstRunSetupDialogClosed;
+        }
+        const dialog = preparedDialog ?? this.createFirstRunSetupDialog();
+        this.firstRunSetupDialog = dialog;
+        const closed = dialog.openSetup(mode).finally(() => {
+            if (this.firstRunSetupDialog === dialog) {
+                this.firstRunSetupDialog = undefined;
+                this.firstRunSetupDialogClosed = undefined;
+            }
+        });
+        this.firstRunSetupDialogClosed = closed;
+        return closed;
     }
 
     // --- ホーム v3: 状態読み取り（SSOT はファイル。裁定 R1/R5） ---
@@ -340,10 +505,34 @@ export class AkariHomeWidget extends ReactWidget {
      */
     protected async refreshHomeFlow(): Promise<void> {
         this.connected = await this.readConnected();
+        this.storeEmail = await this.readStoreConnection();
         const intake = await this.readIntake();
         this.intakeSnapshot = intake;
         this.intakeStatus = intake.status;
         this.update();
+    }
+
+    /**
+     * AKARI Store の接続状態（`~/.akari/store-credentials.json`・AKARI_HOME で差し替え可）。
+     * 読み方は partner-connection.json と同じ EnvVariablesServer + FileService 経路。
+     * 無い/壊れていれば未接続扱い（フェイルセーフ側）。watch は張らない —
+     * 反映は内蔵デバイスフローの RPC 結果とホーム再表示時の読み直しで担保する。
+     */
+    protected async readStoreConnection(): Promise<string | null> {
+        try {
+            const uri = (await this.resolveAkariHomeUri()).resolve(STORE_CREDENTIALS_FILENAME);
+            const parsed = JSON.parse((await this.fileService.readFile(uri)).value.toString());
+            if (typeof parsed?.token !== 'string') {
+                return null;
+            }
+            if (typeof parsed?.url === 'string') {
+                // 資格情報の url は API 基点（…/api/store）。サイト側の基点（…/lab/）に読み替える
+                this.storeSiteUrl = parsed.url.replace(/\/api\/store\/?$/, '/lab/');
+            }
+            return typeof parsed?.email === 'string' ? parsed.email : '接続済み';
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -410,7 +599,8 @@ export class AkariHomeWidget extends ReactWidget {
             tasks: [...INTAKE_TASK_DEFAULTS],
             duration: INTAKE_DEFAULT_DURATION,
             autonomy: INTAKE_DEFAULT_AUTONOMY,
-            taste: null
+            taste: null,
+            title: null
         };
         if (!this.intakeUri) {
             return fallback;
@@ -428,7 +618,8 @@ export class AkariHomeWidget extends ReactWidget {
                 autonomy: (INTAKE_AUTONOMY_ORDER as readonly string[]).includes(parsed?.autonomy)
                     ? parsed.autonomy as IntakeAutonomy
                     : INTAKE_DEFAULT_AUTONOMY,
-                taste: typeof target?.taste === 'string' ? target.taste : null
+                taste: typeof target?.taste === 'string' ? target.taste : null,
+                title: parseIntakeTitle(parsed)
             };
         } catch {
             return fallback;
@@ -504,7 +695,7 @@ export class AkariHomeWidget extends ReactWidget {
             if (!(await this.isScaffoldedProject(uri))) {
                 continue;
             }
-            results.push({ name: uri.path.base || fsPath, uri });
+            results.push({ name: uri.path.base || fsPath, uri, title: await this.readProjectTitle(uri) });
             if (results.length >= STANDALONE_PROJECT_DISPLAY_LIMIT) {
                 break;
             }
@@ -518,6 +709,20 @@ export class AkariHomeWidget extends ReactWidget {
             return await this.fileService.exists(uri.resolve(CONNECTIONS_RELATIVE_PATH));
         } catch {
             return false;
+        }
+    }
+
+    /**
+     * 一覧 1 行分の表示名解決用に、`<projectUri>/.akari/intake.json` の title だけを読む
+     * （task 2026-08-09-project-display-title）。無い・壊れている場合は null
+     * （フェイルセーフ側 — 一覧描画自体は止めない）。
+     */
+    protected async readProjectTitle(uri: URI): Promise<string | null> {
+        try {
+            const content = await this.fileService.readFile(uri.resolve(INTAKE_RELATIVE_PATH));
+            return parseIntakeTitle(JSON.parse(content.value.toString()));
+        } catch {
+            return null;
         }
     }
 
@@ -570,10 +775,16 @@ export class AkariHomeWidget extends ReactWidget {
         for (const channelDir of channelDirs) {
             const projectDirs = await this.resolveChildDirectories(channelDir.resource.resolve(CREATOR_ROOT_VIDEOS_DIRNAME));
             for (const projectDir of projectDirs) {
-                entries.push({ name: projectDir.name, channel: channelDir.name, uri: projectDir.resource });
+                entries.push({ name: projectDir.name, channel: channelDir.name, uri: projectDir.resource, title: null });
             }
         }
-        return this.sortCreatorRootProjects(entries).slice(0, CREATOR_ROOT_PROJECT_DISPLAY_LIMIT);
+        // ソート（フォルダ名の日付プレフィックス基準）→ 表示上限で絞ってから title を読む
+        // — 一覧に出ない過去プロジェクトぶんまで intake.json を読みにいかないため。
+        const sliced = this.sortCreatorRootProjects(entries).slice(0, CREATOR_ROOT_PROJECT_DISPLAY_LIMIT);
+        await Promise.all(sliced.map(async entry => {
+            entry.title = await this.readProjectTitle(entry.uri);
+        }));
+        return sliced;
     }
 
     /** 名前の日付プレフィックス（`YYYY-MM-DD-...`）降順。プレフィックスが無いものは末尾（辞書順）。 */
@@ -605,6 +816,14 @@ export class AkariHomeWidget extends ReactWidget {
     protected openCreatorRootProject = (uri: URI): void => {
         this.workspaceService.open(uri);
     };
+
+    /**
+     * プロジェクトカードの「Finder で表示」ボタン（task 2026-08-09-reveal-in-finder）。
+     * 実体は akari-project 拡張のコマンド（ID ミラー・存在確認とエラー表示もあちらが担う）。
+     */
+    protected async revealProjectInFileManager(row: ProjectListRow): Promise<void> {
+        await this.commands.executeCommand(REVEAL_IN_FILE_MANAGER_COMMAND, row.uri);
+    }
 
     // --- F5 新しい動画を始める（task 2026-08-03-shell-quickwins-feedback） -----
 
@@ -655,32 +874,97 @@ export class AkariHomeWidget extends ReactWidget {
 
     /**
      * 「+ 新しい動画を始める」。作業場の既定チャンネルの `videos/` 配下に
-     * 新規プロジェクトを作り、開く（孤児禁止 — task.md 指定）。
+     * 新規プロジェクトを作り、開く（孤児禁止 — task.md 指定）。作業場が一つも
+     * 解決できていない（`creatorRootUri` 未解決 — ウェルカム画面の完全初回など）
+     * ときは、F9 の ensureCreatorRoot 連結（確認 → 作成）を経てから同じ生成へ
+     * 続ける（task 2026-08-05-welcome-screen §1「F9 の ensureCreatorRoot 連結に
+     * 繋ぐ」指定）。確認をキャンセルした/作成に失敗したときは何も変えず戻る
+     * （エラーメッセージは失敗時のみ ensureCreatorRootForNewProject 側で出す）。
      * 生成は `akari-project` 拡張の既存バックエンドサービス
      * `AkariProjectService#createProject()` を呼ぶだけで再実装しない
      * （テンプレコピー・フォールバック補完・スキル同梱・git init は向こう側の責務）。
-     * 生成できたら `openCreatorRootProject` と同じ `WorkspaceService#open` で開く。
+     * 生成できたら**このウィンドウをそのまま**新しい動画へ切り替える
+     * （`preserveWindow: true`）。`openCreatorRootProject`（過去プロジェクトを開く）が
+     * 別ウィンドウなのと違うのは、こちらが「今から作る 1 本へ移動する」導線だから
+     * （プロジェクト未選択のウェルカム画面では Theia 既定が元々同ウィンドウ切替に
+     * なるため、状態によって挙動が変わらない形にも揃う）。
+     *
+     * 開くのに `WorkspaceService#open` は使えない: あれは `void` を返す
+     * fire-and-forget で、内部の `doOpen` を await せず失敗も握り潰すため、
+     * 開けなかったときに下の catch へ入らず「作成しています…」で固まる
+     * （実機再現済み。`openWorkspace` は同じ経路を Promise で返す public API）。
+     * フラグ復帰は finally に置く — 成功時に戻し忘れるとボタンが
+     * disabled のまま二度と押せなくなる（同上）。
      */
-    protected startNewProject = async (): Promise<void> => {
-        if (this.startingNewProject || !this.creatorRootUri) {
+    startNewProject = async (): Promise<void> => {
+        if (this.startingNewProject) {
             return;
         }
         this.startingNewProject = true;
         this.update();
-        const rootUri = this.creatorRootUri;
         try {
+            // `creatorRootUri` は loadCreatorRootProjects が解決して持つが、この経路は
+            // File メニューのコマンド（akari-home-command-contribution）からも来る —
+            // ホームを開いた直後だと解決がまだ走っていないことがあり、そのまま
+            // ensureCreatorRootForNewProject に落ちると置き場が既にあるのに
+            // 「作成しますか？」を聞いてしまう。先に同じ解決を 1 回試す。
+            const rootUri = this.creatorRootUri
+                ?? (this.creatorRootUri = await this.resolveCreatorRootDir())
+                ?? await this.ensureCreatorRootForNewProject();
+            if (!rootUri) {
+                return;
+            }
             const channel = await this.resolveDefaultChannelName(rootUri);
             const name = await this.reserveNewProjectName(rootUri, channel);
             const destination = rootUri.resolve(CREATOR_ROOT_CHANNELS_DIRNAME).resolve(channel).resolve(CREATOR_ROOT_VIDEOS_DIRNAME).resolve(name);
             await this.newProjectService.createProject(destination.toString());
-            this.workspaceService.open(destination);
+            await this.workspaceService.openWorkspace(destination, { preserveWindow: true });
         } catch (error) {
             console.error('[akari-surfaces] failed to start a new project:', error);
-            this.messages.error('新しい動画の作成に失敗しました。');
+            // 理由を出さない 1 行だけだと実機の失敗（雛形/scaffold の同梱漏れ・権限・
+            // 同名衝突）がすべて同じ文言に潰れて切り分けができない。`ensureCreatorRoot`
+            // 側（describeEnsureError）と同じ流儀で、原因を括弧で添える。
+            this.messages.error(
+                error instanceof Error && error.message
+                    ? `新しい動画の作成に失敗しました（${error.message}）。`
+                    : '新しい動画の作成に失敗しました。'
+            );
+        } finally {
             this.startingNewProject = false;
             this.update();
         }
     };
+
+    /**
+     * 無 root 時の「+ 新しい動画を始める」連結（F9 ensureCreatorRoot・
+     * task 2026-08-05-welcome-screen §1）。`createChannelDestinationAndJoin`
+     * （U5「チャンネルに入れる」の無 root 連結・task 2026-08-04-home-no-root-flow）と
+     * 対になる新規プロジェクト版 — 確認は 1 回だけ、「作業場」の語は出さない（U1）。
+     * 解決できたら以後の一覧・状態バッジ解決も新しい置き場を見られるようにしておく
+     * （`createChannelDestinationAndJoin` と同じ流儀）。
+     */
+    protected async ensureCreatorRootForNewProject(): Promise<URI | undefined> {
+        const confirmed = await new ConfirmDialog({
+            title: 'チャンネルの置き場を作成しますか？',
+            msg: 'チャンネルの置き場がまだありません。作成して、新しい動画を始めますか？（データの場所: ~/Akari）',
+            ok: '作成してはじめる',
+            cancel: 'キャンセル'
+        }).open();
+        if (!confirmed) {
+            return undefined;
+        }
+        try {
+            const rootUriString = await this.newProjectService.ensureCreatorRoot();
+            const rootUri = new URI(rootUriString);
+            this.creatorRootUri = rootUri;
+            this.creatorRootAvailable = true;
+            return rootUri;
+        } catch (error) {
+            console.error('[akari-surfaces] failed to ensure a channel destination for a new project:', error);
+            this.messages.error(error instanceof Error ? error.message : 'チャンネルの置き場の作成に失敗しました。');
+            return undefined;
+        }
+    }
 
     // --- U2 状態バッジ（旧 F6 現在地 1 行を置換。task 2026-08-03-home-v5-terms） --
 
@@ -729,24 +1013,30 @@ export class AkariHomeWidget extends ReactWidget {
     // --- U5 チャンネルに入れる（養子縁組。task 2026-08-03-home-v5-terms） -------
 
     /**
-     * 「チャンネルに入れる」ボタン。(a) チャンネルが 1 つなら確認ダイアログのみ
-     * (b) 複数なら QuickPick でチャンネル名を選んでから確認 (c) 実行は
-     * `AkariNewProjectService#adoptProject`（node 側で creator-root の
-     * `adoptProject()` を呼ぶだけ） (d) 成功したら移動先を `workspaceService.open`
-     * で開き直す (e) 失敗したら `MessageService.error` で 1 行 + 何も壊さない
-     * （adoptProject は失敗時に元の場所を残す契約 — task.md §4 指定どおり）。
+     * 「チャンネルに入れる」ボタン。作業場が既に解決できていれば既存の確認 →
+     * 移動 → 開き直しへ（`confirmAndAdopt`）。1 つも解決できない（マシンに
+     * チャンネルの置き場がまだ無い）ときは、失敗させずに「作成 → 取り込み」の
+     * 連結フローへ分岐する（`createChannelDestinationAndJoin` ・
+     * task 2026-08-04-home-no-root-flow）。
      */
     protected joinChannel = async (): Promise<void> => {
         if (this.joiningChannel || this.currentLocation?.kind !== 'outside') {
             return;
         }
         const projectUri = this.currentLocation.projectUri;
-        const rootUri = this.creatorRootUri;
-        if (!rootUri) {
-            this.messages.error('作業場が見つからないため、チャンネルに入れられませんでした。');
+        if (!this.creatorRootUri) {
+            await this.createChannelDestinationAndJoin(projectUri);
             return;
         }
+        await this.confirmAndAdopt(this.creatorRootUri, projectUri);
+    };
 
+    /**
+     * 作業場が既に解決できている経路（home-v5 で検証済み・不変）。(a) チャンネルが
+     * 1 つなら確認ダイアログのみ (b) 複数なら QuickPick でチャンネル名を選んでから
+     * 確認 (c) 実行は `performAdopt` に委ねる。
+     */
+    protected async confirmAndAdopt(rootUri: URI, projectUri: URI): Promise<void> {
         const channels = await this.resolveManifestChannels(rootUri);
         const channel = channels.length > 1 ? await this.pickChannel(channels) : channels[0];
         if (!channel) {
@@ -762,9 +1052,61 @@ export class AkariHomeWidget extends ReactWidget {
         if (!confirmed) {
             return;
         }
+        this.joiningChannel = true;
+        this.update();
+        await this.performAdopt(rootUri, projectUri, channel);
+    }
+
+    /**
+     * 無 root 時の「作成 → 取り込み」連結フロー（task 2026-08-04-home-no-root-flow）。
+     * 確認は 1 回だけ — 文言自体が「作成して、このプロジェクトを入れますか？」と
+     * 作成 + 取り込みをまとめて尋ねる形なので、作成直後に `confirmAndAdopt` の
+     * 2 回目の確認は挟まない。「作業場」の語は出さない（U1）— 事実表記の
+     * 「データの場所: ~/Akari」だけ許可される。ensure 直後の作業場は必ず
+     * チャンネルが 1 つ（`createCreatorRoot` の既定チャンネル）なので QuickPick も
+     * 不要 — 解決したチャンネル名をそのまま `performAdopt` に渡す。
+     */
+    protected async createChannelDestinationAndJoin(projectUri: URI): Promise<void> {
+        const confirmed = await new ConfirmDialog({
+            title: 'チャンネルの置き場を作成しますか？',
+            msg: 'チャンネルの置き場がまだありません。作成して、このプロジェクトを入れますか？（データの場所: ~/Akari）',
+            ok: '作成して入れる',
+            cancel: 'キャンセル'
+        }).open();
+        if (!confirmed) {
+            return;
+        }
 
         this.joiningChannel = true;
         this.update();
+        let rootUri: URI;
+        try {
+            const rootUriString = await this.newProjectService.ensureCreatorRoot();
+            rootUri = new URI(rootUriString);
+        } catch (error) {
+            console.error('[akari-surfaces] failed to ensure a channel destination:', error);
+            this.messages.error(error instanceof Error ? error.message : 'チャンネルの置き場の作成に失敗しました。');
+            this.joiningChannel = false;
+            this.update();
+            return;
+        }
+        // 以後の一覧・状態バッジ解決が新しい置き場を見られるようにしておく
+        // （このプロジェクトはこのあと開き直されるため即座には効かないが、
+        // 途中でエラーになった場合でも次の再表示から反映される）。
+        this.creatorRootUri = rootUri;
+        this.creatorRootAvailable = true;
+
+        const channels = await this.resolveManifestChannels(rootUri);
+        await this.performAdopt(rootUri, projectUri, channels[0]);
+    }
+
+    /**
+     * 実移動 + 開き直し（`AkariNewProjectService#adoptProject` を呼ぶだけ）。
+     * 呼び出し側で確認済み・`joiningChannel` を立てた後に呼ぶ。失敗したら
+     * `MessageService.error` で 1 行 + 何も壊さない（adoptProject は失敗時に
+     * 元の場所を残す契約 — task.md §2(d) 指定どおり）。
+     */
+    protected async performAdopt(rootUri: URI, projectUri: URI, channel: string): Promise<void> {
         try {
             const destinationUri = await this.newProjectService.adoptProject(rootUri.toString(), projectUri.toString(), channel);
             // 成功後はワークスペースが切り替わり本ウィジェットは作り直されるため、
@@ -776,7 +1118,7 @@ export class AkariHomeWidget extends ReactWidget {
             this.joiningChannel = false;
             this.update();
         }
-    };
+    }
 
     /** 複数チャンネルから 1 つを選ばせる QuickPick（U5 (b)）。キャンセル時は undefined。 */
     protected async pickChannel(channels: string[]): Promise<string | undefined> {
@@ -1003,6 +1345,55 @@ export class AkariHomeWidget extends ReactWidget {
         }
     };
 
+    // --- U3 electron-updater（内部リポ契約 update-and-versioning §11）: main プロセス
+    // イベントの購読と「今すぐ再起動して適用」アクション ---
+
+    /**
+     * `window.electronAkariUpdater`（akari-surfaces の electron-main/preload が
+     * 公開する API）を取り出す。`Window` 型の直接プロパティアクセスに頼らず明示的に
+     * キャストするのは akari-project の revealInFileManager と同じ流儀
+     * （akari-project-contribution.ts 参照）。未署名の開発ビルド・`theia start`
+     * （非 Electron）では存在しないため undefined を返し、呼び出し側で沈黙する。
+     */
+    protected resolveElectronUpdaterApi(): ElectronAkariUpdaterApi | undefined {
+        return (window as Window & { electronAkariUpdater?: ElectronAkariUpdaterApi }).electronAkariUpdater;
+    }
+
+    /**
+     * main プロセスの electron-updater イベントを購読する。既に発火済みのイベント
+     * （このウィジェットの生成が DL 完了より後になったケース）は `getLastEvent` で
+     * 追いつく。API 不在（開発ビルド）・IPC 失敗はすべて沈黙する（契約 §11）。
+     */
+    protected initUpdaterEvents(): void {
+        const api = this.resolveElectronUpdaterApi();
+        if (!api) {
+            return;
+        }
+        api.getLastEvent().then(event => {
+            if (event) {
+                this.applyUpdaterEvent(event);
+            }
+        }).catch(() => {
+            // 沈黙（契約 §11）。
+        });
+        this.updaterUnsubscribe = api.onEvent(event => this.applyUpdaterEvent(event));
+        this.toDispose.push({ dispose: () => this.updaterUnsubscribe?.() });
+    }
+
+    protected applyUpdaterEvent(event: ShellUpdaterEvent): void {
+        this.updaterUiState = applyShellUpdaterEvent(this.updaterUiState, event);
+        this.update();
+    }
+
+    /** 「今すぐ再起動して適用」ボタン: main プロセスへ委ねる（quitAndInstall はこのウィジェット側では呼ばない）。 */
+    protected restartAndApplyUpdate = (): void => {
+        const api = this.resolveElectronUpdaterApi();
+        if (!api) {
+            return;
+        }
+        void api.restartAndInstall();
+    };
+
     // --- ホーム v2: アクション ---
 
     protected connectPartner = async (): Promise<void> => {
@@ -1021,6 +1412,17 @@ export class AkariHomeWidget extends ReactWidget {
             // watch でも拾われるが、二重に読んでも害はない。
             await this.refreshHomeFlow();
         }
+    };
+
+    protected connectStore = async (): Promise<void> => {
+        await this.storeConnectionFlow.start();
+    };
+
+    protected cancelStoreConnection = (): void => this.storeConnectionFlow.cancel();
+
+    protected openStoreSite = (): void => {
+        const base = this.storeSiteUrl.replace(/\/$/, '');
+        this.windowService.openNewWindow(this.storeEmail !== null ? `${base}/library` : `${base}/`, { external: true });
     };
 
     /**
@@ -1113,7 +1515,11 @@ export class AkariHomeWidget extends ReactWidget {
             target,
             autonomy: this.intakeAutonomy,
             status: 'submitted' as const,
-            submitted_at: new Date().toISOString()
+            submitted_at: new Date().toISOString(),
+            // フォームに title の入力欄は無い（本タスクのスコープ外）。エージェントが
+            // 別経路で書いた値を送信のたびに消してしまわないよう、読み込み済みの
+            // スナップショットからそのまま持ち回って書き戻す。
+            title: this.intakeSnapshot?.title ?? null
         };
 
         try {
@@ -1377,8 +1783,15 @@ export class AkariHomeWidget extends ReactWidget {
      * ドロップターゲット。専用カードは足さず、dragover 中だけ
      * {@link renderDropOverlay} を重ねて可視化する。`data-akari-dropzone='true'`
      * は evidence 互換のためこの要素に復活させた。
+     *
+     * F11（task 2026-08-05-welcome-screen）: `welcomeMode` の間は dashboard を
+     * 一切描かず {@link renderWelcomeSurface} だけを返す — 通常ホームの要素
+     * （状態バッジ・説明・接続カード等）を混在させない（task.md §2 指定）。
      */
     protected override render(): React.ReactNode {
+        if (this.welcomeMode && !this.showDashboardWithoutProject) {
+            return this.renderWelcomeSurface();
+        }
         return (
             <div
                 className='akari-home-surface'
@@ -1390,16 +1803,126 @@ export class AkariHomeWidget extends ReactWidget {
                 style={{ height: '100%', overflow: 'auto', padding: '18px 22px', boxSizing: 'border-box', position: 'relative' }}
             >
                 {this.renderDashboardHeader()}
-                {this.updateStatus.available && this.renderUpdateBanner()}
+                {(this.updateStatus.available || this.updaterUiState.downloaded) && this.renderUpdateBanner()}
                 {this.importedNotice && this.renderImportedNotice()}
                 {this.renderExplanation()}
                 {this.renderProjectList()}
                 {!this.connected && this.renderConnectCard()}
+                {this.renderStoreCard()}
                 {this.intakeFormOpen && this.renderIntakeForm()}
                 {this.dragActive && this.renderDropOverlay()}
             </div>
         );
     }
+
+    /**
+     * F11 ウェルカム面（状態 0・task 2026-08-05-welcome-screen）。見た目の正は
+     * `planning/attachments/2026-08-03-owner-feedback-shell-v013/shell-home-mock.html`
+     * の「状態 0: ウェルカム」。中央カード 1 枚に「プロジェクトを開く」を
+     * 集中させ、初回セットアップの再表示はカード末尾の副次導線に留める。
+     * 更新があればカードより先/上に案内する（F11 追補・
+     * オーナー追加裁定「起動 → 更新案内 → ウェルカム」。既存の
+     * {@link renderUpdateBanner} をそのまま流用し、スキップ/更新後はバナーが
+     * 消えてカードだけが残る = ウェルカムへ集中が移る）。左パネル・パートナー
+     * ペインの沈黙化（薄化・無効化）は akari-shell-strip 側の担当でスコープ外
+     * （task.md §4 指定 — この widget からは触らない）。
+     */
+    protected renderWelcomeSurface(): React.ReactNode {
+        return (
+            <div
+                className='akari-home-surface akari-home-welcome'
+                data-akari-home-stage='welcome'
+                style={homeFlowStyles.welcomeSurface}
+            >
+                <div style={homeFlowStyles.welcomeStack}>
+                    {(this.updateStatus.available || this.updaterUiState.downloaded) && this.renderUpdateBanner()}
+                    {this.renderWelcomeCard()}
+                </div>
+            </div>
+        );
+    }
+
+    /**
+     * ウェルカムカード本体（モックの `.w-card`）。新規ボタンは常時表示
+     * （F9 ensureCreatorRoot 連結込みの {@link startNewProject} を流用）。一覧は
+     * 既存の {@link buildProjectRows}（U3）をそのまま流用する — ウェルカム中は
+     * `currentProjectUri`/`currentLocation` がどちらも undefined のため「開いて
+     * います」判定は自然に出ない（現在開いているプロジェクトという概念自体が
+     * 無い）。作業場もプロジェクト履歴も無い完全初回（rows が空）は見出しごと
+     * 出さない。フォルダ選択とセットアップ再表示は、主操作を邪魔しない末尾の
+     * 副次導線として常に残す。
+     */
+    protected renderWelcomeCard(): React.ReactNode {
+        const rows = this.buildProjectRows();
+        return (
+            <div data-akari-welcome-card='true' style={homeFlowStyles.welcomeCard}>
+                <div style={homeFlowStyles.welcomeLogo}>🏮 AKARI Video</div>
+                <div style={homeFlowStyles.welcomeSub}>プロジェクトを開いてはじめましょう</div>
+                <button
+                    type='button'
+                    className='theia-button main'
+                    style={homeFlowStyles.welcomeNewButton}
+                    disabled={this.startingNewProject}
+                    data-akari-welcome-new-project='true'
+                    onClick={() => void this.startNewProject()}
+                >
+                    {this.startingNewProject ? '作成しています…' : '＋ 新しい動画を始める'}
+                </button>
+                {rows.length > 0 && (
+                    <>
+                        <p style={homeFlowStyles.welcomeListHeading}>最近のプロジェクト</p>
+                        <div style={homeFlowStyles.welcomeList} data-akari-welcome-list='true'>
+                            {rows.map(row => (
+                                <button
+                                    key={row.key}
+                                    type='button'
+                                    className='theia-button secondary'
+                                    style={homeFlowStyles.welcomeProjectItem}
+                                    data-akari-project-item='true'
+                                    data-akari-project-standalone={row.standalone ? 'true' : undefined}
+                                    onClick={() => this.openCreatorRootProject(row.uri)}
+                                >
+                                    <span className='codicon codicon-folder' aria-hidden='true' style={homeFlowStyles.chipIcon} />
+                                    <span style={homeFlowStyles.projectItemBody}>
+                                        <strong style={homeFlowStyles.projectItemName}>{row.name}</strong>
+                                    </span>
+                                    {!row.standalone && row.channel && <span style={homeFlowStyles.welcomeProjectBadge}>{row.channel}</span>}
+                                    {row.standalone && <span style={homeFlowStyles.welcomeProjectBadge}>単体</span>}
+                                </button>
+                            ))}
+                        </div>
+                    </>
+                )}
+                <button
+                    type='button'
+                    style={homeFlowStyles.welcomeOpenFolder}
+                    data-akari-welcome-open-folder='true'
+                    onClick={this.openFolderAdvanced}
+                >
+                    フォルダを開く…（上級者向け）
+                </button>
+                <button
+                    type='button'
+                    className='theia-button secondary'
+                    style={homeFlowStyles.welcomeSetupButton}
+                    data-akari-open-first-run-setup='true'
+                    onClick={() => void this.openFirstRunSetup()}
+                >
+                    <span className='codicon codicon-tools' aria-hidden='true' />
+                    セットアップを開く
+                </button>
+            </div>
+        );
+    }
+
+    /**
+     * 「フォルダを開く…（上級者向け）」= 既存の Open Folder コマンド呼び出し
+     * （task.md §1 指定・新規実装はしない）。Electron 版 Theia 標準の
+     * `workspace:openFolder`（`WorkspaceCommands.OPEN_FOLDER`）をそのまま叩く。
+     */
+    protected openFolderAdvanced = (): void => {
+        void this.commands.executeCommand(WorkspaceCommands.OPEN_FOLDER.id);
+    };
 
     /**
      * ドロップ受け付けの可視化（dragover 中のみ）。静的レイアウトには何も足さず、
@@ -1433,8 +1956,31 @@ export class AkariHomeWidget extends ReactWidget {
      * 新版がある時だけ出す。常時領域を専有しない。アクション 2 つ:
      * 更新する（自プラットフォーム配布物 DL を外部ブラウザで開始） /
      * 今回はスキップ（dismissed 記録・不変）。文言・ボタン構成はモック準拠（U7・U8）。
+     *
+     * U3（electron-updater・契約 §11）: `updaterUiState.downloaded` が true の間は
+     * 上記の DL 前バナーの代わりに「DL 済み・再起動で適用されます」バナーへ切り替える
+     * （task.md §4「DL 前は従来どおり」= 逆に言えば DL 後はここで表示が変わる）。
      */
     protected renderUpdateBanner(): React.ReactNode {
+        if (this.updaterUiState.downloaded) {
+            return (
+                <div role='status' style={homeFlowStyles.updateBanner} data-akari-update-downloaded='true'>
+                    <span className='codicon codicon-arrow-circle-up' aria-hidden='true' style={homeFlowStyles.updateBannerIcon} />
+                    <span style={homeFlowStyles.updateBannerText}>{formatDownloadedBannerText(this.updaterUiState)}</span>
+                    <div style={homeFlowStyles.updateBannerActions}>
+                        <button
+                            type='button'
+                            className='theia-button main'
+                            style={homeFlowStyles.updateBannerButton}
+                            data-akari-update-restart='true'
+                            onClick={this.restartAndApplyUpdate}
+                        >
+                            今すぐ再起動して適用
+                        </button>
+                    </div>
+                </div>
+            );
+        }
         return (
             <div role='status' style={homeFlowStyles.updateBanner}>
                 <span className='codicon codicon-arrow-circle-up' aria-hidden='true' style={homeFlowStyles.updateBannerIcon} />
@@ -1460,7 +2006,18 @@ export class AkariHomeWidget extends ReactWidget {
     protected renderDashboardHeader(): React.ReactNode {
         return (
             <header style={{ marginBottom: 14 }}>
-                <h1 style={{ margin: 0, fontSize: 21 }}>ホーム</h1>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                    <h1 style={{ margin: 0, fontSize: 21 }}>ホーム</h1>
+                    <button
+                        type='button'
+                        className='theia-button secondary'
+                        data-akari-open-first-run-setup='true'
+                        style={homeFlowStyles.setupReopenButton}
+                        onClick={() => void this.openFirstRunSetup()}
+                    >
+                        セットアップを開く
+                    </button>
+                </div>
                 {this.renderStatusBadge()}
             </header>
         );
@@ -1542,16 +2099,16 @@ export class AkariHomeWidget extends ReactWidget {
      * 旧・過去プロジェクト一覧 裁定 R3 を改称・拡張）。creatorRootProjects（過去+
      * 現在）と standaloneProjects（単体・履歴由来）を 1 本の行配列に統合する。
      * 現在開いているプロジェクトは ▶ +「開いています」を付け、クリックを無効化する
-     * （task.md 指定）。作業場が解決できなければ一覧を出さず 1 行の案内へ
-     * フォールバックする（作成 UI 自体はホームに足さない — 作成は相棒 / `akari` CLI）。
+     * （task.md 指定）。作業場が解決できないときは、状態バッジ（U2/U5・単体プロジェクト
+     * なら「チャンネルに入れる」がそこに出る）と案内が二重にならないよう、ここは
+     * 見出し下の薄い 1 行だけに留める（task 2026-08-04-home-no-root-flow）。
      */
     protected renderProjectList(): React.ReactNode {
         if (!this.creatorRootAvailable) {
             return (
-                <section style={homeFlowStyles.card}>
-                    <div style={homeFlowStyles.cardBody}>
-                        <p style={homeFlowStyles.cardLead}>{CREATOR_ROOT_MISSING_NOTICE}</p>
-                    </div>
+                <section style={{ marginBottom: 16 }}>
+                    <p style={homeFlowStyles.glabel}>プロジェクト</p>
+                    <p style={homeFlowStyles.cardFine}>{CREATOR_ROOT_LIST_PLACEHOLDER}</p>
                 </section>
             );
         }
@@ -1564,26 +2121,41 @@ export class AkariHomeWidget extends ReactWidget {
                     {rows.length === 0 ? (
                         <p style={homeFlowStyles.cardLead}>まだプロジェクトがありません。</p>
                     ) : rows.map(row => (
-                        <button
-                            key={row.key}
-                            type='button'
-                            className='theia-button secondary'
-                            style={homeFlowStyles.projectItem}
-                            disabled={row.current}
-                            data-akari-project-item='true'
-                            data-akari-project-current={row.current ? 'true' : undefined}
-                            data-akari-project-standalone={row.standalone ? 'true' : undefined}
-                            onClick={() => !row.current && this.openCreatorRootProject(row.uri)}
-                        >
-                            {row.current && <span aria-hidden='true' style={homeFlowStyles.projectCurrentArrow}>▶</span>}
-                            <span className='codicon codicon-folder' aria-hidden='true' style={homeFlowStyles.chipIcon} />
-                            <span style={homeFlowStyles.projectItemBody}>
-                                <strong style={homeFlowStyles.projectItemName}>{row.name}</strong>
-                                {!row.standalone && row.channel && <small style={homeFlowStyles.projectItemChannel}>{row.channel}</small>}
-                            </span>
-                            {row.current && <span style={homeFlowStyles.projectBadge}>開いています</span>}
-                            {row.standalone && <span style={homeFlowStyles.projectBadge}>単体</span>}
-                        </button>
+                        <div key={row.key} style={homeFlowStyles.projectRow} data-akari-project-row='true'>
+                            <button
+                                type='button'
+                                className='theia-button secondary'
+                                style={{ ...homeFlowStyles.projectItem, flex: '1 1 auto' }}
+                                disabled={row.current}
+                                data-akari-project-item='true'
+                                data-akari-project-current={row.current ? 'true' : undefined}
+                                data-akari-project-standalone={row.standalone ? 'true' : undefined}
+                                onClick={() => !row.current && this.openCreatorRootProject(row.uri)}
+                            >
+                                {row.current && <span aria-hidden='true' style={homeFlowStyles.projectCurrentArrow}>▶</span>}
+                                <span className='codicon codicon-folder' aria-hidden='true' style={homeFlowStyles.chipIcon} />
+                                <span style={homeFlowStyles.projectItemBody}>
+                                    <strong style={homeFlowStyles.projectItemName}>{row.name}</strong>
+                                    {!row.standalone && row.channel && <small style={homeFlowStyles.projectItemChannel}>{row.channel}</small>}
+                                </span>
+                                {row.current && <span style={homeFlowStyles.projectBadge}>開いています</span>}
+                                {row.standalone && <span style={homeFlowStyles.projectBadge}>単体</span>}
+                            </button>
+                            <button
+                                type='button'
+                                className='theia-button secondary'
+                                title={revealInFileManagerActionLabel(row.name)}
+                                aria-label={revealInFileManagerActionLabel(row.name)}
+                                data-akari-project-reveal={row.key}
+                                style={homeFlowStyles.projectRevealButton}
+                                onClick={event => {
+                                    event.stopPropagation();
+                                    void this.revealProjectInFileManager(row);
+                                }}
+                            >
+                                <span className='codicon codicon-folder-opened' aria-hidden='true' />
+                            </button>
+                        </div>
                     ))}
                 </div>
             </section>
@@ -1602,7 +2174,7 @@ export class AkariHomeWidget extends ReactWidget {
         const currentFsPath = this.currentProjectUri?.path.fsPath();
         const rows: ProjectListRow[] = this.creatorRootProjects.map(project => ({
             key: project.uri.toString(),
-            name: project.name,
+            name: resolveProjectDisplayName(project.title, project.name),
             uri: project.uri,
             channel: project.channel,
             current: currentFsPath !== undefined && project.uri.path.fsPath() === currentFsPath,
@@ -1615,14 +2187,24 @@ export class AkariHomeWidget extends ReactWidget {
             if (isCurrent) {
                 matchedCurrent = true;
             }
-            rows.push({ key: project.uri.toString(), name: project.name, uri: project.uri, current: isCurrent, standalone: true });
+            rows.push({
+                key: project.uri.toString(),
+                name: resolveProjectDisplayName(project.title, project.name),
+                uri: project.uri,
+                current: isCurrent,
+                standalone: true
+            });
         }
 
         if (!matchedCurrent && this.currentLocation?.kind === 'outside') {
             const uri = this.currentLocation.projectUri;
+            const folderName = uri.path.base || uri.path.fsPath();
             rows.push({
                 key: uri.toString(),
-                name: uri.path.base || uri.path.fsPath(),
+                // このフォールバック行は「現在開いているプロジェクト」だけが通る経路 —
+                // すでに読み込み済みの intakeSnapshot（現在のワークスペース root の
+                // intake.json）をそのまま使えば、ここだけ別に intake.json を読み直さずに済む。
+                name: resolveProjectDisplayName(this.intakeSnapshot?.title, folderName),
                 uri,
                 current: true,
                 standalone: true
@@ -1683,6 +2265,85 @@ export class AkariHomeWidget extends ReactWidget {
                 >
                     {this.connecting ? '接続しています…' : 'パートナーに接続する'}
                 </button>
+            </section>
+        );
+    }
+
+    /**
+     * AKARI Store カード（ホーム v4 の 3 要素へのオーナー承認済み追加・2026-08-03）。
+     * 未接続 = 内蔵デバイスフローの進行表示と接続ボタン。
+     * 接続済み = メール表示 + マイページを外部ブラウザで開く。
+     */
+    protected renderStoreCard(): React.ReactNode {
+        const connected = this.storeEmail !== null;
+        const connectionState = connected
+            ? 'connected'
+            : this.storeFlowPhase === 'idle' ? 'disconnected' : this.storeFlowPhase;
+        return (
+            <section style={homeFlowStyles.card} data-akari-store-connection={connectionState}>
+                <div style={homeFlowStyles.cardMark} aria-hidden='true'>
+                    <span className='codicon codicon-package' style={{ fontSize: 20, color: 'var(--theia-button-foreground)' }} />
+                </div>
+                <div style={homeFlowStyles.cardBody}>
+                    <strong style={homeFlowStyles.cardTitle}>AKARI Store</strong>
+                    {connected && <p style={homeFlowStyles.cardLead}>接続中: {this.storeEmail}</p>}
+                    {!connected && this.storeFlowPhase === 'idle' && (
+                        <p style={homeFlowStyles.cardLead}>購入した素材（宣言パック・3D モックなど）を本体で使うには接続します。</p>
+                    )}
+                    {!connected && this.storeFlowPhase === 'starting' && (
+                        <p style={homeFlowStyles.cardLead}>接続を開始しています…</p>
+                    )}
+                    {!connected && this.storeFlowPhase === 'pending' && (
+                        <>
+                            <p style={homeFlowStyles.cardLead}>ブラウザで承認してください…</p>
+                            {this.storeFlowUserCode && <p style={homeFlowStyles.cardFine}>確認コード: {this.storeFlowUserCode}</p>}
+                        </>
+                    )}
+                    {!connected && (this.storeFlowPhase === 'expired' || this.storeFlowPhase === 'error') && (
+                        <p style={{ ...homeFlowStyles.cardLead, color: 'var(--theia-errorForeground)' }}>{this.storeFlowError}</p>
+                    )}
+                    {connected && <p style={homeFlowStyles.cardFine}>購入素材の導入は「購入した素材をセットアップして」と頼むだけ</p>}
+                </div>
+                {connected ? (
+                    <button
+                        type='button'
+                        className='theia-button secondary'
+                        style={homeFlowStyles.cardCta}
+                        onClick={() => this.openStoreSite()}
+                    >
+                        ストアを開く
+                    </button>
+                ) : this.storeFlowPhase === 'pending' ? (
+                    <button
+                        type='button'
+                        className='theia-button secondary'
+                        style={homeFlowStyles.cardCta}
+                        onClick={this.cancelStoreConnection}
+                    >
+                        キャンセル
+                    </button>
+                ) : this.storeFlowPhase === 'expired' || this.storeFlowPhase === 'error' ? (
+                    <button
+                        type='button'
+                        className='theia-button secondary'
+                        data-akari-store-connect
+                        style={homeFlowStyles.cardCta}
+                        onClick={() => void this.connectStore()}
+                    >
+                        もう一度試す
+                    </button>
+                ) : (
+                    <button
+                        type='button'
+                        className='theia-button main'
+                        data-akari-store-connect
+                        style={homeFlowStyles.cardCta}
+                        disabled={this.storeFlowPhase === 'starting'}
+                        onClick={() => void this.connectStore()}
+                    >
+                        {this.storeFlowPhase === 'starting' ? '接続を開始しています…' : 'ストアに接続する'}
+                    </button>
+                )}
             </section>
         );
     }
@@ -1796,6 +2457,8 @@ const homeFlowStyles: Record<string, React.CSSProperties> = {
         minHeight: 'auto', height: 'auto'
     },
 
+    setupReopenButton: { minHeight: 'auto', height: 'auto', padding: '5px 10px', fontSize: 11.5 },
+
     // 案内カード（説明 / 過去プロジェクトのフォールバック / 接続）。ロックではないので画面を占有せず 1 枚に収める。
     card: {
         display: 'flex', alignItems: 'flex-start', gap: 13, marginBottom: 12, padding: '13px 15px',
@@ -1818,6 +2481,13 @@ const homeFlowStyles: Record<string, React.CSSProperties> = {
 
     // プロジェクト一覧 = 唯一のスイッチャー（U3。旧・過去プロジェクト一覧 裁定 R3）。
     projectList: { display: 'flex', flexDirection: 'column', gap: 6 },
+    // 行 = 本体ボタン（開く）+ 「Finder で表示」ボタン（task 2026-08-09-reveal-in-finder）。
+    // button の入れ子は無効な HTML のため、行を div にして両ボタンを兄弟にする。
+    projectRow: { display: 'flex', alignItems: 'stretch', gap: 6 },
+    projectRevealButton: {
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flex: '0 0 auto', minHeight: 'auto', height: 'auto', padding: '0 12px', borderRadius: 9
+    },
     projectItem: {
         display: 'flex', alignItems: 'center', gap: 10, padding: '9px 13px', borderRadius: 9,
         fontSize: 12.5, minHeight: 'auto', height: 'auto', width: '100%',
@@ -1902,6 +2572,52 @@ const homeFlowStyles: Record<string, React.CSSProperties> = {
         background: 'var(--theia-list-dropBackground, rgba(127,127,127,0.12))',
         border: '2px dashed var(--theia-focusBorder)', borderRadius: 8,
         color: 'var(--theia-editorWidget-foreground)'
+    },
+
+    // F11 ウェルカム面（状態 0・task 2026-08-05-welcome-screen）。見た目の正は
+    // shell-home-mock.html の `.w-card` 系（幅 min(480px,92%) の中央カード）。
+    welcomeSurface: {
+        height: '100%', overflow: 'auto', padding: '18px 22px', boxSizing: 'border-box',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center'
+    },
+    welcomeStack: { width: 'min(480px, 92%)', display: 'flex', flexDirection: 'column', gap: 14 },
+    welcomeCard: {
+        width: '100%', boxSizing: 'border-box', padding: '28px 28px 22px', borderRadius: 14,
+        border: '1px solid var(--theia-widget-border)', background: 'var(--theia-editorWidget-background)',
+        display: 'flex', flexDirection: 'column', alignItems: 'stretch'
+    },
+    welcomeLogo: { fontSize: 22, fontWeight: 800, textAlign: 'center', marginBottom: 4 },
+    welcomeSub: { color: 'var(--theia-descriptionForeground)', fontSize: 13, textAlign: 'center', marginBottom: 20 },
+    welcomeNewButton: {
+        width: '100%', padding: '13px', borderRadius: 9, fontSize: 15, fontWeight: 800,
+        minHeight: 'auto', height: 'auto', marginBottom: 16
+    },
+    welcomeListHeading: {
+        fontFamily: 'monospace', fontSize: 10.5, letterSpacing: '0.12em', textTransform: 'uppercase',
+        color: 'var(--theia-descriptionForeground)', margin: '0 0 8px'
+    },
+    welcomeList: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 4 },
+    welcomeProjectItem: {
+        display: 'flex', alignItems: 'center', gap: 10, padding: '9px 13px', borderRadius: 8,
+        fontSize: 13, minHeight: 'auto', height: 'auto', width: '100%',
+        border: '1px solid var(--theia-widget-border)', background: 'var(--theia-editorWidget-background)',
+        color: 'var(--theia-editorWidget-foreground)', cursor: 'pointer', textAlign: 'left'
+    },
+    welcomeProjectBadge: {
+        marginLeft: 'auto', flex: '0 0 auto', fontSize: 10.5, padding: '2px 9px', borderRadius: 999,
+        border: '1px solid var(--theia-widget-border)', color: 'var(--theia-descriptionForeground)',
+        background: 'var(--theia-editorWidget-background)'
+    },
+    welcomeOpenFolder: {
+        display: 'block', margin: '14px auto 0', background: 'transparent', border: 'none',
+        color: 'var(--theia-descriptionForeground)', fontSize: 12, cursor: 'pointer',
+        textDecoration: 'underline', padding: 0, minHeight: 'auto', height: 'auto'
+    },
+    welcomeSetupButton: {
+        alignSelf: 'center', display: 'inline-flex', alignItems: 'center', gap: 6,
+        marginTop: 10, padding: '5px 9px', minHeight: 'auto', height: 'auto',
+        borderColor: 'transparent', background: 'transparent',
+        color: 'var(--theia-descriptionForeground)', fontSize: 11.5
     }
 };
 

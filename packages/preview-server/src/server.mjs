@@ -12,6 +12,7 @@ import { editToTimeline } from './edit-to-timeline.mjs';
 // lint 実行系が見つからない場合は fail-open（オーナー裁定 2026-08-02 — shell と同一挙動に統一）。
 import { lintProjectCandidates, writeAtomic } from '../../edit-store/lib/write-gate.js';
 import { resolveFfmpeg, resolveFfprobe } from '../../media-bin/src/index.mjs';
+import { resolveCaptionApiPayload } from './caption-api.mjs';
 
 const args = process.argv.slice(2);
 let port = 3000;
@@ -49,9 +50,20 @@ const MIME = {
   '.ogg': 'audio/ogg',
   '.woff2': 'font/woff2',
   '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
 };
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
+const CAPTION_FONT_PATH = fileURLToPath(new URL('../../../assets/font/noto-sans-jp/NotoSansJP-Variable.ttf', import.meta.url));
+const CAPTION_FONT_ROUTE = '/assets/fonts/akari-noto-sans-jp.ttf';
+// 3D オーバーレイのランタイム。どちらも素の IIFE（vendor は window.AkariThree、
+// runtime は window.akari.threeRuntime を立てる）なのでバンドルは要らず、
+// 字幕フォントと同じ「リポ所有の固定ルート」で配る（776KB を public/ へ複製しない）。
+// projectRoot もユーザー入力も経由しないため traversal で別ファイルを選べない。
+const THREE_ROUTES = {
+  '/three-bundle.js': fileURLToPath(new URL('../../overlay-runtime/src/vendor/three-bundle.js', import.meta.url)),
+  '/three-runtime.js': fileURLToPath(new URL('../../overlay-runtime/src/three-runtime.js', import.meta.url)),
+};
 const PROXY_DIR = path.join(projectRoot, '.proxy');
 
 // --- ffmpeg/ffprobe detection ---
@@ -117,20 +129,46 @@ function respond(res, status, data, contentType = 'application/json; charset=utf
   res.end(body);
 }
 
-function serveFile(res, filePath, contentType, extraHeaders = {}) {
+// mtime + サイズの検証子。中身のハッシュではないので編集は必ず検知でき、
+// かつ stat 1 回で済む（効果音のような多数の小ファイルでも安い）。
+function fileEtag(stat) {
+  return `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+}
+
+// readFileSync はシングルスレッドのイベントループを丸ごと止める。効果音の多い
+// プロジェクトでは音声取得が数十本走るため、その間 <video> のレンジ要求が返せず
+// 再生が stall する（= 読み込み中スピナー）。ストリームで返して塞がないようにする。
+// あわせて条件付き GET に対応する。cache-control: no-cache は維持（毎回検証するので
+// 編集のホットリロードは従来どおり効く）が、変わっていなければ 304 で本文を送らない。
+function serveFile(res, filePath, contentType, extraHeaders = {}, reqHeaders = null) {
+  let stat;
   try {
-    const data = fs.readFileSync(filePath);
-    if (Buffer.isBuffer(data)) {
-      res.writeHead(200, { 'content-type': contentType, 'access-control-allow-origin': '*', 'cache-control': 'no-cache', ...extraHeaders });
-      res.end(data);
-    } else {
-      respond(res, 200, data, contentType);
-    }
-    return true;
+    stat = fs.statSync(filePath);
+    if (!stat.isFile()) throw new Error('not a file');
   } catch {
     respond(res, 404, { error: 'File not found' });
     return true;
   }
+  const etag = fileEtag(stat);
+  const headers = {
+    'content-type': contentType,
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-cache',
+    etag,
+    'last-modified': new Date(stat.mtimeMs).toUTCString(),
+    ...extraHeaders,
+  };
+  if (reqHeaders && reqHeaders['if-none-match'] === etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return true;
+  }
+  res.writeHead(200, { ...headers, 'content-length': stat.size });
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', () => res.destroy());
+  res.on('close', () => stream.destroy());
+  stream.pipe(res);
+  return true;
 }
 
 function serveRange(res, filePath, contentType, rangeHeader) {
@@ -151,6 +189,53 @@ function serveRange(res, filePath, contentType, rangeHeader) {
     fs.createReadStream(filePath, { start, end }).pipe(res);
   } catch {
     respond(res, 404, { error: 'Not found' });
+  }
+}
+
+// --- 編集履歴（edit.json を上書きする直前の状態を世代保存する） ---
+// 置き場は .akari/history/。プロジェクト直下ではないので watch（edit.json / captions.json のみ）
+// を誘発せず、リロードの無限ループにならない。
+const HISTORY_DIR = path.join(projectRoot, '.akari', 'history');
+const HISTORY_KEEP = 50;
+
+function snapshotEdit() {
+  const source = path.join(projectRoot, 'edit.json');
+  try {
+    if (!fs.existsSync(source)) return null; // 初回作成時は退避するものが無い
+    ensureDir(HISTORY_DIR);
+    // ファイル名で時系列に並ぶようにする（ISO8601 のコロンはファイル名に使えないので置換）
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(HISTORY_DIR, `edit-${stamp}.json`);
+    fs.copyFileSync(source, dest);
+    // 保持数を超えた古い世代を捨てる
+    const files = fs.readdirSync(HISTORY_DIR)
+      .filter((name) => /^edit-.*\.json$/.test(name))
+      .sort();
+    for (const name of files.slice(0, Math.max(0, files.length - HISTORY_KEEP))) {
+      try { fs.unlinkSync(path.join(HISTORY_DIR, name)); } catch { /* 競合は無視 */ }
+    }
+    return path.relative(projectRoot, dest);
+  } catch (e) {
+    // 履歴が取れなくても編集自体は通す（安全網であって関門ではない）
+    console.error('[history] 退避に失敗しました', e.message);
+    return null;
+  }
+}
+
+function listHistory() {
+  try {
+    if (!fs.existsSync(HISTORY_DIR)) return [];
+    return fs.readdirSync(HISTORY_DIR)
+      .filter((name) => /^edit-.*\.json$/.test(name))
+      .sort()
+      .reverse()
+      .map((name) => {
+        const full = path.join(HISTORY_DIR, name);
+        const stat = fs.statSync(full);
+        return { name, savedAt: new Date(stat.mtimeMs).toISOString(), bytes: stat.size };
+      });
+  } catch {
+    return [];
   }
 }
 
@@ -254,9 +339,40 @@ const router = {
           return respond(res, 422, { error: 'Lint failed', findings: lintResult.findings });
         }
       }
+      // 上書きする前の状態を必ず 1 世代残す。ドラッグ 1 回で書き換わる編集面なので、
+      // 「気づかないうちにずれていて、数日後に発見する」が現実に起きる（実機 2026-08-07:
+      // 誤ドラッグ 4 件が edit.json に混入、うち 1 件は移動量 0.00004px）。
+      // クライアント側の undo はリロードで消えるため、保証はここに置く。
+      const snapshot = snapshotEdit();
+      markSelfWrite();
       await writeAtomic(path.join(projectRoot, 'edit.json'), text);
       wss.broadcast(JSON.stringify({ type: 'reload', ts: Date.now() }));
-      respond(res, 200, { ok: true });
+      respond(res, 200, { ok: true, snapshot });
+    } catch (e) {
+      respond(res, 500, { error: e.message });
+    }
+  },
+  'GET /api/edit-history': (req, res) => respond(res, 200, { entries: listHistory() }),
+  // 世代を書き戻す。書き戻し自体も 1 世代残すので、戻しすぎても前へ進み直せる。
+  'POST /api/edit-history/restore': async (req, res) => {
+    let name;
+    try { ({ name } = JSON.parse(await collectBody(req))); }
+    catch (e) { return respond(res, 400, { error: 'Invalid JSON: ' + e.message }); }
+    // 履歴の実ファイル名だけを受け付ける（パスを一切組み立てさせない）
+    if (typeof name !== 'string' || !/^edit-[\w-]+\.json$/.test(name)) {
+      return respond(res, 400, { error: 'Invalid history name' });
+    }
+    const source = path.join(HISTORY_DIR, name);
+    if (!fs.existsSync(source)) return respond(res, 404, { error: 'History entry not found' });
+    let text;
+    try { text = JSON.stringify(JSON.parse(fs.readFileSync(source, 'utf-8')), null, 2); }
+    catch (e) { return respond(res, 422, { error: '履歴が壊れています: ' + e.message }); }
+    try {
+      const snapshot = snapshotEdit();
+      markSelfWrite();
+      await writeAtomic(path.join(projectRoot, 'edit.json'), text);
+      wss.broadcast(JSON.stringify({ type: 'reload', ts: Date.now() }));
+      respond(res, 200, { ok: true, restored: name, snapshot });
     } catch (e) {
       respond(res, 500, { error: e.message });
     }
@@ -264,7 +380,16 @@ const router = {
   'GET /api/captions.json': (req, res) => {
     const r = readJson(path.join(projectRoot, 'captions.json'));
     if (r.error) return respond(res, 200, []);
-    respond(res, 200, r.data);
+    if (Array.isArray(r.data) || !r.data || typeof r.data !== 'object' || r.data.display_policy === undefined) {
+      return respond(res, 200, r.data);
+    }
+    const edit = readJson(path.join(projectRoot, 'edit.json'));
+    if (edit.error) return respond(res, 422, { error: 'edit.json is required to resolve caption display policy' });
+    try {
+      respond(res, 200, resolveCaptionApiPayload(r.data, edit.data));
+    } catch (error) {
+      respond(res, 422, { error: error instanceof Error ? error.message : String(error) });
+    }
   },
   'PUT /api/captions.json': async (req, res) => {
     const body = await collectBody(req);
@@ -282,8 +407,46 @@ const router = {
           return respond(res, 422, { error: 'Lint failed', findings: lintResult.findings });
         }
       }
+      markSelfWrite();
       await writeAtomic(path.join(projectRoot, 'captions.json'), text);
       wss.broadcast(JSON.stringify({ type: 'captions-reload', ts: Date.now() }));
+      respond(res, 200, { ok: true });
+    } catch (e) {
+      respond(res, 500, { error: e.message });
+    }
+  },
+  // 断片テキスト編集（contenteditable）の書き戻し先。overlays[].html は契約上ファイル参照
+  // （edit-lint が regular file を要求）なので、マークアップは edit.json ではなく参照先の
+  // 断片ファイルへ書く。edit.json へ直接マージすると lint 422 で全滅する（実測）
+  'PUT /api/overlay-html': async (req, res) => {
+    const body = await collectBody(req);
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch (e) {
+      return respond(res, 400, { error: 'Invalid JSON: ' + e.message });
+    }
+    const { id, html } = parsed ?? {};
+    if (typeof id !== 'string' || !id) return respond(res, 400, { error: 'id が必要です' });
+    if (typeof html !== 'string' || !html.trim()) return respond(res, 400, { error: 'html が必要です' });
+    const edit = readJson(path.join(projectRoot, 'edit.json'));
+    if (edit.error) return respond(res, 404, { error: edit.error });
+    const overlay = (edit.data.overlays || []).find(o => String(o?.id) === id);
+    if (!overlay) return respond(res, 404, { error: `オーバーレイが見つかりません: ${id}` });
+    if (typeof overlay.html !== 'string' || !overlay.html) {
+      return respond(res, 422, { error: `overlays[].html がファイル参照ではありません: ${id}` });
+    }
+    const target = resolveSafe(projectRoot, overlay.html);
+    if (!target) return respond(res, 422, { error: 'プロジェクト外への書き込みは拒否しました' });
+    try {
+      if (!fs.statSync(target).isFile()) throw new Error('not a file');
+    } catch {
+      return respond(res, 422, { error: `断片ファイルがありません: ${overlay.html}` });
+    }
+    try {
+      markSelfWrite();
+      await writeAtomic(target, html);
+      wss.broadcast(JSON.stringify({ type: 'reload', ts: Date.now() }));
       respond(res, 200, { ok: true });
     } catch (e) {
       respond(res, 500, { error: e.message });
@@ -368,16 +531,17 @@ function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function servePublicFile(res, pathname) {
+function servePublicFile(res, pathname, reqHeaders = null) {
   const filePath = path.join(PUBLIC_DIR, pathname);
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
     const ext = path.extname(filePath);
-    return serveFile(res, filePath, MIME[ext] ?? 'application/octet-stream');
+    return serveFile(res, filePath, MIME[ext] ?? 'application/octet-stream', {}, reqHeaders);
   }
   return false;
 }
 
-function serveProjectFile(res, pathname, rangeHeader) {
+function serveProjectFile(res, pathname, reqHeaders = null) {
+  const rangeHeader = reqHeaders?.range;
   const safe = resolveSafe(projectRoot, pathname);
   if (!safe || !fs.existsSync(safe) || !fs.statSync(safe).isFile()) return false;
   const ext = path.extname(safe).toLowerCase();
@@ -398,7 +562,7 @@ function serveProjectFile(res, pathname, rangeHeader) {
   } else {
     const extra = (mime.startsWith('video/') || mime.startsWith('audio/'))
       ? { 'accept-ranges': 'bytes' } : {};
-    serveFile(res, safe, mime, extra);
+    serveFile(res, safe, mime, extra, reqHeaders);
   }
   return true;
 }
@@ -421,6 +585,33 @@ const server = http.createServer(async (req, res) => {
     return serveFile(res, path.join(PUBLIC_DIR, 'index.html'), 'text/html; charset=utf-8');
   }
 
+  // 3D ランタイム（リポ所有の固定ルート。断片が 3D を宣言した時だけ取りに来る）
+  if (THREE_ROUTES[pathname] && req.method === 'GET') {
+    return serveFile(res, THREE_ROUTES[pathname], MIME['.js'], {}, req.headers);
+  }
+
+  // Fixed route to the repository-owned caption font. It is intentionally not
+  // resolved from user input or projectRoot, so traversal cannot select another file.
+  if (pathname === CAPTION_FONT_ROUTE && (req.method === 'GET' || req.method === 'HEAD')) {
+    if (req.method === 'HEAD') {
+      try {
+        const size = fs.statSync(CAPTION_FONT_PATH).size;
+        res.writeHead(200, {
+          'content-type': 'font/ttf',
+          'content-length': size,
+          'access-control-allow-origin': '*',
+          'cache-control': 'public, max-age=31536000, immutable',
+        });
+        return res.end();
+      } catch {
+        return respond(res, 404, { error: 'Caption font not found' });
+      }
+    }
+    return serveFile(res, CAPTION_FONT_PATH, 'font/ttf', {
+      'cache-control': 'public, max-age=31536000, immutable',
+    });
+  }
+
   if (pathname === '/api/output-preview') {
     res.writeHead(302, { location: '/?mode=output' });
     res.end();
@@ -430,12 +621,12 @@ const server = http.createServer(async (req, res) => {
   const prefixMatch = pathname.match(/^\/api\/asset\/(.+)/);
   if (prefixMatch) {
     const assetPath = prefixMatch[1];
-    if (serveProjectFile(res, assetPath, req.headers.range)) return;
+    if (serveProjectFile(res, assetPath, req.headers)) return;
     return respond(res, 404, { error: 'Asset not found' });
   }
 
-  if (servePublicFile(res, pathname)) return;
-  if (serveProjectFile(res, pathname, req.headers.range)) return;
+  if (servePublicFile(res, pathname, req.headers)) return;
+  if (serveProjectFile(res, pathname, req.headers)) return;
 
   respond(res, 404, { error: 'Not found' });
 });
@@ -457,9 +648,24 @@ wss.on('seek', (msg, socket) => {
   wss.broadcastExcept({ type: 'seek', time: t, ts: Date.now() }, socket);
 });
 
+// 1 回の編集で reload が何度も飛ぶとプレビューがその回数ぶんチラつく（実測 3 回）。
+// 原因は (a) PUT 自身の通知 (b) atomic 書き込み（tmp + rename）が watch を複数回発火させること。
+// 自分で書いた直後の watch イベントは PUT が既に通知済みなので捨て、残りはまとめて 1 回にする。
+let selfWriteAt = 0;
+function markSelfWrite() { selfWriteAt = Date.now(); }
+let reloadTimer = null;
+function scheduleReload() {
+  if (Date.now() - selfWriteAt < 1000) return;
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    wss.broadcast(JSON.stringify({ type: 'reload', ts: Date.now() }));
+  }, 120);
+}
+
 fs.watch(projectRoot, { recursive: false }, (eventType, filename) => {
   if (filename === 'edit.json' || filename === 'captions.json') {
-    wss.broadcast(JSON.stringify({ type: 'reload', ts: Date.now() }));
+    scheduleReload();
   }
 });
 console.log(`[watch] watching ${projectRoot}`);

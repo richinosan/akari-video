@@ -37,11 +37,29 @@ import {
     parseEdit,
     writeTimelineTracksInSource
 } from '../common/edit-store';
-import { deriveDefaultTimelineTracks } from '../common/derive-timeline-tracks';
+import {
+    computeTrackAutoNames as computeTrackKindAutoNames,
+    deriveDefaultTimelineTracks,
+    withCaptionsDisplaySupplement
+} from '../common/derive-timeline-tracks';
 import { assignSubRows } from '../common/lane-layout';
 import { computeAudioOverlapLayout } from '../common/audio-overlap-layout';
 import { computeCutBoundaries } from '../common/cut-boundaries';
+import { buildTimelineClipMenuItems } from '../common/timeline-context-menu-items';
+import { PARTNER_WIDGET_ID, resolveRightPaneSyncAction } from '../common/right-pane-sync';
+import {
+    buildLayerElement,
+    buildSfxElement,
+    computeMaterialGhostRange,
+    IMAGE_LAYER_DEFAULT_DURATION_SECONDS,
+    insertedLayerTimelineTracks,
+    materialDropAcceptance,
+    materialGhostVisibility,
+    MaterialDragKind,
+    shiftLayerTracksForInsert
+} from '../common/timeline-material-insert';
 import { OPEN_AKARI_INSPECTOR_ID, OPEN_AKARI_REVIEW_PANEL_ID } from './akari-annotations-commands';
+import { openTimelineContextMenu } from './akari-timeline-context-menu';
 import { ProjectLocation } from './project-location';
 import { ReviewModel } from './review-model';
 import {
@@ -72,6 +90,8 @@ const HISTORY_LIMIT = 50;
 const PLAYHEAD_FOLLOW_THRESHOLD = 0.78;
 const MINIMUM_ITEM_DURATION = 0.15;
 const MINIMUM_SFX_TRIM_DURATION = 0.1;
+/** 素材追加コマンドで実尺（getAudioDuration）が取れない video のフォールバック尺（司令塔裁定4）。 */
+const MATERIAL_INSERT_FALLBACK_DURATION_SECONDS = 3;
 const DRAG_THRESHOLD_PX = 3;
 const EDGE_ZONE_PX = 6;
 const TRACK_INSERT_ZONE_PX = 10;
@@ -147,9 +167,6 @@ const TRANSITION_TYPE_OPTIONS: ReadonlyArray<{ type: 'dissolve' | 'fade-black' |
     { type: 'fade-white', label: '白フェード', glyph: 'W' }
 ];
 const BEAT_PROJECTION_EPSILON = 0.000001;
-/** パートナー拡張とは widget ID の文字列だけで疎結合に連携する。 */
-const PARTNER_WIDGET_ID = 'akari-partner-onboarding';
-
 /** タイムライン（出力秒軸）上の1セグメント。cuts[].at / track を解決した結果。 */
 interface OutputSegment {
     index: number;
@@ -222,6 +239,37 @@ const TIMELINE_SYNC_TRACK_TOGGLES_EVENT = 'akari.timeline.syncTrackToggles';
 // インスペクターのスクラブドラッグ中、書き込みなしで cuts/layers の transform/opacity をプレビューへ
 // 即時反映する ephemeral イベント。
 const TIMELINE_LIVE_TRANSFORM_EVENT = 'akari.timeline.liveTransform';
+
+// 素材カード D&D（task 2026-08-10-material-dnd-timeline 司令塔裁定4）。mime 文字列・イベント名は
+// 送信側（akari-role-buckets-widget.tsx）と独立にリテラル宣言する（PREVIEW_PLAYBACK_TICK_EVENT と
+// 同じ流儀 — 拡張間の npm 依存を作らない）。
+const MATERIAL_DRAG_MIME = 'application/x-akari-material';
+const MATERIAL_DRAG_START_EVENT = 'akari.material.dragStart';
+const MATERIAL_DRAG_END_EVENT = 'akari.material.dragEnd';
+/** ゴースト・ドロップ挿入で使う D&D 中の素材ペイロード（送信側 dataTransfer/CustomEvent の共通形）。 */
+interface MaterialDragPayload {
+    relativePath: string;
+    kind: MaterialDragKind;
+    durationSeconds?: number;
+}
+
+/** 未検証の値（DataTransfer.getData の JSON.parse 結果・CustomEvent.detail）を安全に絞り込む。 */
+function parseMaterialDragPayload(value: unknown): MaterialDragPayload | undefined {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+    const candidate = value as { relativePath?: unknown; kind?: unknown; durationSeconds?: unknown };
+    if (typeof candidate.relativePath !== 'string' || !candidate.relativePath) {
+        return undefined;
+    }
+    if (candidate.kind !== 'video' && candidate.kind !== 'audio' && candidate.kind !== 'image') {
+        return undefined;
+    }
+    const durationSeconds = typeof candidate.durationSeconds === 'number' && candidate.durationSeconds > 0
+        ? candidate.durationSeconds
+        : undefined;
+    return { relativePath: candidate.relativePath, kind: candidate.kind, durationSeconds };
+}
 
 interface OverlayTrackLayout {
     track: number;
@@ -357,6 +405,8 @@ export class AkariAnnotationsWidget extends BaseWidget {
     protected readonly dragFeedback = document.createElement('div');
     protected readonly trackInsertIndicator = document.createElement('div');
     protected readonly selectionMarquee = document.createElement('div');
+    /** 素材カード D&D の点線ゴースト（task 2026-08-10-material-dnd-timeline 司令塔裁定5）。 */
+    protected readonly materialGhost = document.createElement('div');
     protected readonly notice = document.createElement('div');
     protected readonly footer = document.createElement('div');
 
@@ -401,6 +451,13 @@ export class AkariAnnotationsWidget extends BaseWidget {
     protected wordBoundaries: number[] = [];
     protected configured = false;
     protected dragState: DragState | undefined;
+    /** 素材カード D&D 中（受け側）: 直近 dragStart イベントで受け取ったペイロード。dragEnd/drop でクリアする。 */
+    protected materialDragPayload: MaterialDragPayload | undefined;
+    protected materialDragLastClientX = 0;
+    protected materialDragLastClientY = 0;
+    /** relativePath → getAudioDuration で解決済みの実尺（司令塔裁定6）。video/audio のみ使う。 */
+    protected readonly materialDurationCache = new Map<string, number>();
+    protected readonly materialDurationPromises = new Map<string, Promise<number | undefined>>();
     protected renderStripPending = false;
     protected past: HistoryEntry[] = [];
     protected future: HistoryEntry[] = [];
@@ -496,13 +553,23 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.title.iconClass = 'codicon codicon-comment';
         this.title.closable = true;
         this.node.classList.add('akari-annotations-widget');
+        // docs/contract-2026-08-11-review-session-ui-events.md #2: panel:<id> opt-in target.
+        this.node.setAttribute('data-akari-ui', 'panel:timeline');
+        this.node.setAttribute('data-akari-ui-label', 'タイムライン');
         Object.assign(this.node.style, {
             display: 'grid',
+            // An implicit auto track can grow to child max-content, so force the column to shrink to the widget width.
+            gridTemplateColumns: 'minmax(0, 1fr)',
             gridTemplateRows: 'auto minmax(0, 1fr) auto auto auto',
             height: '100%',
             overflow: 'hidden',
             background: 'var(--theia-editor-background)'
         });
+        // 素材カード D&D（task 2026-08-10-material-dnd-timeline 事実2）: タイムライン widget は
+        // bottom エリア（#theia-main-content-panel の外）にあるため、akari-project-contribution.ts
+        // の isDelegatedDropzone に自分を素通しさせるため data-akari-dropzone を付ける
+        // （akari-role-buckets-widget.tsx:287 と同じ流儀）。
+        this.node.setAttribute('data-akari-dropzone', 'true');
 
         Object.assign(this.toolbar.style, {
             alignItems: 'center', display: 'flex', gap: '4px', minHeight: '38px',
@@ -644,8 +711,18 @@ export class AkariAnnotationsWidget extends BaseWidget {
             background: 'color-mix(in srgb, var(--theia-focusBorder) 20%, transparent)',
             pointerEvents: 'none', zIndex: '11', boxSizing: 'border-box'
         });
+        // 素材カード D&D の点線ゴースト（司令塔裁定5。旧実装 akari-video-on-os の
+        // .output-timeline__ghost を意匠のみ参考にし、座標は本リポの percent() 流儀に合わせる）。
+        // renderStrip() は strip.replaceChildren() を毎回行うため、strip の子ではなく
+        // 決して消されない timelineOverlay の子として持つ（trackInsertIndicator と同じ理由）。
+        Object.assign(this.materialGhost.style, {
+            position: 'absolute', display: 'none', border: '1px dashed #4dd0c8',
+            background: 'rgba(77, 208, 200, .22)', borderRadius: '3px',
+            pointerEvents: 'none', zIndex: '10', boxSizing: 'border-box'
+        });
         this.timelineOverlay.append(
-            this.playhead, this.snapGuide, this.dragFeedback, this.trackInsertIndicator, this.selectionMarquee
+            this.playhead, this.snapGuide, this.dragFeedback, this.trackInsertIndicator, this.selectionMarquee,
+            this.materialGhost
         );
         // ㉖ 全域クリックシーク: strip 単体ではなく stripScroll（中央寄せの上下ギャップ・
         // トラック本数不足の余白・黒背景を含む可視領域全体）へバインドする。strip 内の
@@ -654,7 +731,15 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.stripScroll.addEventListener('click', event => this.onStripClick(event));
         this.strip.addEventListener('pointerdown', event => this.onStripPointerDown(event));
         this.strip.addEventListener('wheel', event => this.onWheelZoom(event), { passive: false });
-        this.strip.addEventListener('contextmenu', event => this.openAnnotationPopup(event));
+        this.strip.addEventListener('contextmenu', event => {
+            const target = event.target instanceof Element ? event.target : undefined;
+            const itemElement = target?.closest<HTMLElement>('[data-akari-item-kind]');
+            if (itemElement) {
+                this.openTimelineClipContextMenu(event, itemElement);
+                return;
+            }
+            this.openAnnotationPopup(event);
+        });
         this.rulerBar.addEventListener('click', event => this.onStripClick(event));
         this.rulerBar.addEventListener('wheel', event => this.onWheelZoom(event), { passive: false });
         this.rulerBar.addEventListener('contextmenu', event => this.openAnnotationPopup(event));
@@ -685,6 +770,13 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.stripScroll.addEventListener('scroll', () => {
             this.trackHeaders.style.transform = `translateY(${-this.stripScroll.scrollTop}px)`;
         });
+        // 素材カード D&D の受け側 3 点セット（task 2026-08-10-material-dnd-timeline 指示3）。
+        // 自 mime（application/x-akari-material）以外は preventDefault/stopPropagation せず
+        // 素通しする — 既存のファイルドロップ等（グローバルフォールバック）を壊さない。
+        this.stripScroll.addEventListener('dragenter', event => this.handleMaterialDragEnter(event));
+        this.stripScroll.addEventListener('dragover', event => this.handleMaterialDragOver(event));
+        this.stripScroll.addEventListener('dragleave', event => this.handleMaterialDragLeave(event));
+        this.stripScroll.addEventListener('drop', event => this.handleMaterialDrop(event));
         // ㉕/㉗ 中央寄せギャップはビューポート高（stripScroll.clientHeight）に依存するため、
         // パネルのリサイズ（分割線ドラッグ等）でも再計算されるよう監視する。
         const stripScrollResizeObserver = new ResizeObserver(() => this.renderStrip());
@@ -1178,6 +1270,32 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 this.cancelDrag(this.dragState);
             }
         }));
+
+        // 素材カード D&D の window CustomEvent ミラー受信（司令塔裁定4・指示5）。dragover 中は
+        // DataTransfer.getData が読めないため、dragstart で受け取ったペイロードをここに保持し、
+        // ゴースト計算・実尺プローブに使う。drop 自体は DataTransfer を正として別途 getData する。
+        const onMaterialDragStart = (event: Event): void => {
+            const payload = parseMaterialDragPayload((event as CustomEvent<unknown>).detail);
+            if (!payload) {
+                return;
+            }
+            this.materialDragPayload = payload;
+            if (payload.kind === 'video' || payload.kind === 'audio') {
+                this.probeMaterialDuration(payload.relativePath);
+            }
+        };
+        window.addEventListener(MATERIAL_DRAG_START_EVENT, onMaterialDragStart);
+        this.toDispose.push(Disposable.create(
+            () => window.removeEventListener(MATERIAL_DRAG_START_EVENT, onMaterialDragStart)
+        ));
+        const onMaterialDragEnd = (): void => {
+            this.materialDragPayload = undefined;
+            this.hideMaterialGhost();
+        };
+        window.addEventListener(MATERIAL_DRAG_END_EVENT, onMaterialDragEnd);
+        this.toDispose.push(Disposable.create(
+            () => window.removeEventListener(MATERIAL_DRAG_END_EVENT, onMaterialDragEnd)
+        ));
     }
 
     protected configureIconButton(button: HTMLButtonElement, icon: string, ariaLabel: string, title: string): void {
@@ -1366,9 +1484,14 @@ export class AkariAnnotationsWidget extends BaseWidget {
             if (revision !== this.rightPaneSyncRevision) {
                 return;
             }
-            if (showInspector) {
+            // キュー待ち中の手動タブ切替を尊重するため、作用させる直前の current を使う。
+            const action = resolveRightPaneSyncAction(
+                this.shell.rightPanelHandler.tabBar.currentTitle?.owner.id,
+                showInspector
+            );
+            if (action === 'open-inspector') {
                 await this.commands.executeCommand(OPEN_AKARI_INSPECTOR_ID);
-            } else {
+            } else if (action === 'show-partner') {
                 await this.shell.activateWidget(PARTNER_WIDGET_ID);
             }
         }).catch(error => {
@@ -2536,6 +2659,348 @@ export class AkariAnnotationsWidget extends BaseWidget {
         }
     }
 
+    /**
+     * 素材追加コマンド（akari.timeline.addMaterialAtPlayhead）の受け側（task
+     * 2026-08-10-timeline-clip-menu 指示4）。再生ヘッド位置・トラック 0 固定で addMaterialAt
+     * へ委譲する（task 2026-08-10-material-dnd-timeline 指示6）。
+     */
+    async addMaterialAtPlayhead(relativePath: string, kind: string): Promise<void> {
+        const t = Number.isFinite(this.playheadT) ? this.playheadT : 0;
+        await this.addMaterialAt(relativePath, kind, t, 0);
+    }
+
+    /**
+     * 素材追加の共通実装（task 2026-08-10-material-dnd-timeline 指示6）。再生ヘッド追加
+     * （addMaterialAtPlayhead）と D&D ドロップ（handleMaterialDrop）の両方がここへ委譲する。
+     * video は layers[]、audio は audio.sfx[] へ {t, track} で挿入する。書き込みは全文
+     * スナップショット方式（performDeleteMultiSelected と同型）。widget から未使用の
+     * insertLayer/insertSfx RPC は使わない。引数検証・拒否はここで完結し、例外は投げない。
+     * options.durationSeconds が渡されていれば実尺プローブ済みとして扱い、video の実尺 RPC を
+     * 再度叩かない（司令塔裁定6「ドロップ時の実挿入も同じ優先順」）。image は常に
+     * IMAGE_LAYER_DEFAULT_DURATION_SECONDS（司令塔裁定3）。
+     * options.insertTrack が渡されていれば行間ドロップ（task 2026-08-10-dnd-ghost-and-insert-fix
+     * 司令塔裁定3）: 既存 layers[].track の繰り上げ + 宣言トラックの繰り上げ・新規挿入を、この
+     * メソッド内の 1 回の全文スナップショット書き込みに畳み込む（undo/redo 1 エントリで
+     * アイテムと新トラックの両方が可逆になる）。audio には insertTrack は来ない（裁定4）。
+     */
+    async addMaterialAt(
+        relativePath: string,
+        kind: string,
+        t: number,
+        track: number,
+        options?: { durationSeconds?: number; insertTrack?: number }
+    ): Promise<void> {
+        if (kind !== 'video' && kind !== 'audio' && kind !== 'image') {
+            this.messages.warn('素材を追加できません（種別が不正です）。');
+            return;
+        }
+        if (!relativePath) {
+            this.messages.warn('素材を追加できません（パスが空です）。');
+            return;
+        }
+        const location = this.location;
+        if (!location?.editUri) {
+            this.messages.warn('edit.json が見つからないため素材を追加できません。');
+            return;
+        }
+        let durationSeconds = 0;
+        let fallbackNote = '';
+        if (kind === 'image') {
+            durationSeconds = options?.durationSeconds ?? IMAGE_LAYER_DEFAULT_DURATION_SECONDS;
+        } else if (kind === 'video') {
+            if (typeof options?.durationSeconds === 'number' && options.durationSeconds > 0) {
+                durationSeconds = options.durationSeconds;
+            } else {
+                const audioUri = this.resolveEditMediaUri(relativePath, location.editUri).toString();
+                let resolved: number | undefined;
+                try {
+                    const result = await this.annotationsService.getAudioDuration({
+                        projectRootUri: location.root.toString(), audioUri
+                    });
+                    resolved = result.status === 'ready' ? result.durationSeconds : undefined;
+                } catch {
+                    resolved = undefined;
+                }
+                if (resolved === undefined) {
+                    durationSeconds = MATERIAL_INSERT_FALLBACK_DURATION_SECONDS;
+                    fallbackNote = `実尺を取得できなかったため ${MATERIAL_INSERT_FALLBACK_DURATION_SECONDS} 秒として追加しました。`;
+                } else {
+                    durationSeconds = resolved;
+                }
+            }
+        }
+        try {
+            const editBefore = (await this.fileService.readFile(location.editUri)).value.toString();
+            const value = JSON.parse(editBefore) as Record<string, any>;
+            const contentDuration = this.contentEndDuration();
+            if (kind === 'video' || kind === 'image') {
+                const existingIds: string[] = Array.isArray(value.layers)
+                    ? value.layers
+                        .map((layer: any) => (layer && typeof layer.id === 'string' ? layer.id : ''))
+                        .filter((id: string) => id.length > 0)
+                    : [];
+                const built = buildLayerElement(existingIds, relativePath, t, durationSeconds, contentDuration, track);
+                if (!built.ok) {
+                    this.footer.textContent = '指定位置が総尺以上のため素材を追加できません。';
+                    return;
+                }
+                if (!Array.isArray(value.layers)) {
+                    value.layers = [];
+                }
+                if (options?.insertTrack !== undefined) {
+                    value.layers = shiftLayerTracksForInsert(value.layers, options.insertTrack);
+                    const baseTracks = this.pinAudioGroupToBottom(
+                        parseEdit(editBefore).timeline?.tracks
+                            ?? deriveDefaultTimelineTracks(JSON.parse(editBefore), this.captions.length > 0)
+                    );
+                    value.timeline = { tracks: insertedLayerTimelineTracks(baseTracks, options.insertTrack) };
+                }
+                value.layers.push(built.element);
+            } else {
+                const built = buildSfxElement(relativePath, t, contentDuration, track);
+                if (!built.ok) {
+                    this.footer.textContent = '指定位置が総尺以上のため素材を追加できません。';
+                    return;
+                }
+                if (!value.audio || typeof value.audio !== 'object') {
+                    value.audio = {};
+                }
+                if (!Array.isArray(value.audio.sfx)) {
+                    value.audio.sfx = [];
+                }
+                value.audio.sfx.push(built.element);
+            }
+            let editAfter = `${JSON.stringify(value, undefined, 2)}\n`;
+            await this.writeTimelineSnapshots(editAfter);
+            await this.reloadEdit();
+            editAfter = (await this.fileService.readFile(location.editUri)).value.toString();
+            this.pushHistory({
+                label: '素材を追加',
+                undo: async () => {
+                    await this.writeTimelineSnapshots(editBefore);
+                    await this.reloadEdit();
+                },
+                redo: async () => {
+                    await this.writeTimelineSnapshots(editAfter);
+                    await this.reloadEdit();
+                }
+            });
+            this.hideNotice();
+            this.footer.textContent = fallbackNote || 'タイムラインに素材を追加しました。';
+            this.revealOutputPreview();
+        } catch (error) {
+            const detail = this.errorMessage(error);
+            this.showNotice(`素材を追加できません: ${detail}`);
+            this.messages.error(`素材を追加できません: ${detail}`);
+        }
+    }
+
+    /**
+     * 素材カード D&D の実尺プローブ（task 2026-08-10-material-dnd-timeline 指示5・司令塔裁定6）。
+     * dragStart イベント受信時に video/audio のみ非同期で 1 回発火する。解決したら
+     * materialDurationCache に積み、現在ドラッグ中の素材と一致すればゴーストを再計算する。
+     */
+    protected probeMaterialDuration(relativePath: string): void {
+        if (this.materialDurationCache.has(relativePath) || this.materialDurationPromises.has(relativePath)) {
+            return;
+        }
+        const location = this.location;
+        if (!location?.editUri) {
+            return;
+        }
+        const audioUri = this.resolveEditMediaUri(relativePath, location.editUri).toString();
+        const promise = this.annotationsService.getAudioDuration({
+            projectRootUri: location.root.toString(), audioUri
+        }).then(result => (result.status === 'ready' ? result.durationSeconds : undefined))
+            .catch(() => undefined);
+        this.materialDurationPromises.set(relativePath, promise);
+        void promise.then(resolved => {
+            this.materialDurationPromises.delete(relativePath);
+            if (typeof resolved !== 'number' || resolved <= 0) {
+                return;
+            }
+            this.materialDurationCache.set(relativePath, resolved);
+            if (this.materialDragPayload?.relativePath === relativePath) {
+                this.updateMaterialGhost(this.materialDragLastClientX, this.materialDragLastClientY);
+            }
+        });
+    }
+
+    protected isMaterialDragTransfer(transfer: DataTransfer | null): boolean {
+        return !!transfer && transfer.types.includes(MATERIAL_DRAG_MIME);
+    }
+
+    protected handleMaterialDragEnter(event: DragEvent): void {
+        if (!this.isMaterialDragTransfer(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    /**
+     * dragover のたびにゴースト位置を更新する（司令塔裁定5・6、指示4）。Theia 本体が document
+     * バブル段階で dropEffect='none' を強制するため（akari-project-contribution.ts と同じ実測済み
+     * 事情）、preventDefault + stopPropagation + dropEffect='copy' の 3 点セットを毎回行う。
+     */
+    protected handleMaterialDragOver(event: DragEvent): void {
+        if (!this.isMaterialDragTransfer(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const payload = this.materialDragPayload;
+        const rejected = !!payload && this.resolveMaterialDropTarget(payload.kind, event.clientY).rejected;
+        if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = rejected ? 'none' : 'copy';
+        }
+        this.updateMaterialGhost(event.clientX, event.clientY);
+    }
+
+    protected handleMaterialDragLeave(event: DragEvent): void {
+        if (!this.isMaterialDragTransfer(event.dataTransfer)) {
+            return;
+        }
+        const next = event.relatedTarget;
+        if (next instanceof Node && this.stripScroll.contains(next)) {
+            return;
+        }
+        this.hideMaterialGhost();
+    }
+
+    /**
+     * drop 時は DataTransfer.getData を正とする（司令塔裁定4）。取れなければ dragStart
+     * ミラーイベントで保持していたペイロードへフォールバックする。
+     */
+    protected handleMaterialDrop(event: DragEvent): void {
+        if (!this.isMaterialDragTransfer(event.dataTransfer)) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const clientX = event.clientX;
+        const clientY = event.clientY;
+        const payload = this.readMaterialDropPayload(event.dataTransfer) ?? this.materialDragPayload;
+        this.hideMaterialGhost();
+        this.materialDragPayload = undefined;
+        if (!payload) {
+            return;
+        }
+        const target = this.resolveMaterialDropTarget(payload.kind, clientY);
+        if (target.rejected) {
+            return;
+        }
+        const t = Math.min(Math.max(this.timeAtClientX(clientX), 0), this.contentEndDuration());
+        const durationSeconds = payload.kind === 'image'
+            ? IMAGE_LAYER_DEFAULT_DURATION_SECONDS
+            : this.materialDurationCache.get(payload.relativePath) ?? payload.durationSeconds;
+        void this.addMaterialAt(
+            payload.relativePath, payload.kind, t, target.track,
+            {
+                ...(typeof durationSeconds === 'number' ? { durationSeconds } : {}),
+                ...(target.insertTrack !== undefined ? { insertTrack: target.insertTrack } : {})
+            }
+        );
+    }
+
+    protected readMaterialDropPayload(transfer: DataTransfer | null): MaterialDragPayload | undefined {
+        if (!transfer) {
+            return undefined;
+        }
+        const raw = transfer.getData(MATERIAL_DRAG_MIME);
+        if (!raw) {
+            return undefined;
+        }
+        try {
+            return parseMaterialDragPayload(JSON.parse(raw));
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * ドロップ先トラック行の解決（司令塔裁定2）。video/image は layerTracks、audio は
+     * audioTracks を対象にする。既存 trackAtClientY（そのまま使う — 指示3）に、layers が
+     * 1 本も無いプロジェクトでも新トラック扱いで受理する特例を足す。
+     */
+    protected resolveMaterialDropTarget(
+        kind: MaterialDragKind, clientY: number
+    ): { track: number; top: number; height: number; rejected: boolean; insertTrack?: number } {
+        if (kind === 'audio') {
+            const layouts = this.laneLayout.audioTracks;
+            if (materialDropAcceptance('audio', layouts.length ? 'audio' : undefined) === 'reject') {
+                return { track: 0, top: 0, height: SUBROW_STRIDE, rejected: true };
+            }
+            const hit = this.trackAtClientY('audio', layouts, clientY, layouts[0].track);
+            const matched = layouts.find(layout => layout.track === hit.track);
+            return { track: hit.track, top: hit.top, height: matched?.height ?? SUBROW_STRIDE, rejected: hit.rejected };
+        }
+        const layouts = this.laneLayout.layerTracks;
+        if (layouts.length === 0) {
+            // layers 行が 1 本も無いプロジェクトでも挿入できること（司令塔裁定2 の明示要求）。
+            return { track: 0, top: 0, height: SUBROW_STRIDE, rejected: false, insertTrack: 0 };
+        }
+        const hit = this.trackAtClientY('layer', layouts, clientY, layouts[0].track);
+        const matched = layouts.find(layout => layout.track === hit.track);
+        return {
+            track: hit.track, top: hit.top, height: matched?.height ?? SUBROW_STRIDE,
+            rejected: hit.rejected, insertTrack: hit.insertTrack
+        };
+    }
+
+    protected materialGhostDurationSeconds(payload: MaterialDragPayload): number {
+        if (payload.kind === 'image') {
+            return IMAGE_LAYER_DEFAULT_DURATION_SECONDS;
+        }
+        const probed = this.materialDurationCache.get(payload.relativePath);
+        if (typeof probed === 'number' && probed > 0) {
+            return probed;
+        }
+        if (typeof payload.durationSeconds === 'number' && payload.durationSeconds > 0) {
+            return payload.durationSeconds;
+        }
+        return MATERIAL_INSERT_FALLBACK_DURATION_SECONDS;
+    }
+
+    protected updateMaterialGhost(clientX: number, clientY: number): void {
+        const payload = this.materialDragPayload;
+        if (!payload) {
+            this.hideMaterialGhost();
+            return;
+        }
+        this.materialDragLastClientX = clientX;
+        this.materialDragLastClientY = clientY;
+        const target = this.resolveMaterialDropTarget(payload.kind, clientY);
+        const visibility = materialGhostVisibility(payload.kind, target);
+        if (!visibility.showGhost) {
+            // rejected（対象外の帯）: 本体ゴーストを表示しない（司令塔裁定1）。trackAtClientY の
+            // fallthrough は rejected でも top に最上段レイヤー行を返すため、ここで描くと
+            // 「関係ない行に点線」に見えてしまう。
+            this.hideMaterialGhost();
+            return;
+        }
+        const durationSeconds = this.materialGhostDurationSeconds(payload);
+        const contentDuration = this.contentEndDuration();
+        const t = Math.min(Math.max(this.timeAtClientX(clientX), 0), contentDuration);
+        const range = computeMaterialGhostRange(t, durationSeconds, contentDuration);
+        this.setGhostRange(this.materialGhost, range.ok ? range.range.start : t, range.ok ? range.range.end : t);
+        this.setGhostRejected(this.materialGhost, !range.ok);
+        const viewportTop = RULER_BAND_HEIGHT_PX + target.top - this.stripScroll.scrollTop;
+        this.materialGhost.style.top = `${viewportTop}px`;
+        this.materialGhost.style.height = `${target.height}px`;
+        this.materialGhost.style.display = 'block';
+        if (visibility.showInsertIndicator) {
+            this.showTrackInsertIndicatorAt(target.top);
+        } else {
+            this.hideTrackInsertIndicator();
+        }
+    }
+
+    protected hideMaterialGhost(): void {
+        this.materialGhost.style.display = 'none';
+        this.hideTrackInsertIndicator();
+    }
+
     protected async performCompactCuts(): Promise<void> {
         const location = this.location;
         if (!location?.editUri) {
@@ -2723,7 +3188,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 this.audioNarration = parsed.audioNarration;
                 this.audioBgm = parsed.audioBgm;
                 this.timelineTracks = this.pinAudioGroupToBottom(
-                    parsed.timeline?.tracks ?? deriveDefaultTimelineTracks(rawValue)
+                    parsed.timeline?.tracks ?? deriveDefaultTimelineTracks(rawValue, this.captions.length > 0)
                 );
                 this.fps = parsed.fps;
                 if (parsed.warnings.length > 0) {
@@ -3057,6 +3522,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
      */
     protected calculateLaneLayout(topOffset = 0): number {
         this.computeAudioDisplayTracks();
+        this.computeCaptionsDisplayTrack();
         this.captionRows = assignSubRows(this.captions.map(caption => ({ start: caption.start, end: caption.end })));
         const captionRowCount = this.captionRows.length ? Math.max(...this.captionRows) + 1 : 0;
         let nextTop = topOffset;
@@ -3192,6 +3658,21 @@ export class AkariAnnotationsWidget extends BaseWidget {
             { id: track.id, kind: 'audio' as const, ref: track.ref }
         )));
         this.displayTimelineTracks = next;
+    }
+
+    /**
+     * 表示専用の字幕レーン補完（司令塔裁定 2026-08-12・裁定 2）: this.timelineTracks
+     * （明示 timeline.tracks、または派生ベースライン）に captions 種別が 1 つも無くても、
+     * captions.json（this.captions）に字幕があれば表示上のみ補う（中核アルゴリズムは
+     * withCaptionsDisplaySupplement、common/ の純粋関数として単体テスト済み）。edit.json への
+     * 書き戻しは一切行わない。reloadEdit / reloadCaptions は別々に走るため（読み込み順に依存
+     * させない要件）、本メソッドは renderStrip の度に calculateLaneLayout 冒頭から必ず呼ばれ、
+     * その時点の this.captions / this.timelineTracks の最新値から毎回作り直す。
+     */
+    protected computeCaptionsDisplayTrack(): void {
+        this.displayTimelineTracks = withCaptionsDisplaySupplement(
+            this.displayTimelineTracks, this.captions.length > 0
+        );
     }
 
     /** sfx の表示上の割当トラック ref（R7-3 の自動配置で上書きされていればそれを、なければ実際の sfx.track を返す）。 */
@@ -3353,6 +3834,9 @@ export class AkariAnnotationsWidget extends BaseWidget {
             );
             element.dataset.akariItemKind = 'overlay';
             element.dataset.akariItemId = overlay.id;
+            // docs/contract-2026-08-11-review-session-ui-events.md #2: timeline:overlay:<id>.
+            element.setAttribute('data-akari-ui', `timeline:overlay:${overlay.id}`);
+            element.setAttribute('data-akari-ui-label', overlay.id);
             element.dataset.akariTrack = String(overlay.track);
             element.dataset.akariLane = layout?.id ?? `track-${overlay.track}`;
             element.style.opacity = this.hiddenTracks.has(overlay.track) ? '.28' : '';
@@ -3532,6 +4016,9 @@ export class AkariAnnotationsWidget extends BaseWidget {
             );
             element.dataset.akariItemKind = 'cut';
             element.dataset.akariItemId = String(segment.index);
+            // docs/contract-2026-08-11-review-session-ui-events.md #2: timeline:cut:<n>.
+            element.setAttribute('data-akari-ui', `timeline:cut:${segment.index}`);
+            element.setAttribute('data-akari-ui-label', `C${segment.index + 1}`);
             element.dataset.akariLane = cutLayout.id ?? 'clips';
             const dimForTrimmer = trimmerActiveIndex !== undefined && trimmerActiveIndex !== segment.index;
             element.style.opacity = cutLayout.hidden ? '.28' : dimForTrimmer ? '.6' : '';
@@ -3960,25 +4447,15 @@ export class AkariAnnotationsWidget extends BaseWidget {
     }
 
     /**
-     * R7-4・A/V 命名: トラック表示名をグループ内連番 + 種別プレフィックスへ
-     * （音声 = A1, A2, …（最下段から A1）・映像系 = V1, V2, …（下から V1・従来の縦順のまま））。
-     * this.displayTimelineTracks は配列先頭 = 画面最下段（widget の `[...tracks].reverse()` 規約）
-     * なので、配列を先頭から辿るだけで両グループとも「最下段から連番」になる。
+     * R7-4・A/V/T 命名（2026-08-12、字幕レーンの自動命名を V 系から T 系へ分離）: トラック表示名を
+     * グループ内連番 + 種別プレフィックスへ（音声 = A1, A2, …・字幕 = T1, T2, …・映像系
+     * （cuts/layers/overlays）= V1, V2, …。いずれも最下段から連番）。this.displayTimelineTracks は
+     * 配列先頭 = 画面最下段（widget の `[...tracks].reverse()` 規約）なので、配列を先頭から辿る
+     * だけで各グループとも「最下段から連番」になる（中核アルゴリズムは computeTrackAutoNames、
+     * common/ の純粋関数として単体テスト済み）。
      */
     protected computeTrackAutoNames(): Map<string, string> {
-        const names = new Map<string, string>();
-        let audioCount = 0;
-        let videoCount = 0;
-        for (const track of this.displayTimelineTracks) {
-            if (track.kind === 'audio') {
-                audioCount++;
-                names.set(track.id, `A${audioCount}`);
-            } else {
-                videoCount++;
-                names.set(track.id, `V${videoCount}`);
-            }
-        }
-        return names;
+        return computeTrackKindAutoNames(this.displayTimelineTracks);
     }
 
     protected trackHeaderRow(
@@ -4185,7 +4662,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
             const before = (await this.fileService.readFile(editUri)).value.toString();
             const parsed = parseEdit(before);
             const base = this.pinAudioGroupToBottom(parsed.timeline?.tracks
-                ?? deriveDefaultTimelineTracks(JSON.parse(before) as unknown));
+                ?? deriveDefaultTimelineTracks(JSON.parse(before) as unknown, this.captions.length > 0));
             const tracks = mutate(base.map(track => ({ ...track })));
             const after = writeTimelineTracksInSource(before, tracks);
             if (after === before) {
@@ -4230,7 +4707,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
     ): EditTimelineTrack[] {
         const parsed = parseEdit(source);
         const tracks = this.pinAudioGroupToBottom(parsed.timeline?.tracks
-            ?? deriveDefaultTimelineTracks(JSON.parse(source) as unknown)).map(track => ({
+            ?? deriveDefaultTimelineTracks(JSON.parse(source) as unknown, this.captions.length > 0)).map(track => ({
             ...track,
             ...(track.kind === kind && (track.ref ?? 0) >= insertTrack
                 ? { ref: (track.ref ?? 0) + 1 } : {})
@@ -7543,6 +8020,58 @@ export class AkariAnnotationsWidget extends BaseWidget {
     protected closeAnnotationPopup(): void {
         this.contextPopup?.remove();
         this.contextPopup = undefined;
+    }
+
+    /**
+     * タイムラインのクリップ右クリックメニュー（task 2026-08-10-timeline-clip-menu 指示3）。
+     * 右クリックしたアイテムを先に単一選択に切り替えてから（司令塔裁定2）メニューを出す。
+     * 項目構成は既存ハンドラの対応範囲に従う純関数 buildTimelineClipMenuItems に委ねる。
+     */
+    protected openTimelineClipContextMenu(event: MouseEvent, element: HTMLElement): void {
+        event.preventDefault();
+        const item = this.timelineSelectionFromElement(element);
+        if (!item) {
+            return;
+        }
+        this.closeAnnotationPopup();
+        this.applySelection(item);
+        const items = buildTimelineClipMenuItems(item.kind, this.clipboard !== undefined);
+        const clientX = event.clientX;
+        openTimelineContextMenu({
+            x: event.clientX,
+            y: event.clientY,
+            items,
+            onSelect: id => this.dispatchTimelineClipMenuAction(id, item, clientX)
+        });
+    }
+
+    /**
+     * メニュー id → 既存ハンドラへのディスパッチ（司令塔裁定1）。分割の分割位置は
+     * 右クリックした X 位置（`clientX`）を使う（司令塔裁定1・事実2）。
+     */
+    protected dispatchTimelineClipMenuAction(id: string, item: TimelineSelectionItem, clientX: number): void {
+        if (id === 'copy') {
+            this.copySelectedItem();
+            return;
+        }
+        if (id === 'paste') {
+            void this.pasteClipboard();
+            return;
+        }
+        if (id === 'split') {
+            if (item.kind !== 'cut') {
+                return;
+            }
+            const segment = this.segments.find(candidate => candidate.index === item.index);
+            if (!segment) {
+                return;
+            }
+            void this.performRazorSplitAt(segment, clientX);
+            return;
+        }
+        if (id === 'delete') {
+            void this.performDeleteSelected();
+        }
     }
 
     /** タイムライン上の右クリックから直接追加する経路。一覧・入力欄は注釈パネルが持つ。 */

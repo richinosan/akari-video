@@ -103,7 +103,11 @@ export class ReviewModel {
         this.onSeekRequestedEmitter.fire(time);
     }
 
-    async addAnnotation(text: string, sourceT: number): Promise<{ annotation: Annotation; committed: boolean }> {
+    async addAnnotation(
+        text: string,
+        sourceT: number,
+        src: string | null = null
+    ): Promise<{ annotation: Annotation; committed: boolean }> {
         const location = this._location;
         if (!location) {
             throw new Error('プロジェクトを特定できません。');
@@ -111,9 +115,38 @@ export class ReviewModel {
         const result = await this.annotationsService.createAnnotation({
             reviewUri: location.reviewUri.toString(),
             projectRootUri: location.root.toString(),
+            src,
             sourceT,
             timelineT: null,
             target: null,
+            text
+        });
+        if (!this._annotations.some(existing => existing.id === result.annotation.id)) {
+            this._annotations = [...this._annotations, result.annotation];
+            this.onChangedEmitter.fire();
+        }
+        return result;
+    }
+
+    /** source 素材上の区間注釈。音声を含む素材種別を増やさず src + sourceRange へ着地させる。 */
+    async addSourceRangeAnnotation(
+        text: string,
+        src: string,
+        sourceRange: [number, number]
+    ): Promise<{ annotation: Annotation; committed: boolean }> {
+        const location = this._location;
+        if (!location) {
+            throw new Error('プロジェクトを特定できません。');
+        }
+        const result = await this.annotationsService.createAnnotation({
+            reviewUri: location.reviewUri.toString(),
+            projectRootUri: location.root.toString(),
+            src,
+            sourceT: sourceRange[0],
+            sourceRange,
+            timelineT: null,
+            target: null,
+            targetKind: 'range',
             text
         });
         if (!this._annotations.some(existing => existing.id === result.annotation.id)) {
@@ -167,6 +200,32 @@ export class ReviewModel {
             timelineT: null,
             target: `image:${imagePath}`,
             strokes: strokes.length > 0 ? strokes : null,
+            text
+        });
+        if (!this._annotations.some(existing => existing.id === result.annotation.id)) {
+            this._annotations = [...this._annotations, result.annotation];
+            this.onChangedEmitter.fire();
+        }
+        return result;
+    }
+
+    /**
+     * ui: target 注釈の作成（docs/contract-2026-08-11-review-session-ui-events.md §6 / M3）。
+     * doc: / image: とは異なり、UI 要素には固有の動画秒が無いわけではない（レビュー中に
+     * 選択した瞬間の再生位置に意味がある）ため、sourceT は addAnnotation と同じく現在の
+     * 選択秒をそのまま渡す — sourceT: null 許容規約（isDocOrImageTarget）を広げる必要がない。
+     */
+    async addUiAnnotation(text: string, sourceT: number, uiTarget: string): Promise<{ annotation: Annotation; committed: boolean }> {
+        const location = this._location;
+        if (!location) {
+            throw new Error('プロジェクトを特定できません。');
+        }
+        const result = await this.annotationsService.createAnnotation({
+            reviewUri: location.reviewUri.toString(),
+            projectRootUri: location.root.toString(),
+            sourceT,
+            timelineT: null,
+            target: `ui:${uiTarget}`,
             text
         });
         if (!this._annotations.some(existing => existing.id === result.annotation.id)) {

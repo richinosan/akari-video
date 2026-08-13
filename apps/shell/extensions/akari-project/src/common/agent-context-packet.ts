@@ -36,7 +36,8 @@ function renderField(field: AgentContextField): string {
     return field.label ? `${field.label} ${field.value}` : field.value;
 }
 
-function collapseToSingleLine(text: string): string {
+/** sendText 側の 1 行送信前提に合わせ、改行等の空白連続を単一スペースへ畳み込む。 */
+export function collapseToSingleLine(text: string): string {
     return text.replace(/\s+/g, ' ').trim();
 }
 
@@ -72,4 +73,22 @@ export function composeMaterialAskAgentPrompt(context: MaterialAgentContext, req
         fields.push({ label: 'analysis:', value: context.analysisRelativePath });
     }
     return composeAgentContextPacket(MATERIAL_TARGET_KIND, fields, request);
+}
+
+/** 「できたもの」書き出し行から composeAgentContextPacket へ渡す前段の入力。 */
+export interface OutputAgentContext {
+    /** プロジェクト相対パス（例: exports/cut.mp4）。 */
+    relativePath: string;
+}
+
+const OUTPUT_TARGET_KIND = '書き出し済みの成果物';
+
+/**
+ * 「できたもの」書き出し行（export）の「エージェントに頼む」の唯一の呼び出し元
+ * （task 2026-08-09-material-context-menu-mvp 指示8）。data/plan/report 行には
+ * 出さない（MVP 外・司令塔裁定5）。
+ */
+export function composeOutputAskAgentPrompt(context: OutputAgentContext, request: string): string {
+    const fields: AgentContextField[] = [{ value: context.relativePath }];
+    return composeAgentContextPacket(OUTPUT_TARGET_KIND, fields, request);
 }

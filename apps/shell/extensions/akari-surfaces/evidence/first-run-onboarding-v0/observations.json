@@ -1,0 +1,62 @@
+{
+  "sharedAkariHome": true,
+  "launches": [
+    {
+      "launch": 1,
+      "stages": [
+        "welcome+setup-dialog",
+        "workspace-dialog",
+        "connection-dialog",
+        "dashboard"
+      ],
+      "tools": [
+        {
+          "id": "ffmpeg",
+          "available": "true"
+        },
+        {
+          "id": "whisper",
+          "available": "true"
+        },
+        {
+          "id": "chrome",
+          "available": "true"
+        },
+        {
+          "id": "yt-dlp",
+          "available": "false"
+        },
+        {
+          "id": "voicevox",
+          "available": "true"
+        },
+        {
+          "id": "blender",
+          "available": "false"
+        },
+        {
+          "id": "xcode-clt",
+          "available": "true"
+        }
+      ],
+      "marker": {
+        "schema": 1,
+        "shownAt": "2026-08-11T22:16:05.396Z"
+      },
+      "pointer": {
+        "lastRoot": "/var/folders/j1/hl65g8x91mv4hl8rm7q04j440000gn/T/akari-first-run-l1-TqlMng/home/Akari",
+        "updatedAt": "2026-08-11T22:16:02.043Z"
+      },
+      "manifestSchema": "creator-root/v1"
+    },
+    {
+      "launch": 2,
+      "initialStage": "welcome",
+      "autoSetupCount": 0,
+      "reopenButtonCount": 1,
+      "buttonReopenClosedWithEscape": true,
+      "commandStage": "setup-dialog-over-welcome",
+      "commandReopenClosedWithX": true
+    }
+  ]
+}

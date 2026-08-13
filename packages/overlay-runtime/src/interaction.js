@@ -375,6 +375,15 @@ window.akari.interaction = (() => {
     );
   }
 
+  // 素材の選択・ドラッグをまとめて止めるスイッチ。既定は有効なので shell / store は挙動不変。
+  // Web UI は編集モードでない間これを false にする。後から選択を畳む方式だと、捕捉フェーズで
+  // 既に始まったドラッグが生き残り「枠は出ないのに動かせる」状態になる（実機 2026-08-07）。
+  let interactionEnabled = true;
+  function setEnabled(next) {
+    interactionEnabled = next !== false;
+    if (!interactionEnabled) clearSelection();
+  }
+
   function isSelectable(container) {
     if (
       !stage ||
@@ -387,6 +396,19 @@ window.akari.interaction = (() => {
     }
 
     return getComputedStyle(container).visibility !== "hidden";
+  }
+
+  // 2026-08-07 オーナー裁定・確定: role==="background" は
+  // 「選択・削除はできるが、ドラッグ・拡縮では動かせない」種別（mount() が dataset.role を立てる。
+  // preview-server の app.js / shell の overlay-runtime.js 双方）。要件の本質は「ずれたら直せる」
+  // ではなく「ずらせない」なので、ドラッグ/リサイズの開始点そのものを isSelectable とは別に
+  // isMovable で塞ぐ（選択自体は isSelectable のまま生かす）。
+  function isBackgroundRole(container) {
+    return Boolean(container?.dataset?.role === "background");
+  }
+
+  function isMovable(container) {
+    return isSelectable(container) && !isBackgroundRole(container);
   }
 
   function cssVariableText(container, name) {
@@ -453,6 +475,11 @@ window.akari.interaction = (() => {
       // 誤発火は無い」という設計判断のまま）。
       document.body.appendChild(selectionFrame);
     }
+
+    // 背景は動かせない選択であることを視覚でも伝える（拡縮ハンドルを消し、枠を破線にする。
+    // interaction.css の .is-locked）。isMovable ではなく isBackgroundRole を見るのは、
+    // 選択自体は許すが移動系操作だけを塞ぐという役割分担を CSS 側にも一致させるため。
+    selectionFrame.classList.toggle("is-locked", isBackgroundRole(selectedOverlay));
 
     const usableRect =
       [rect.left, rect.top, rect.width, rect.height].every(Number.isFinite) &&
@@ -555,6 +582,21 @@ window.akari.interaction = (() => {
     if (!drag.moved) return null;
 
     const transform = readTransform(drag.container);
+    // 位置が実質変わっていないなら書かない。drag.moved は「動き始めたか」しか見ていないので、
+    // しきい値を越えてから元の位置へ戻して離すと、変化ゼロのまま書き込みが走っていた
+    // （実機 2026-08-07: 移動量 0.00004px の transform が edit.json に残留）。
+    // 出力座標で 0.5px 未満 = 目にも見えないし、意図した調整でもない。
+    const WRITE_EPSILON_PX = 0.5;
+    if (
+      Math.abs(transform.x - drag.startX) < WRITE_EPSILON_PX &&
+      Math.abs(transform.y - drag.startY) < WRITE_EPSILON_PX
+    ) {
+      // 端数を残さないよう開始値へ戻し、何も書かずに終える
+      drag.container.style.setProperty("--x", `${drag.startX}px`);
+      drag.container.style.setProperty("--y", `${drag.startY}px`);
+      refreshSelectionFrame();
+      return null;
+    }
     const record = enqueueWrite(
       drag.writeContext,
       drag.overlayId,
@@ -1094,11 +1136,12 @@ window.akari.interaction = (() => {
   }
 
   function onPointerDown(event) {
+    if (!interactionEnabled) return;
     if (event.button !== 0 || activeDrag || activeResize) return;
 
     const handleEl = findHandleElement(event.target);
     if (handleEl) {
-      if (!isSelectable(selectedOverlay)) return;
+      if (!isMovable(selectedOverlay)) return;
       beginResize(event, selectedOverlay, handleEl);
       return;
     }
@@ -1116,6 +1159,11 @@ window.akari.interaction = (() => {
     }
 
     if (activeEdit) void commitEdit();
+
+    // 背景（role==="background"）は選択できるが動かせない。選択はここまでで完了させ、
+    // ドラッグは開始しない（isSelectable のみで isMovable を通さないと、選択直後に
+    // pointermove が来た瞬間 activeDrag が動き出してしまう）。
+    if (!isMovable(container)) return;
 
     const transform = readTransform(container);
     activeDrag = {
@@ -1208,8 +1256,19 @@ window.akari.interaction = (() => {
     );
   }
 
+  // 多層積み断片（overlay-authoring telop.md「多層テキスト断片と data-mirror 規約」）:
+  // 縁取り・影・裏打ち等でテキストを複製した層は data-mirror="text" を持つ。
+  // これらは直接テキストを持っていても編集候補から除外し、断片ごとに残る唯一の
+  // 直接テキスト層（最前面の fill 層）だけが編集対象になるようにする。
+  function isMirrorTextLayer(element) {
+    return (
+      element instanceof Element && element.getAttribute("data-mirror") === "text"
+    );
+  }
+
   function canEditText(element) {
     if (!(element instanceof HTMLElement) || !hasDirectText(element)) return false;
+    if (isMirrorTextLayer(element)) return false;
 
     return ![
       "INPUT",
@@ -1252,6 +1311,35 @@ window.akari.interaction = (() => {
     return null;
   }
 
+  // ミラー同期のスコープ特定: 編集層の直近の祖先のうち、data-mirror="text" 層を
+  // 子孫に持つ最初のもの。既定は編集層の親要素（PoC 由来の積層断片は fill 層と
+  // ミラー層が同じ積層コンテナ = 親要素の直下に並ぶ — telop.md 参照）。container
+  // （[data-overlay-id]）を超えて他のオーバーレイ側へは探しに行かない。
+  function mirrorSyncScope(container, element) {
+    let scope = element.parentElement;
+    while (scope && scope !== container) {
+      if (scope.querySelector('[data-mirror="text"]')) return scope;
+      scope = scope.parentElement;
+    }
+    return element.parentElement;
+  }
+
+  // 編集層の textContent を同一 stack 内の全ミラー層へコピーする（P0-R 契約 §2）。
+  // 呼び出し元は input / compositionend のたびに、および保存直前の安全網として
+  // commitEdit からも呼ぶ。
+  function syncMirrorLayers(container, element) {
+    const scope = mirrorSyncScope(container, element);
+    if (!scope) return;
+
+    const mirrors = scope.querySelectorAll('[data-mirror="text"]');
+    if (!mirrors.length) return;
+
+    const text = element.textContent ?? "";
+    for (const mirror of mirrors) {
+      if (mirror.textContent !== text) mirror.textContent = text;
+    }
+  }
+
   function restoreAttribute(element, name, hadAttribute, value) {
     if (hadAttribute) {
       element.setAttribute(name, value);
@@ -1284,6 +1372,10 @@ window.akari.interaction = (() => {
 
     const edit = activeEdit;
     activeEdit = null;
+
+    // 保存直前の安全網: input/compositionend を取りこぼした場合でも、確定した
+    // 編集層のテキストで全ミラー層を同期してから書き出す（P0-R 契約 §3）。
+    syncMirrorLayers(edit.container, edit.element);
 
     restoreAttribute(
       edit.element,
@@ -1370,11 +1462,13 @@ window.akari.interaction = (() => {
   }
 
   function onClick(event) {
+    if (!interactionEnabled) return;
     const container = overlayForEvent(event);
     if (isSelectable(container)) selectOverlay(container);
   }
 
   function onDoubleClick(event) {
+    if (!interactionEnabled) return;
     const container = overlayForEvent(event);
     if (!isSelectable(container)) return;
 
@@ -1390,6 +1484,14 @@ window.akari.interaction = (() => {
     if (activeEdit && event.target === activeEdit.element) {
       void commitEdit({ blur: false });
     }
+  }
+
+  // 文字確定（input）/ IME 確定（compositionend）のたびにミラー層へ同期する
+  // （P0-R 契約 §2）。IME 変換中の中間状態も input が発火する環境ではそのまま
+  // コピーしてよい（ミラー層は mount() が aria-hidden="true" を付与済み）。
+  function onEditableInput(event) {
+    if (!activeEdit || event.target !== activeEdit.element) return;
+    syncMirrorLayers(activeEdit.container, activeEdit.element);
   }
 
   function onKeyDown(event) {
@@ -1717,6 +1819,8 @@ window.akari.interaction = (() => {
   listenerRoot.addEventListener("pointerdown", onPointerDown, true);
   listenerRoot.addEventListener("dblclick", onDoubleClick, true);
   listenerRoot.addEventListener("blur", onBlur, true);
+  listenerRoot.addEventListener("input", onEditableInput, true);
+  listenerRoot.addEventListener("compositionend", onEditableInput, true);
   listenerRoot.addEventListener(
     "dragstart",
     (event) => {
@@ -1762,5 +1866,7 @@ window.akari.interaction = (() => {
     // Web UI（preview-server）が編集モードを抜けるときに選択枠を畳むための公開口
     // （Phase 2-4 一本化。shell では未使用の追加 export で挙動不変）。
     clearSelection,
+    // Web UI が編集モードに合わせて素材操作そのものを止めるための公開口。
+    setEnabled,
   };
 })();

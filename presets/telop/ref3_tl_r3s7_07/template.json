@@ -21,91 +21,363 @@
       "key": "text",
       "type": "text",
       "label": "字幕テキスト",
-      "default": "NHK　東京放送局"
+      "default": "NHK　東京放送局",
+      "group": "main",
+      "role": "text"
     },
     {
       "key": "fontSize",
       "type": "number",
       "label": "文字サイズ",
-      "default": 82
+      "default": 82,
+      "group": "main",
+      "role": "size"
     },
     {
       "key": "posY",
       "type": "number",
-      "label": "表示Y位置",
-      "default": 856
-    },
-    {
-      "key": "letterSpacing",
-      "type": "number",
-      "label": "字間",
-      "default": 8
+      "label": "Y位置（中央基準）",
+      "default": 380,
+      "group": "global",
+      "role": "pos-y"
     },
     {
       "key": "color_primary",
       "type": "color",
       "label": "リン光上端（青白）",
-      "default": "#E8F4FF"
+      "default": "#E8F4FF",
+      "group": "main",
+      "role": "color-accent"
     },
     {
       "key": "color_primary_2",
       "type": "color",
       "label": "リン光中間",
-      "default": "#B8DCFF"
+      "default": "#B8DCFF",
+      "group": "main",
+      "role": "color-accent"
     },
     {
       "key": "color_primary_3",
       "type": "color",
       "label": "リン光下端（やや暗）",
-      "default": "#7AACDC"
+      "default": "#7AACDC",
+      "group": "main",
+      "role": "color-accent"
     },
     {
       "key": "color_bg",
       "type": "color",
       "label": "字幕帯色（濃灰）",
-      "default": "rgba(8,12,20,0.82)"
-    },
-    {
-      "key": "color_stroke",
-      "type": "color",
-      "label": "外縁色（黒）",
-      "default": "rgba(0,0,0,0.95)"
+      "default": "rgba(8,12,20,0.82)",
+      "group": "band",
+      "role": "color-bg"
     },
     {
       "key": "color_bg_2",
       "type": "color",
       "label": "帯グラデ縁（暗）",
-      "default": "rgba(4,8,16,0.5)"
+      "default": "rgba(4,8,16,0.5)",
+      "group": "band",
+      "role": "color-stroke"
     },
     {
       "key": "color_bg_3",
       "type": "color",
       "label": "帯グラデ中央",
-      "default": "rgba(8,12,20,0.85)"
+      "default": "rgba(8,12,20,0.85)",
+      "group": "band",
+      "role": "color-bg"
     },
     {
       "key": "color_stroke_2",
       "type": "color",
       "label": "内側の青フチ色",
-      "default": "rgba(100,180,255,0.6)"
-    },
-    {
-      "key": "color_shadow",
-      "type": "color",
-      "label": "影色（黒）",
-      "default": "rgba(0,0,0,0.9)"
-    },
-    {
-      "key": "color_glow",
-      "type": "color",
-      "label": "グロー色（青）",
-      "default": "rgba(80,160,255,0.5)"
+      "default": "rgba(100,180,255,0.6)",
+      "group": "main",
+      "role": "color-stroke"
     },
     {
       "key": "color_glow_2",
       "type": "color",
       "label": "グロー色（水色）",
-      "default": "rgba(140,200,255,0.25)"
+      "default": "rgba(140,200,255,0.25)",
+      "group": "main",
+      "role": "color-glow"
+    },
+    {
+      "key": "fontFamily",
+      "type": "font",
+      "label": "フォント",
+      "default": "'Noto Sans JP', sans-serif",
+      "options": [
+        "'Noto Sans JP', sans-serif",
+        "'Noto Serif JP', serif",
+        "'M PLUS Rounded 1c', 'Noto Sans JP', sans-serif",
+        "'BIZ UDGothic', 'Noto Sans JP', sans-serif",
+        "'Dela Gothic One', 'Noto Sans JP', sans-serif",
+        "'Zen Maru Gothic', 'M PLUS Rounded 1c', sans-serif",
+        "'Shippori Mincho', 'Noto Serif JP', serif",
+        "'DotGothic16', 'Noto Sans JP', sans-serif",
+        "'Klee One', 'Noto Sans JP', sans-serif",
+        "'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif",
+        "'851チカラヅヨク', 'Noto Sans JP', sans-serif",
+        "'851チカラヨワク', 'Noto Sans JP', sans-serif",
+        "'RocknRoll One', 'Noto Sans JP', sans-serif",
+        "'Reggae One', 'Noto Sans JP', sans-serif",
+        "'零ゴシック', 'Noto Sans JP', sans-serif",
+        "'異世ゴ', 'Noto Sans JP', sans-serif",
+        "'チェックアンド横断フォント', 'Noto Sans JP', sans-serif",
+        "'07ラノベPOP', 'ラノベPOP', 'M PLUS Rounded 1c', sans-serif",
+        "'わんぱくルイカ-07', 'わんぱくルイカ', 'M PLUS Rounded 1c', sans-serif",
+        "'ルイカ-08', 'ルイカ', 'Noto Sans JP', sans-serif",
+        "'M PLUS 1p', 'Noto Sans JP', sans-serif",
+        "'Mgen+ 1p', 'Mgen+ 1c', 'Noto Sans JP', sans-serif",
+        "'コーポレート・ロゴ（ラウンド）ver3', 'コーポレート・ロゴ ラウンド', 'Noto Sans JP', sans-serif",
+        "'棘薔薇', 'Noto Serif JP', serif",
+        "'KSO黒龍爽', 'Noto Serif JP', serif",
+        "'TA-F1ブロックライン', 'Noto Sans JP', sans-serif",
+        "'TA演芸筆', 'Noto Serif JP', serif",
+        "'TA風雅筆', 'Noto Serif JP', serif",
+        "'VDL-V7明朝', 'Noto Serif JP', serif",
+        "'VDL-ロゴJrブラック', 'Noto Sans JP', sans-serif",
+        "'AB-kirigirisu', 'Noto Sans JP', sans-serif"
+      ],
+      "group": "global",
+      "role": "font"
+    },
+    {
+      "key": "fontWeight",
+      "type": "number",
+      "label": "太さ（100〜900）",
+      "default": 700,
+      "group": "global",
+      "role": "weight"
+    },
+    {
+      "key": "posX",
+      "type": "number",
+      "label": "X位置（中央基準）",
+      "default": 0,
+      "group": "global",
+      "role": "pos-x"
+    },
+    {
+      "key": "bgEnabled",
+      "type": "bool",
+      "label": "座布団",
+      "default": true,
+      "group": "fx",
+      "role": "toggle"
+    },
+    {
+      "key": "strokeEnabled",
+      "type": "bool",
+      "label": "縁取り",
+      "default": true,
+      "group": "fx",
+      "role": "toggle"
+    },
+    {
+      "key": "strokeWidth",
+      "type": "number",
+      "label": "縁取り太さ",
+      "default": 14,
+      "group": "fx",
+      "role": "stroke-width"
+    },
+    {
+      "key": "color_stroke",
+      "type": "color",
+      "label": "縁取り色",
+      "default": "rgba(0,0,0,0.95)",
+      "group": "fx",
+      "role": "color-stroke"
+    },
+    {
+      "key": "shadowEnabled",
+      "type": "bool",
+      "label": "影",
+      "default": true,
+      "group": "fx",
+      "role": "toggle"
+    },
+    {
+      "key": "color_shadow",
+      "type": "color",
+      "label": "影色",
+      "default": "rgba(0,0,0,0.9)",
+      "group": "fx",
+      "role": "color-shadow"
+    },
+    {
+      "key": "glowEnabled",
+      "type": "bool",
+      "label": "グロー",
+      "default": true,
+      "group": "fx",
+      "role": "toggle"
+    },
+    {
+      "key": "color_glow",
+      "type": "color",
+      "label": "グロー色",
+      "default": "rgba(80,160,255,0.5)",
+      "group": "fx",
+      "role": "color-glow"
+    },
+    {
+      "key": "glowStrength",
+      "type": "number",
+      "label": "グロー強度",
+      "default": 1,
+      "group": "fx",
+      "role": "strength"
+    },
+    {
+      "key": "letterSpacing",
+      "type": "number",
+      "label": "字間",
+      "default": 8,
+      "group": "fx",
+      "role": "spacing"
+    },
+    {
+      "key": "animIn",
+      "type": "select",
+      "label": "入りアニメ",
+      "default": "original",
+      "options": [
+        "original",
+        "none",
+        "fade-in-out",
+        "soft-fade",
+        "fade-up",
+        "fade-down",
+        "cinematic-fade",
+        "slide-left",
+        "slide-right",
+        "slide-up",
+        "slide-down",
+        "push-left",
+        "push-right",
+        "push-up",
+        "push-down",
+        "rise-soft",
+        "drop-in",
+        "zoom-in-out",
+        "zoom-pop",
+        "zoom-pulse",
+        "pop",
+        "bounce",
+        "squash-pop",
+        "stretch-in",
+        "stomp",
+        "snap",
+        "rotate-in",
+        "spin-in",
+        "roll-in",
+        "spiral-in",
+        "swing",
+        "shake",
+        "jitter",
+        "glitch",
+        "flash",
+        "heartbeat",
+        "typewriter",
+        "wipe-left",
+        "wipe-right",
+        "caption-rise"
+      ],
+      "group": "anim",
+      "role": "anim-in"
+    },
+    {
+      "key": "animOut",
+      "type": "select",
+      "label": "抜けアニメ",
+      "default": "original",
+      "options": [
+        "original",
+        "none",
+        "fade-in-out",
+        "soft-fade",
+        "fade-up",
+        "fade-down",
+        "cinematic-fade",
+        "slide-left",
+        "slide-right",
+        "slide-up",
+        "slide-down",
+        "push-left",
+        "push-right",
+        "push-up",
+        "push-down",
+        "rise-soft",
+        "drop-in",
+        "zoom-in-out",
+        "zoom-pop",
+        "zoom-pulse",
+        "pop",
+        "bounce",
+        "squash-pop",
+        "stretch-in",
+        "stomp",
+        "snap",
+        "rotate-in",
+        "spin-in",
+        "roll-in",
+        "spiral-in",
+        "swing",
+        "shake",
+        "jitter",
+        "glitch",
+        "flash",
+        "heartbeat",
+        "typewriter",
+        "wipe-left",
+        "wipe-right",
+        "caption-rise"
+      ],
+      "group": "anim",
+      "role": "anim-out"
+    },
+    {
+      "key": "animLoop",
+      "type": "select",
+      "label": "ループアニメ",
+      "default": "original",
+      "options": [
+        "original",
+        "none",
+        "wobble",
+        "float",
+        "breath",
+        "neon-flicker",
+        "hologram",
+        "retro-flicker",
+        "news-ticker",
+        "marquee-left",
+        "crawl-up"
+      ],
+      "group": "anim",
+      "role": "anim-loop"
+    },
+    {
+      "key": "animInSec",
+      "type": "number",
+      "label": "入り時間（秒）",
+      "default": 0.6,
+      "group": "anim",
+      "role": "anim-duration"
+    },
+    {
+      "key": "animOutSec",
+      "type": "number",
+      "label": "抜け時間（秒）",
+      "default": 0.6,
+      "group": "anim",
+      "role": "anim-duration"
     }
   ],
   "layers": [
@@ -153,9 +425,7 @@
       },
       "transform": {
         "x": 960,
-        "y": {
-          "var": "posY"
-        },
+        "y": 856,
         "anchor": {
           "x": 0.5,
           "y": 0.5
@@ -220,7 +490,8 @@
             }
           ]
         }
-      ]
+      ],
+      "fxTag": "bg"
     },
     {
       "id": "ref3_tl_r3s7_07_text",
@@ -232,15 +503,17 @@
         "size": {
           "var": "fontSize"
         },
-        "font": "'Noto Sans JP', sans-serif",
-        "weight": 700,
+        "font": {
+          "var": "fontFamily"
+        },
+        "weight": {
+          "var": "fontWeight"
+        },
         "color": {
           "var": "color_primary"
         },
         "align": "center",
-        "letterSpacing": {
-          "var": "letterSpacing"
-        },
+        "letterSpacing": 8,
         "fill": {
           "type": "linear-v",
           "stops": [
@@ -314,9 +587,7 @@
         "x": {
           "expr": "@stage.width / 2"
         },
-        "y": {
-          "var": "posY"
-        },
+        "y": 856,
         "anchor": {
           "x": 0.5,
           "y": 0.5
@@ -358,5 +629,28 @@
         }
       ]
     }
-  ]
+  ],
+  "groups": [
+    {
+      "id": "main",
+      "label": "本文"
+    },
+    {
+      "id": "band",
+      "label": "帯・背景"
+    },
+    {
+      "id": "global",
+      "label": "全体"
+    },
+    {
+      "id": "fx",
+      "label": "装飾"
+    },
+    {
+      "id": "anim",
+      "label": "アニメ"
+    }
+  ],
+  "anchor": "bc"
 }

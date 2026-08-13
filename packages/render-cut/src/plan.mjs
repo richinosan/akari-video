@@ -12,9 +12,13 @@ import {
   segmentDuration,
 } from "./cut-timeline.mjs";
 import { appendCutVisualTransform, hasCutVisualTransform } from "./cut-transform.mjs";
+import { hasCutFraming } from "./cut-framing.mjs";
+import { appendFreezeAwareAudioTrim, appendFreezeAwareVideoTrim, hasCutFreeze } from "./cut-freeze.mjs";
 import { buildTailPadCommand, computeContentDurationSeconds } from "./content-duration.mjs";
-import { buildVideoEncodeArgs, resolveEncoderChoice } from "./encode-preset.mjs";
-import { buildLayersCompositeCommand, hasLayers } from "./layers.mjs";
+import { appendCutFxChain, hasCutFx } from "./fx.mjs";
+import { resolveEncodingPolicy } from "./encode-preset.mjs";
+import { buildLayersCompositeCommand, hasLayers, isImageLayerSource } from "./layers.mjs";
+import { resolveLutPath } from "./render-inputs.mjs";
 import {
   buildCutTrackCompositeCommand,
   buildTrackBaseCommand,
@@ -28,10 +32,20 @@ const DUCKING_SIDECHAIN_ARGS = "threshold=0.063:ratio=8:attack=5:release=300";
 // docs/contract-2026-07-20-edit-json-v1-narration.md §1: gain_db clamp range, shared with bgm/sfx.
 const GAIN_DB_MIN = -60;
 const GAIN_DB_MAX = 12;
-// presets/luts/<id>/<id>.cube — packages/render-cut/src/../../.. is the monorepo root, sibling to
-// presets/ (see presets/luts/INDEX.md for the bare-name preset reference convention). Moved from
-// catalog/luts on 2026-07-29: LUTs are a lookup table resolved by id in code, not a library asset.
-const PRESETS_LUTS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "presets", "luts");
+// Cut intermediates favor independent frames: keyint=1 removes x264's expensive temporal search
+// while retaining the resolved preset and CRF verbatim. At a fixed CRF, all-intra frames are not
+// visually coarser (short A/B renders measure higher SSIM/PSNR); the trade-off is a larger cut.mp4.
+// Apply this only to an explicitly resolved libx264 policy. The null legacy path and hardware
+// encoders must keep their exact argument arrays.
+const CUT_X264_PERFORMANCE_PARAMS = "keyint=1";
+
+function tuneCutVideoEncodeArgs(videoEncodeArgs) {
+  if (!Array.isArray(videoEncodeArgs)) return videoEncodeArgs;
+  const codecIndex = videoEncodeArgs.indexOf("-c:v");
+  if (codecIndex < 0 || videoEncodeArgs[codecIndex + 1] !== "libx264") return videoEncodeArgs;
+  if (videoEncodeArgs.includes("-x264-params")) return videoEncodeArgs;
+  return [...videoEncodeArgs, "-x264-params", CUT_X264_PERFORMANCE_PARAMS];
+}
 
 export function buildPlan({
   edit,
@@ -52,13 +66,34 @@ export function buildPlan({
   // backward-compat guarantee this task requires.
   quality,
   encoder,
+  encodingPolicy,
   fpsOverride,
 }) {
+  // docs/contract-2026-08-12-still-image-cut-source-v0.md 裁定5: a still image has no intrinsic
+  // duration, so v0's "cuts[] empty = whole source" shortcut (predictedDuration's sourceDuration
+  // fallback) cannot apply to it. edit-lint's cuts.still-image-cuts-required check rejects this
+  // combination before render normally runs; this is the defensive backstop for direct
+  // buildPlan()/render-cut invocations that skip lint (same posture as buildTrackStackPlan's
+  // transition_out backstop below).
+  if (
+    edit.version === 0
+    && isImageLayerSource(edit.source?.path)
+    && (!Array.isArray(edit.cuts) || edit.cuts.length === 0)
+  ) {
+    throw new Error(
+      "source.path is a still image and cuts[] is empty. A still image has no intrinsic duration, so the v0 "
+        + "\"empty cuts = whole source\" shortcut does not apply here -- declare at least one cut with an "
+        + "explicit out to state the display duration (docs/contract-2026-08-12-still-image-cut-source-v0.md).",
+    );
+  }
   const width = edit.output.width;
   const height = edit.output.height;
   const fps = isPositiveNumber(fpsOverride) ? fpsOverride : edit.output.fps;
-  const encoderChoice = resolveEncoderChoice({ requested: encoder, ffmpegCommand: capabilities.ffmpegCommand });
-  const videoEncodeArgs = buildVideoEncodeArgs({ quality, encoderChoice, profile: "high" });
+  const resolvedEncodingPolicy = encodingPolicy === undefined
+    ? resolveEncodingPolicy({ cli: { quality, encoder }, edit, capabilities })
+    : encodingPolicy;
+  const videoEncodeArgs = resolvedEncodingPolicy?.video_encode_args ?? null;
+  const cutVideoEncodeArgs = tuneCutVideoEncodeArgs(videoEncodeArgs);
   const cutsEndSeconds = predictedDuration(edit.cuts, capabilities.sourceDuration, edit.version);
   const finalDurationSeconds = computeContentDurationSeconds({
     edit,
@@ -89,7 +124,7 @@ export function buildPlan({
       ffmpegCommand: capabilities.ffmpegCommand,
       projectRoot,
       look: edit.output.look,
-      videoEncodeArgs,
+      videoEncodeArgs: cutVideoEncodeArgs,
     });
   } else {
     const sourcePath = resolve(projectRoot, edit.source.path);
@@ -106,7 +141,7 @@ export function buildPlan({
       projectRoot,
       look: edit.output.look,
       chromaKey: edit.source?.chroma_key,
-      videoEncodeArgs,
+      videoEncodeArgs: cutVideoEncodeArgs,
     });
   }
   const tailPad = finalDurationSeconds > cutsEndSeconds + 0.001
@@ -115,7 +150,8 @@ export function buildPlan({
         inputPath: cutPath,
         outputPath: tailPaddedPath,
         cutsEndSeconds,
-        finalDurationSeconds,
+      finalDurationSeconds,
+      videoEncodeArgs,
       })
     : null;
   const cutOutputPath = tailPad ? tailPaddedPath : cutPath;
@@ -128,11 +164,13 @@ export function buildPlan({
         layers: edit.layers,
         projectRoot,
         ffmpegCommand: capabilities.ffmpegCommand,
+        ffprobeCommand: capabilities.ffprobeCommand,
         inputPath: cutOutputPath,
         outputPath: layeredPath,
         duration: finalDurationSeconds,
         width,
         height,
+        videoEncodeArgs,
       })
     : null;
   const trackStack = defaultTrackOrder
@@ -150,10 +188,18 @@ export function buildPlan({
         height,
         fps,
         hasSourceAudio,
+        videoEncodeArgs,
       });
   const baseVideoPath = trackStack ? trackStack.outputPath : (layers ? layeredPath : cutOutputPath);
 
+  // v1（sources[]）の書き出しは cuts[] を連結するだけで track / at を合成しない。
+  // 宣言だけ通って絵が消える事故を検証メッセージで名指しするための旗（verifyArtifact が読む）。
+  const cutTrackDeclarationUnrendered = edit.version === 1
+    && Array.isArray(edit.cuts)
+    && needsGapAwareCutTimeline(edit.cuts);
+
   return {
+    cut_track_declaration_unrendered: cutTrackDeclarationUnrendered,
     predicted_duration_seconds: finalDurationSeconds,
     duration_tolerance_seconds: Math.max(0.1, 2 / fps),
     output: relativeOrAbsolute(projectRoot, outputPath),
@@ -161,11 +207,13 @@ export function buildPlan({
       video_codec: "h264",
       profile: "high",
       pixel_format: "yuv420p",
+      color_range: "tv",
       audio_codec: "aac",
       width,
       height,
       fps,
     },
+    ...(resolvedEncodingPolicy ? { encoding: resolvedEncodingPolicy } : {}),
     rasterizer: {
       selected: rasterizer,
       // 3D scenes cannot degrade to a still image: execution rejects HyperFrames and requires
@@ -289,7 +337,9 @@ function buildTrackStackPlan({
   height,
   fps,
   hasSourceAudio,
+  videoEncodeArgs,
 }) {
+  const cutVideoEncodeArgs = tuneCutVideoEncodeArgs(videoEncodeArgs);
   const ordered = resolveTrackOrder(edit)
     .map((track, orderIndex) => {
       const ref = Number.isInteger(track?.ref) ? track.ref : null;
@@ -302,6 +352,30 @@ function buildTrackStackPlan({
     })
     .filter(track => (track.kind === "cuts" || track.kind === "layers") && track.items.length > 0);
 
+  // task 2026-08-07-track-transition-lint-guard (edit-lint's cuts.track-transition-unsupported
+  // check is the primary guard; this is the defensive backstop for direct render-cut invocations
+  // that skip lint). See that check's comment in edit-lint.mjs for the full rationale: gap-aware
+  // track compositing (this function) is built on resolveCutSegments/computeVideoRuns, which
+  // treat same-track adjacent cuts as separate non-overlapping windows and so cannot represent an
+  // xfade's intentional overlap -- verified with a real render to silently show the base track's
+  // background leaking through partway into what should still be the dissolved clip.
+  if (edit.version === 1) {
+    for (const track of ordered) {
+      if (track.kind !== "cuts") continue;
+      for (const cut of track.items.slice(0, -1)) {
+        if (!cut.transition_out) continue;
+        throw new Error(
+          `cuts[].transition_out is declared on track ${track.ref}, which timeline.tracks composites through `
+            + "the gap-aware track engine. That engine treats adjacent same-track cuts as separate, "
+            + "non-overlapping windows, so it cannot represent an xfade's intentional overlap -- the composited "
+            + "window and the actually-shrunk clip diverge, and content disappears early. Remove transition_out "
+            + "from this track's cuts, or drop the custom timeline.tracks order for this track so it renders "
+            + "through the plain sequential path instead.",
+        );
+      }
+    }
+  }
+
   const basePath = join(temporary, "track-base.mp4");
   const base = buildTrackBaseCommand({
     ffmpegCommand: capabilities.ffmpegCommand,
@@ -311,6 +385,7 @@ function buildTrackStackPlan({
     width,
     height,
     fps,
+    videoEncodeArgs,
   });
   const cutTracks = [];
   const stages = [];
@@ -332,6 +407,7 @@ function buildTrackStackPlan({
             ffmpegCommand: capabilities.ffmpegCommand,
             projectRoot,
             look: edit.output.look,
+            videoEncodeArgs: cutVideoEncodeArgs,
           })
         : buildCutCommand({
             sourcePath: resolve(projectRoot, edit.source.path),
@@ -346,6 +422,7 @@ function buildTrackStackPlan({
             projectRoot,
             look: edit.output.look,
             chromaKey: edit.source?.chroma_key,
+            videoEncodeArgs: cutVideoEncodeArgs,
           });
       cutTracks.push({ ref: track.ref, path: trackPath, command });
       stages.push({
@@ -362,6 +439,7 @@ function buildTrackStackPlan({
             outputDuration: duration,
           }),
           duration,
+          videoEncodeArgs,
         }),
       });
     } else {
@@ -372,11 +450,13 @@ function buildTrackStackPlan({
           layers: track.items,
           projectRoot,
           ffmpegCommand: capabilities.ffmpegCommand,
+          ffprobeCommand: capabilities.ffprobeCommand,
           inputPath: previousPath,
           outputPath,
           duration,
           width,
           height,
+          videoEncodeArgs,
         }),
       });
     }
@@ -422,7 +502,16 @@ export function buildAudioMixCommand({
     return { operation: "copy", input: inputPath, output: outputPath, warnings, hasNarration };
   }
 
-  const args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", inputPath];
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    master ? "info" : "error",
+    ...(master ? ["-nostats"] : []),
+    "-nostdin",
+    "-y",
+    "-i",
+    inputPath,
+  ];
   const labels = ["[0:a]"];
   const filters = [];
   let inputIndex = 1;
@@ -522,7 +611,7 @@ export function buildAudioMixCommand({
       filters.push(`${finalLabel}afftdn=nr=${nr}:nf=-30[master_dn]`);
       finalLabel = "[master_dn]";
     }
-    filters.push(`${finalLabel}loudnorm=I=${formatNumber(master.loudnormTarget)}:TP=-1.5:LRA=11[master_ln]`);
+    filters.push(`${finalLabel}loudnorm=I=${formatNumber(master.loudnormTarget)}:TP=${formatNumber(master.truePeakTarget)}:LRA=11:print_format=json[master_ln]`);
     finalLabel = "[master_ln]";
   }
 
@@ -555,7 +644,9 @@ function normalizeMasterPlan(master) {
   const denoise = ["off", "std", "strong"].includes(master.denoise) ? master.denoise : "off";
   const rawTarget = master.loudnorm;
   const loudnormTarget = typeof rawTarget === "number" && Number.isFinite(rawTarget) ? rawTarget : -14;
-  return { denoise, loudnormTarget };
+  const rawTruePeak = master.true_peak_dbtp;
+  const truePeakTarget = typeof rawTruePeak === "number" && Number.isFinite(rawTruePeak) ? rawTruePeak : -1.5;
+  return { denoise, loudnormTarget, truePeakTarget };
 }
 
 // docs/contract-2026-07-20-edit-json-v1-narration.md §4: resolve each narration element against the
@@ -653,12 +744,12 @@ function buildAnimatedCompositeCommand(command, cutPath, overlayPath, outputPath
       "-i",
       overlayPath,
       "-filter_complex",
-      "[0:v][1:v]overlay=0:0:format=auto:shortest=1[outv]",
+      "[0:v][1:v]overlay=0:0:format=auto:shortest=1[composited];[composited]scale=out_range=tv[outv]",
       "-map",
       "[outv]",
       "-map",
       "0:a:0",
-      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",
@@ -681,16 +772,17 @@ function buildStaticCompositeCommand(command, cutPath, outputPath, temporary, ov
     );
     previous = next;
   }
+  filters.push(`${previous}scale=out_range=tv[outv]`);
   args.push(
     "-filter_complex",
     filters.join(";"),
     "-map",
-    previous,
+    "[outv]",
     "-map",
     "0:a:0",
     "-t",
     formatNumber(duration),
-    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+    ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
     "-pix_fmt",
     "yuv420p",
     "-c:a",
@@ -703,13 +795,6 @@ function buildStaticCompositeCommand(command, cutPath, outputPath, temporary, ov
 // docs/contract-2026-07-22-render-basics.md #4: "lut(プリセット参照 or パス)" — a bare name (no
 // path separator) resolves against presets/luts/<name>/<name>.cube; anything else is treated as a
 // path relative to the project root (same regel as source.path / audio.bgm.path elsewhere).
-function resolveLutPath(projectRoot, lutRef) {
-  if (!lutRef.includes("/") && !lutRef.includes("\\")) {
-    return join(PRESETS_LUTS_ROOT, lutRef, `${lutRef}.cube`);
-  }
-  return resolve(projectRoot, lutRef);
-}
-
 // ffmpeg filter option values split on ':' and quote-related characters; escape both before
 // wrapping the value in single quotes (lut3d's file= option; same convention as chromakey's color=).
 function escapeFilterPath(path) {
@@ -873,10 +958,30 @@ export function buildCutCommand({
   videoEncodeArgs = null,
 }) {
   if (needsGapAwareCutTimeline(cuts)) {
+    // docs/contract-2026-07-22-render-basics.md #7 (cuts[].freeze), residual decision (this
+    // task): freeze is scoped to the default sequential cut timeline in v0. The gap-aware path's
+    // run-splitting math (computeVideoRuns) maps output time back to source time with a single
+    // linear speed factor, which breaks for a cut whose local timeline has a non-linear hold in
+    // the middle -- properly supporting that would require gap-aware run splitting to itself be
+    // freeze-boundary-aware, which is out of scope here. Rejecting loudly beats a silent drop
+    // (the contract's stated principle) if a project ever combines freeze with explicit at/track.
+    if (hasCutFreeze(cuts)) {
+      throw new Error(
+        "cuts[].freeze is not supported together with a gap-aware cut timeline (explicit at/track placement). "
+          + "Remove freeze or move the cut to the default sequential order (docs/contract-2026-07-22-render-basics.md #7).",
+      );
+    }
     return buildGapAwareCutCommand({ sourcePath, cutPath, cuts, width, height, fps, hasAudio, duration, ffmpegCommand, projectRoot, look, chromaKey, videoEncodeArgs });
   }
   const effectiveCuts = cuts.length > 0 ? cuts : [{ in: 0, out: null }];
-  const transformCuts = hasCutVisualTransform(effectiveCuts);
+  const transformCuts = hasCutVisualTransform(effectiveCuts) || hasCutFraming(effectiveCuts);
+  // docs/contract-2026-08-05-fx-v0.md (cuts[].fx). Like transformCuts above, this is a
+  // whole-array flag: any cut declaring fx routes *every* cut in the array through the
+  // per-segment full-frame path below (appendCutFxChain no-ops via `null` for cuts whose own
+  // fx is empty), so concat's inputs stay uniformly WxH-framed. Zero cuts with fx keeps the
+  // existing fast concat-only path byte-for-byte unchanged.
+  const fxCuts = hasCutFx(effectiveCuts);
+  const perCutFullFrame = transformCuts || fxCuts;
   const filters = [];
   const concatInputs = [];
   // docs/contract-2026-07-22-render-basics.md #3 (cuts[].transition_out). Residual decision 3
@@ -902,31 +1007,85 @@ export function buildCutCommand({
     // pitch back to the original, chained in <=2x/>=0.5x steps per ffmpeg's atempo range limit.
     const speed = cutSpeed(cut);
     const ptsExpr = speed === 1 ? "PTS-STARTPTS" : `(PTS-STARTPTS)/${formatNumber(speed)}`;
-    const trimmedLabel = transformCuts ? `[vraw${index}]` : `[v${index}]`;
-    filters.push(
-      `[0:v]trim=start=${formatNumber(cut.in)}${end},setpts=${ptsExpr}${timebaseNormalizer}${trimmedLabel}`,
-    );
-    if (transformCuts) {
-      appendCutVisualTransform({
+    const trimmedLabel = perCutFullFrame ? `[vraw${index}]` : `[v${index}]`;
+    // cut.out === null only ever happens for the synthetic { in: 0, out: null } fallback used
+    // when cuts[] is empty (see effectiveCuts above), which never carries a user-declared
+    // freeze -- the freeze-aware helper requires a concrete numeric sourceOut, so that
+    // synthetic case keeps the exact original single-line trim untouched.
+    if (cut.out === null) {
+      filters.push(
+        `[0:v]trim=start=${formatNumber(cut.in)}${end},setpts=${ptsExpr}${timebaseNormalizer}${trimmedLabel}`,
+      );
+    } else {
+      appendFreezeAwareVideoTrim({
         filters,
-        inputLabel: trimmedLabel,
-        outputLabel: `[v${index}]`,
-        cut,
+        inputLabel: "[0:v]",
+        outputLabel: trimmedLabel,
+        sourceIn: cut.in,
+        sourceOut: cut.out,
+        speed,
+        freeze: cut.freeze,
         id: `v${index}`,
-        width,
-        height,
         fps,
-        duration: segmentDuration(cut),
+        postSuffixFilter: hasAnyTransition ? "settb=AVTB" : "",
       });
+    }
+    if (perCutFullFrame) {
+      const shapedLabel = fxCuts ? `[vshaped${index}]` : `[v${index}]`;
+      if (transformCuts) {
+        appendCutVisualTransform({
+          filters,
+          inputLabel: trimmedLabel,
+          outputLabel: shapedLabel,
+          cut,
+          id: `v${index}`,
+          width,
+          height,
+          fps,
+          duration: segmentDuration(cut),
+        });
+      } else {
+        filters.push(
+          `${trimmedLabel}scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1${shapedLabel}`,
+        );
+      }
+      if (fxCuts) {
+        appendCutFxChain({
+          filters,
+          inputLabel: shapedLabel,
+          outputLabel: `[v${index}]`,
+          fx: cut.fx,
+          id: `v${index}`,
+          width,
+          height,
+          fps,
+          duration: segmentDuration(cut),
+        });
+      }
     }
     concatInputs.push(`[v${index}]`);
     if (hasAudio) {
       const atempoSuffix = buildAtempoChain(speed)
         .map((factor) => `,atempo=${formatNumber(factor)}`)
         .join("");
-      filters.push(
-        `[0:a]atrim=start=${formatNumber(cut.in)}${end},asetpts=PTS-STARTPTS${atempoSuffix}[a${index}]`,
-      );
+      if (cut.out === null) {
+        filters.push(
+          `[0:a]atrim=start=${formatNumber(cut.in)}${end},asetpts=PTS-STARTPTS${atempoSuffix}[a${index}]`,
+        );
+      } else {
+        appendFreezeAwareAudioTrim({
+          filters,
+          inputLabel: "[0:a]",
+          outputLabel: `[a${index}]`,
+          sourceIn: cut.in,
+          sourceOut: cut.out,
+          speed,
+          atempoSuffix,
+          freeze: cut.freeze,
+          id: `v${index}`,
+          normalize: false,
+        });
+      }
       concatInputs.push(`[a${index}]`);
     }
   }
@@ -970,7 +1129,7 @@ export function buildCutCommand({
   }
 
   const scaledLabel = chromaKey || look ? "[scaled]" : "[outv]";
-  filters.push(transformCuts
+  filters.push(perCutFullFrame
     ? `[joinedv]null${scaledLabel}`
     : `[joinedv]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1${scaledLabel}`);
 
@@ -1032,6 +1191,7 @@ export function buildCutCommand({
   } else if (videoLabel !== "[outv]") {
     filters.push(`${videoLabel}null[outv]`);
   }
+  filters.push("[outv]scale=out_range=tv[outv_tv]");
 
   return {
     command: ffmpegCommand,
@@ -1041,6 +1201,11 @@ export function buildCutCommand({
       "error",
       "-nostdin",
       "-y",
+      // docs/contract-2026-08-12-still-image-cut-source-v0.md 裁定2: a still-image source has no
+      // native duration, so `-loop 1` turns it into an unbounded stream that the trim filters
+      // above cut down to each cut's [in, out) range -- same recipe already proven by
+      // source.chroma_key's background image handling a few lines up in this file.
+      ...(isImageLayerSource(sourcePath) ? ["-loop", "1"] : []),
       "-i",
       sourcePath,
       ...(!hasAudio ? ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] : []),
@@ -1048,10 +1213,10 @@ export function buildCutCommand({
       "-filter_complex",
       filters.join(";"),
       "-map",
-      "[outv]",
+      "[outv_tv]",
       "-map",
       "[joineda]",
-      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",
@@ -1079,21 +1244,52 @@ export function buildMultiSourceCutCommand({
   const inputsById = new Map(sourceInputs.map((source, index) => [source.id, { ...source, inputIndex: index }]));
   const filters = [];
   const concatInputs = [];
-  const transformCuts = hasCutVisualTransform(cuts);
+  const transformCuts = hasCutVisualTransform(cuts) || hasCutFraming(cuts);
+  // docs/contract-2026-08-05-fx-v0.md (cuts[].fx). v1's per-cut branch is already always
+  // full-WxH-framed (both the transform and plain branches below produce a complete frame), so
+  // fx only needs one extra hop after whichever branch ran — no change to the branch selection.
+  const fxCuts = hasCutFx(cuts);
+  // docs/contract-2026-07-22-render-basics.md #3 (cuts[].transition_out), extended to the v1
+  // (multi-source) path by task 2026-08-07-v1-transition-out. Same residual decision as
+  // buildCutCommand: only boundaries that explicitly declare transition_out take the xfade path,
+  // so a v1 project with zero transition_out keeps today's exact single
+  // concat=n=${cuts.length} call byte-for-byte (verified in verify-fps-tolerance.test.mjs's
+  // sibling suite v1-transition-out.test.mjs, "no transition_out keeps the exact legacy call").
+  const hasAnyTransition = cuts.slice(0, -1).some((cut) => cut.transition_out);
 
   for (const [index, cut] of cuts.entries()) {
     const source = inputsById.get(cut.src);
     const speed = cutSpeed(cut);
-    const ptsExpr = speed === 1 ? "PTS-STARTPTS" : `(PTS-STARTPTS)/${formatNumber(speed)}`;
+    // Unlike buildCutCommand (which only ever scales/paces once, after concat), v1 always scales
+    // + fps-resamples per cut (sources[] entries can have different native size/rate). That
+    // per-cut fps= filter -- and appendCutVisualTransform's own internal fps= filter, in the
+    // transformCuts branch -- resets whatever timebase an earlier settb=AVTB had set (verified
+    // empirically: baking settb=AVTB into the trim's own postSuffixFilter, ahead of fps=, still
+    // left concat's own output on a different timebase than a sibling xfade input and ffmpeg
+    // refused to join them). So every branch below writes into `preConcatLabel` first, and
+    // settb=AVTB -- when a transition is present -- is applied as one unconditional LAST step
+    // onto `[v${index}]` (the label concat/xfade actually consume), after fx/transform/scale/fps
+    // have all already run.
+    const preRangeLabel = `[vrange${index}]`;
+    const preConcatLabel = hasAnyTransition ? `[vpre${index}]` : `[v${index}]`;
+    const shapedLabel = fxCuts ? `[vshaped1_${index}]` : preRangeLabel;
     if (transformCuts) {
       const trimmedLabel = `[vraw${index}]`;
-      filters.push(
-        `[${source.inputIndex}:v]trim=start=${formatNumber(cut.in)}:end=${formatNumber(cut.out)},setpts=${ptsExpr}${trimmedLabel}`,
-      );
+      appendFreezeAwareVideoTrim({
+        filters,
+        inputLabel: `[${source.inputIndex}:v]`,
+        outputLabel: trimmedLabel,
+        sourceIn: cut.in,
+        sourceOut: cut.out,
+        speed,
+        freeze: cut.freeze,
+        id: `v1_${index}`,
+        fps,
+      });
       appendCutVisualTransform({
         filters,
         inputLabel: trimmedLabel,
-        outputLabel: `[v${index}]`,
+        outputLabel: shapedLabel,
         cut,
         id: `v1_${index}`,
         width,
@@ -1102,9 +1298,35 @@ export function buildMultiSourceCutCommand({
         duration: segmentDuration(cut),
       });
     } else {
-      filters.push(
-        `[${source.inputIndex}:v]trim=start=${formatNumber(cut.in)}:end=${formatNumber(cut.out)},setpts=${ptsExpr},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1[v${index}]`,
-      );
+      appendFreezeAwareVideoTrim({
+        filters,
+        inputLabel: `[${source.inputIndex}:v]`,
+        outputLabel: shapedLabel,
+        sourceIn: cut.in,
+        sourceOut: cut.out,
+        speed,
+        freeze: cut.freeze,
+        id: `v1_${index}`,
+        fps,
+        postSuffixFilter: `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1`,
+      });
+    }
+    if (fxCuts) {
+      appendCutFxChain({
+        filters,
+        inputLabel: shapedLabel,
+        outputLabel: preRangeLabel,
+        fx: cut.fx,
+        id: `v1_${index}`,
+        width,
+        height,
+        fps,
+        duration: segmentDuration(cut),
+      });
+    }
+    filters.push(`${preRangeLabel}scale=out_range=tv${preConcatLabel}`);
+    if (hasAnyTransition) {
+      filters.push(`${preConcatLabel}settb=AVTB[v${index}]`);
     }
     concatInputs.push(`[v${index}]`);
 
@@ -1112,9 +1334,18 @@ export function buildMultiSourceCutCommand({
       const atempoSuffix = buildAtempoChain(speed)
         .map((factor) => `,atempo=${formatNumber(factor)}`)
         .join("");
-      filters.push(
-        `[${source.inputIndex}:a]atrim=start=${formatNumber(cut.in)}:end=${formatNumber(cut.out)},asetpts=PTS-STARTPTS${atempoSuffix},aresample=48000,aformat=channel_layouts=stereo[a${index}]`,
-      );
+      appendFreezeAwareAudioTrim({
+        filters,
+        inputLabel: `[${source.inputIndex}:a]`,
+        outputLabel: `[a${index}]`,
+        sourceIn: cut.in,
+        sourceOut: cut.out,
+        speed,
+        atempoSuffix,
+        freeze: cut.freeze,
+        id: `v1_${index}`,
+        normalize: true,
+      });
     } else {
       filters.push(
         `anullsrc=r=48000:cl=stereo,atrim=duration=${formatNumber(segmentDuration(cut))},asetpts=PTS-STARTPTS[a${index}]`,
@@ -1123,7 +1354,35 @@ export function buildMultiSourceCutCommand({
     concatInputs.push(`[a${index}]`);
   }
 
-  filters.push(`${concatInputs.join("")}concat=n=${cuts.length}:v=1:a=1[joinedv][joineda]`);
+  if (!hasAnyTransition) {
+    filters.push(`${concatInputs.join("")}concat=n=${cuts.length}:v=1:a=1[joinedv][joineda]`);
+  } else {
+    // v1's per-cut audio label always exists (real audio or anullsrc-generated silence above),
+    // unlike buildCutCommand's single hasAudio flag for the whole source -- so this join never
+    // needs buildCutCommand's "no audio at all" fallback branch.
+    const cutOffsets = computeCutTimelineOffsets(cuts);
+    let videoAcc = "[v0]";
+    let audioAcc = "[a0]";
+    for (let index = 1; index < cuts.length; index += 1) {
+      const boundary = cuts[index - 1].transition_out;
+      const isLastBoundary = index === cuts.length - 1;
+      const nextVideoLabel = isLastBoundary ? "[joinedv]" : `[vacc${index}]`;
+      const nextAudioLabel = isLastBoundary ? "[joineda]" : `[aacc${index}]`;
+      if (boundary) {
+        const transitionName = XFADE_TRANSITION_NAMES[boundary.type] ?? "fade";
+        const transitionDuration = boundary.duration;
+        const offset = Math.max(0, cutOffsets[index].start);
+        filters.push(
+          `${videoAcc}[v${index}]xfade=transition=${transitionName}:duration=${formatNumber(transitionDuration)}:offset=${formatNumber(offset)}${nextVideoLabel}`,
+        );
+        filters.push(`${audioAcc}[a${index}]acrossfade=d=${formatNumber(transitionDuration)}${nextAudioLabel}`);
+      } else {
+        filters.push(`${videoAcc}${audioAcc}[v${index}][a${index}]concat=n=2:v=1:a=1${nextVideoLabel}${nextAudioLabel}`);
+      }
+      videoAcc = nextVideoLabel;
+      audioAcc = nextAudioLabel;
+    }
+  }
 
   let videoLabel = "[joinedv]";
   if (look) {
@@ -1141,6 +1400,7 @@ export function buildMultiSourceCutCommand({
   } else {
     filters.push(`${videoLabel}null[outv]`);
   }
+  filters.push("[outv]scale=out_range=tv[outv_tv]");
 
   return {
     command: ffmpegCommand,
@@ -1150,14 +1410,18 @@ export function buildMultiSourceCutCommand({
       "error",
       "-nostdin",
       "-y",
-      ...sourceInputs.flatMap((source) => ["-i", source.path]),
+      // docs/contract-2026-08-12-still-image-cut-source-v0.md 裁定2: same `-loop 1` recipe as
+      // buildCutCommand, applied per-source here since v1 mixes video and still-image sources.
+      ...sourceInputs.flatMap((source) =>
+        isImageLayerSource(source.path) ? ["-loop", "1", "-i", source.path] : ["-i", source.path],
+      ),
       "-filter_complex",
       filters.join(";"),
       "-map",
-      "[outv]",
+      "[outv_tv]",
       "-map",
       "[joineda]",
-      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",
@@ -1189,7 +1453,14 @@ function buildGapAwareCutCommand({
   const runs = computeVideoRuns(segments, duration);
   const filters = [];
   const videoLabels = [];
-  const transformCuts = hasCutVisualTransform(cuts);
+  // freeze is rejected before dispatch (see buildCutCommand) since this path's run-splitting
+  // math does not account for a freeze hold's non-linear output-time-to-source-time mapping;
+  // framing has no such restriction (it is purely spatial, independent of timeline placement).
+  const transformCuts = hasCutVisualTransform(cuts) || hasCutFraming(cuts);
+  // docs/contract-2026-08-05-fx-v0.md (cuts[].fx). Gap ("black filler") runs have no originating
+  // cut to declare fx on, so only "cut" kind runs ever route through appendCutFxChain below.
+  const fxCuts = hasCutFx(cuts);
+  const perCutFullFrame = transformCuts || fxCuts;
   for (const [index, run] of runs.entries()) {
     const label = `[gv${index}]`;
     if (run.kind === "gap") {
@@ -1199,6 +1470,7 @@ function buildGapAwareCutCommand({
     } else {
       const speed = cutSpeed(run.cut);
       const ptsExpr = speed === 1 ? "PTS-STARTPTS" : `(PTS-STARTPTS)/${formatNumber(speed)}`;
+      const shapedLabel = fxCuts ? `[gvshaped${index}]` : label;
       if (transformCuts) {
         const trimmedLabel = `[gvraw${index}]`;
         filters.push(
@@ -1207,7 +1479,7 @@ function buildGapAwareCutCommand({
         appendCutVisualTransform({
           filters,
           inputLabel: trimmedLabel,
-          outputLabel: label,
+          outputLabel: shapedLabel,
           cut: run.cut,
           id: `gap_${index}`,
           width,
@@ -1215,10 +1487,35 @@ function buildGapAwareCutCommand({
           fps,
           duration: run.outEnd - run.outStart,
         });
+      } else if (fxCuts) {
+        // Unlike buildCutCommand's non-transform branch, a gap-aware run's plain trim has no
+        // later post-concat scale/pad to fall back on for non-transform runs mixed with
+        // WxH-sized gap fillers — it must reach WxH itself before the fx chain (which assumes a
+        // WxH frame, e.g. a hypothetical solid-color-source fx) can run.
+        const rawLabel = `[gvraw${index}]`;
+        filters.push(
+          `[0:v]trim=start=${formatNumber(run.srcIn)}:end=${formatNumber(run.srcOut)},setpts=${ptsExpr}${rawLabel}`,
+        );
+        filters.push(
+          `${rawLabel}scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1${shapedLabel}`,
+        );
       } else {
         filters.push(
-          `[0:v]trim=start=${formatNumber(run.srcIn)}:end=${formatNumber(run.srcOut)},setpts=${ptsExpr}${label}`,
+          `[0:v]trim=start=${formatNumber(run.srcIn)}:end=${formatNumber(run.srcOut)},setpts=${ptsExpr}${shapedLabel}`,
         );
+      }
+      if (fxCuts) {
+        appendCutFxChain({
+          filters,
+          inputLabel: shapedLabel,
+          outputLabel: label,
+          fx: run.cut.fx,
+          id: `gap_${index}`,
+          width,
+          height,
+          fps,
+          duration: run.outEnd - run.outStart,
+        });
       }
     }
     videoLabels.push(label);
@@ -1251,7 +1548,7 @@ function buildGapAwareCutCommand({
   }
 
   const scaledLabel = chromaKey || look ? "[scaled]" : "[outv]";
-  filters.push(transformCuts
+  filters.push(perCutFullFrame
     ? `[joinedv]null${scaledLabel}`
     : `[joinedv]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1${scaledLabel}`);
 
@@ -1313,6 +1610,7 @@ function buildGapAwareCutCommand({
   } else if (videoLabel !== "[outv]") {
     filters.push(`${videoLabel}null[outv]`);
   }
+  filters.push("[outv]scale=out_range=tv[outv_tv]");
 
   return {
     command: ffmpegCommand,
@@ -1322,6 +1620,9 @@ function buildGapAwareCutCommand({
       "error",
       "-nostdin",
       "-y",
+      // docs/contract-2026-08-12-still-image-cut-source-v0.md 裁定2: same `-loop 1` recipe as
+      // buildCutCommand's non-gap-aware path above.
+      ...(isImageLayerSource(sourcePath) ? ["-loop", "1"] : []),
       "-i",
       sourcePath,
       ...(!hasAudio ? ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] : []),
@@ -1329,10 +1630,10 @@ function buildGapAwareCutCommand({
       "-filter_complex",
       filters.join(";"),
       "-map",
-      "[outv]",
+      "[outv_tv]",
       "-map",
       "[joineda]",
-      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high"]),
+      ...(videoEncodeArgs ?? ["-c:v", "libx264", "-profile:v", "high", "-color_range", "tv"]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",
@@ -1347,24 +1648,35 @@ function buildGapAwareCutCommand({
 
 export function predictedDuration(cuts, sourceDuration, version = 0) {
   if (version === 1) {
-    return cuts.reduce((sum, cut) => sum + segmentDuration(cut), 0);
+    // task 2026-08-07-v1-transition-out: v1 never takes the gap-aware path (the version check
+    // above runs before needsGapAwareCutTimeline is ever consulted), so it always uses this same
+    // sequential-with-overlap math as v0's own non-gap-aware branch below -- now that
+    // buildMultiSourceCutCommand actually renders the xfade overlap instead of silently ignoring
+    // transition_out, predicted_duration_seconds must account for it too or verify.duration /
+    // verify.frame-count / verify.fps would all expect a timeline 1x transition_out.duration too
+    // long for the real (now correctly shortened) output.
+    return sequentialDurationWithTransitionOverlap(cuts);
   }
   if (Array.isArray(cuts) && cuts.length > 0 && needsGapAwareCutTimeline(cuts)) {
     const segments = resolveCutSegments(cuts);
     return Math.max(0, ...segments.map((segment) => segment.end));
   }
   if (Array.isArray(cuts) && cuts.length > 0) {
-    const segmentsTotal = cuts.reduce((sum, cut) => sum + segmentDuration(cut), 0);
-    // A transition_out overlaps its own segment's end with the next segment's start, shortening
-    // the combined timeline by the overlap (xfade/acrossfade's own duration math — see
-    // buildCutCommand). The last cut's transition_out (if any) has no following segment to
-    // blend into, so it never actually renders and must not be subtracted here.
-    const transitionOverlap = cuts
-      .slice(0, -1)
-      .reduce((sum, cut) => sum + (isPositiveNumber(cut.transition_out?.duration) ? cut.transition_out.duration : 0), 0);
-    return segmentsTotal - transitionOverlap;
+    return sequentialDurationWithTransitionOverlap(cuts);
   }
   return sourceDuration;
+}
+
+function sequentialDurationWithTransitionOverlap(cuts) {
+  const segmentsTotal = cuts.reduce((sum, cut) => sum + segmentDuration(cut), 0);
+  // A transition_out overlaps its own segment's end with the next segment's start, shortening
+  // the combined timeline by the overlap (xfade/acrossfade's own duration math — see
+  // buildCutCommand / buildMultiSourceCutCommand). The last cut's transition_out (if any) has no
+  // following segment to blend into, so it never actually renders and must not be subtracted here.
+  const transitionOverlap = cuts
+    .slice(0, -1)
+    .reduce((sum, cut) => sum + (isPositiveNumber(cut.transition_out?.duration) ? cut.transition_out.duration : 0), 0);
+  return segmentsTotal - transitionOverlap;
 }
 
 function isPositiveNumber(value) {

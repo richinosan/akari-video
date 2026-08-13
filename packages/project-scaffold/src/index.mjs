@@ -71,13 +71,16 @@ const FALLBACK_SKILLS_GUIDANCE = [
 
 // 進め方フォームの保存先（packages/schemas/intake.schema.json v0 準拠）。
 // 新規プロジェクトは常に status: draft・空 tasks で始まり、フォームまたは対話で確定する。
+// title は人間向け表示名（task 2026-08-09-project-display-title）。フォルダ名とは独立で、
+// 企画が固まった時点でエージェントが書く器として null で始める。
 const FALLBACK_INTAKE = {
     version: 1,
     tasks: [],
     target: { duration_s: null, keep_length: false, taste: null },
     autonomy: 'checkpoint',
     status: 'draft',
-    submitted_at: null
+    submitted_at: null,
+    title: null
 };
 
 const FALLBACK_WORKFLOW = {
@@ -182,6 +185,7 @@ export async function writeFallbackTemplate(destinationDir) {
         }, null, 2) + '\n',
         '.akari/workflow.json': JSON.stringify(FALLBACK_WORKFLOW, null, 2) + '\n',
         '.akari/intake.json': JSON.stringify(FALLBACK_INTAKE, null, 2) + '\n',
+        'edit.json': '{}\n',
         'assets/.gitkeep': '',
         'planning/.gitkeep': '',
         'exports/.gitkeep': '',
@@ -266,6 +270,12 @@ async function copySkillsTree(source, destination) {
     await fs.mkdir(destination, { recursive: true });
     for (const entry of await fs.readdir(source, { withFileTypes: true })) {
         if (entry.name === '.gitkeep' || entry.name === '.DS_Store') {
+            continue;
+        }
+        // dev-fixtures/ はスキル開発用のサンプル素材（例: skills/address-review/dev-fixtures/
+        // 配下の edit.json）で、プロジェクトへ持ち込むとシェルの edit.json 探索が誤って拾う
+        // （F10）。プロジェクトの .claude/skills/ には不要なため元栓として除外する。
+        if (entry.isDirectory() && entry.name === 'dev-fixtures') {
             continue;
         }
         const from = path.join(source, entry.name);
@@ -412,6 +422,15 @@ export async function commitInitialProject(destinationDir, message = 'プロジ�
     return { committed: true };
 }
 
+function firstErrorLine(error) {
+    const detail = error && typeof error === 'object' && typeof error.stderr === 'string'
+        ? error.stderr
+        : error instanceof Error
+            ? error.message
+            : String(error);
+    return detail.split(/\r?\n/, 1)[0].trim() || '不明なエラー';
+}
+
 function escapeHtml(value) {
     return String(value)
         .replaceAll('&', '&amp;')
@@ -502,8 +521,14 @@ export async function createProject(destinationDir, templateDir, options = {}) {
     let action;
     let reason;
     if (boundary.eligibility === 'none') {
-        action = 'initialized-and-committed';
-        reason = 'git 初期化して単一コミットを作成';
+        try {
+            await commitInitialProject(destination);
+            action = 'initialized-and-committed';
+            reason = 'git 初期化して単一コミットを作成';
+        } catch (error) {
+            action = 'skipped';
+            reason = `git が利用できないためスキップ — 後からプロジェクトを開くと自動で git 化されます（${firstErrorLine(error)}）`;
+        }
     } else if (boundary.eligibility === 'own-root') {
         action = 'skipped';
         reason = 'このフォルダは既に git リポジトリのため git init を skip';
@@ -530,10 +555,6 @@ export async function createProject(destinationDir, templateDir, options = {}) {
 
     await fs.mkdir(path.dirname(reportPath), { recursive: true });
     await fs.writeFile(reportPath, renderReportHtml(report), 'utf8');
-
-    if (boundary.eligibility === 'none') {
-        await commitInitialProject(destination);
-    }
 
     return report;
 }

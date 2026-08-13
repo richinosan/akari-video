@@ -24,6 +24,7 @@ import {
 import {
   buildCutMap,
   buildTimelineTrace,
+  buildUiTrace,
   parseEventsJsonl,
 } from "./core/time-mapping.mjs";
 import { transcribeAudio } from "./core/transcription.mjs";
@@ -166,6 +167,31 @@ function validateTranscript(value) {
 }
 
 function validStroke(stroke) {
+  if (stroke?.tool === "rect") {
+    const box = stroke.box;
+    return stroke
+      && /^st-\d{4,}$/.test(stroke.id)
+      && stroke.space === "content-rect"
+      && Number.isFinite(stroke.recTStart)
+      && stroke.recTStart >= 0
+      && Number.isFinite(stroke.recTEnd)
+      && stroke.recTEnd >= stroke.recTStart
+      && Number.isFinite(stroke.frame?.timelineT)
+      && Number.isFinite(stroke.frame?.sourceT)
+      && (
+        stroke.frame?.cutIndex === null
+        || (Number.isInteger(stroke.frame?.cutIndex) && stroke.frame.cutIndex >= 0)
+      )
+      && Array.isArray(box)
+      && box.length === 4
+      && box.every((value) => Number.isFinite(value))
+      && box[0] >= 0
+      && box[1] >= 0
+      && box[2] > 0
+      && box[3] > 0
+      && box[0] + box[2] <= 1
+      && box[1] + box[3] <= 1;
+  }
   return stroke
     && /^st-\d{4,}$/.test(stroke.id)
     && stroke.tool === "pen"
@@ -405,6 +431,8 @@ async function compileSession({ sessionId, sessionDirectory, options, repoRoot }
     const parsedStrokes = await loadStrokes(sessionDirectory);
     const trace = buildTimelineTrace(parsedEvents.events);
     const cutMap = buildCutMap(snapshot);
+    const uiTrace = buildUiTrace(parsedEvents.events);
+    const overlays = Array.isArray(snapshot.overlays) ? snapshot.overlays : [];
     const transcriptPath = path.join(sessionDirectory, "transcript.json");
     const { transcript, warnings: transcriptWarnings } = await loadOrCreateTranscript({
       transcriptPath,
@@ -441,12 +469,20 @@ async function compileSession({ sessionId, sessionDirectory, options, repoRoot }
         }
       }
     } else {
-      proposals = buildProposals({ utterances, trace, cutMap, strokes: parsedStrokes.strokes });
+      proposals = buildProposals({
+        utterances,
+        trace,
+        cutMap,
+        strokes: parsedStrokes.strokes,
+        uiClicks: uiTrace.clicks,
+        overlays,
+      });
     }
 
     const warnings = [
       ...parsedEvents.warnings,
       ...parsedStrokes.warnings,
+      ...uiTrace.warnings,
       ...transcriptWarnings,
     ];
     const unavailableReasons = Array.isArray(transcript.unavailableReasons)

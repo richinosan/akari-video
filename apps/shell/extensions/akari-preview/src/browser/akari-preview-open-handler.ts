@@ -27,18 +27,48 @@ import {
     resolveTimedScheduleWindow
 } from '../common/audio-schedule';
 import { classifyEditAssetPath, uncToFileUriString, windowsDriveToFileUriString } from '../common/edit-asset-path';
+import {
+    CAPTION_FONT_FAMILY,
+    CAPTION_FONT_LOAD_DESCRIPTOR,
+    captionFontFaceCss,
+    RESOLVED_CAPTION_STYLE_VARIABLE_NAMES,
+    RESOLVED_SINGLE_LINE_CAPTION_CSS,
+    RESOLVED_SINGLE_LINE_FRAGMENT_CLOSE,
+    RESOLVED_SINGLE_LINE_FRAGMENT_MIDDLE,
+    RESOLVED_SINGLE_LINE_FRAGMENT_OPEN
+} from '../common/caption-visual-contract';
+import { CutFraming, computeCutFramingVisual } from '../common/cut-framing-visual';
+import { CutFreeze, checkCutFreezeCrossing } from '../common/cut-freeze-visual';
+import { LayerPerspective, computeLayerPerspectiveVisual } from '../common/layer-perspective-visual';
+import { cropAnchorCorrectedTransform } from '../common/layer-crop-anchor';
+import { computeLayerKeyframesVisual } from '../common/layer-keyframes-visual';
+import {
+    buildCutSummaryFields,
+    buildLayerSummaryBase,
+    LayerCropSummary,
+    LayerPerspectiveSummary
+} from '../common/edit-summary-fields';
 import { PEN_TUNING } from '../common/pen-canvas-visuals';
 import { fitPreviewCompositeRect } from '../common/preview-composite-layout';
+import { createRafThrottle } from '../common/raf-throttle';
+import { normalizeRectFromPoints } from '../common/rect-tool-visual';
+import { editReferencesRawMedia } from '../common/related-edit-source';
 import { resolveAnnotationStrokeCompositionSeconds } from '../common/review-stroke-seek';
-import { locatePreviewCaptions, parsePreviewCaptions, PreviewCaption } from './akari-preview-captions';
+import {
+    resolveReviewPreviewEditUri,
+    transitionRawPreviewFocus
+} from '../common/review-preview-state';
+import { ReviewToolMode } from '../common/review-tool-mode';
+import { locatePreviewCaptions, parsePreviewCaptions, parseResolvedPreviewCaptions, PreviewCaption } from './akari-preview-captions';
 import {
     ReviewSessionRecorder,
     ReviewSessionUiState,
     ReviewTransportChange,
     ReviewTransportSnapshot
 } from './review-session-recorder';
+import { ReviewSessionRecordingIndicator } from './review-session-recording-indicator';
 
-interface OverlayTransform {
+export interface OverlayTransform {
     x?: number;
     y?: number;
     scale?: number;
@@ -61,15 +91,36 @@ interface EditSummaryLayer {
     duration: number;
     kind: 'baked' | 'video';
     src?: string;
+    /** task 2026-08-10-image-layer-parity 司令塔裁定1: layers[].src の拡張子だけで判定する
+     * 静止画フラグ（schema の kind は 'video' のまま不変）。webview 側はこれで <video>/<img> の
+     * どちらを生成するか決める。'baked' は常に false（後述 isImageLayerSrc の呼び出し側コメント参照）。 */
+    isImage: boolean;
     transform: OverlayTransform;
     opacity: number;
     blend: string;
     chromaKey: boolean;
     proxyMissing: boolean;
     track: number;
+    /** edit.schema.json #/$defs/layerCrop（0..1 正規化・ソースフレーム相対・静的）。
+     * common/edit-summary-fields.ts の normalizeLayerCropForSummary が担う。 */
+    crop?: LayerCropSummary;
+    /** edit.schema.json #/$defs/layerPerspective（corner-pin パース変形・v0 静的）。
+     * common/edit-summary-fields.ts の normalizeLayerPerspectiveForSummary が担う。 */
+    perspective?: LayerPerspectiveSummary;
 }
 
+// task 2026-08-10-image-layer-parity 司令塔裁定1: layers[].src の拡張子だけで静止画判定する
+// （schema の kind は 'video' のまま不変）。render-cut 側の同じ判定
+// （packages/render-cut/src/layers.mjs の isImageLayerSource）と対象拡張子集合を完全に揃える。
+// 独立した関数として export しているのは webview 生成 HTML の外（この TS モジュール自身）から
+// node --test で直接叩けるようにするため（test/image-layer-source.test.mjs）。
+const IMAGE_LAYER_SRC_PATTERN = /\.(png|jpe?g|webp|bmp|gif)$/i;
+export const isImageLayerSrc = (src: string | undefined): boolean =>
+    typeof src === 'string' && IMAGE_LAYER_SRC_PATTERN.test(src);
+
 interface EditSummaryCut {
+    /** 参照するソース id（v1 cuts[].src。v0 は既定 id）。webview はこれで <video> を切り替える */
+    src: string;
     in: number;
     out: number;
     transform?: OverlayTransform;
@@ -81,6 +132,13 @@ interface EditSummaryCut {
     };
     at?: number;
     track: number;
+    /** contract-2026-07-22-render-basics.md #6 (静的クロップ / ズームキーフレーム）。
+     * 深いバリデーションは common/cut-framing-visual.ts の computeCutFramingVisual が担う
+     * ため、ここでは「非配列オブジェクト」であることだけ確認して素通しする。 */
+    framing?: CutFraming;
+    /** contract-2026-07-22-render-basics.md #7（フリーズ）。同上、深いバリデーションは
+     * common/cut-freeze-visual.ts の checkCutFreezeCrossing 側。 */
+    freeze?: CutFreeze;
 }
 
 interface EditSummaryAudioSource {
@@ -156,6 +214,8 @@ interface PreviewModel {
     editUri?: URI;
     relatedEditUri?: URI;
     sourceUri?: URI;
+    /** ソース id → 実体 URI（v0 は既定 id ひとつ・v1 は sources[] 全件） */
+    sourcesById?: Map<string, { uri: URI; proxyUri?: URI }>;
     // Explicit edit.json source.proxy (v0/v1 schema field), read-only, highest priority over the
     // HEVC-triggered proxy resolved in refreshPreview(). Only set when the file actually exists.
     sourceProxyUri?: URI;
@@ -164,6 +224,12 @@ interface PreviewModel {
     assetStreamIds: string[];
     captionsUri?: URI;
     captions: PreviewCaption[];
+    /**
+     * まだソースが 1 つも宣言されていない edit.json（新規プロジェクト直後）。
+     * `sourceUri` が無いのは「壊れている」からではなく「これから素材を入れる」からなので、
+     * エラーではなく空の状態として案内する（refreshPreview 側で分岐）。
+     */
+    emptyProject?: boolean;
     emphasisWords?: EditSummaryEmphasisWord[];
     session?: {
         muted: boolean;
@@ -183,17 +249,36 @@ interface OverlayWriteRequest {
     patch: {
         vars?: Record<string, unknown>;
         transform?: OverlayTransform;
+        // 断片テキスト編集（contenteditable）の書き戻し。overlays[].html は契約上ファイル参照
+        // なので、この値は edit.json ではなく参照先の断片ファイルへ書く
+        html?: string;
     };
 }
 
+// ㉔ layers[].crop（0..1 正規化・ソースフレーム相対・静的。#/$defs/layerCrop）。
+interface LayerCropPatch {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+}
+
+// ㉖ layers[].perspective（corner-pin パース変形。v0 静的。#/$defs/layerPerspective）。
+interface LayerPerspectivePatch {
+    corners: [number, number][];
+}
+
 // CF-write: overlayWrite と同型の layers[] 版。追加/削除は CF-dnd（別レーン）の範囲のため対象外、
-// transform 変更のみ扱う（t/duration 変更は既存の timeline moveLayer 経路で既に書き戻る）。
+// transform/crop/perspective 変更のみ扱う（t/duration 変更は既存の timeline moveLayer 経路で
+// 既に書き戻る）。perspective: null は「解除」（layer.perspective を削除）を表す。
 interface LayerWriteRequest {
     type: 'akari-preview-layer-write';
     requestId: string;
     layerId: string;
     patch: {
         transform?: OverlayTransform;
+        crop?: LayerCropPatch;
+        perspective?: LayerPerspectivePatch | null;
     };
 }
 
@@ -240,6 +325,14 @@ interface WaveformFetchRequest {
     requestId: string;
 }
 
+// task/2026-08-09-drop-hevc-proxy: <video> の error イベントが MEDIA_ERR_DECODE(3) /
+// MEDIA_ERR_SRC_NOT_SUPPORTED(4) のときだけ webview から届く（実際に再生できなかった、の一報）。
+interface HevcFallbackRequest {
+    type: 'akari-preview-hevc-fallback-request';
+    requestId: string;
+    errorCode: number;
+}
+
 interface OpenOutputRequest {
     type: 'akari-preview-open-output-request';
 }
@@ -252,6 +345,23 @@ interface PreviewReviewStrokeStartRequest {
 interface PreviewReviewStrokeEndRequest {
     type: 'akari-preview-review-stroke-end';
     points: Array<[number, number]>;
+}
+
+// task.md 指示4/6 (M2): rect ツールの開始/終了 (pen の start/end request と対をなす) と、
+// pen-toggle からの mode 切替 request (右パネルのボタン/ショートカットと同じ setToolMode 経路)。
+interface PreviewReviewRectStartRequest {
+    type: 'akari-preview-review-rect-start';
+    frame: ReviewStrokeFrame;
+}
+
+interface PreviewReviewRectEndRequest {
+    type: 'akari-preview-review-rect-end';
+    box: [number, number, number, number];
+}
+
+interface PreviewReviewToolModeRequest {
+    type: 'akari-preview-review-tool-mode-request';
+    mode: ReviewToolMode;
 }
 
 interface ReviewAnnotationStrokeRequest {
@@ -275,6 +385,8 @@ interface PreviewWidgetMarker extends WebviewWidget {
     akariPreviewTrackedResources?: Set<string>;
     akariPreviewTrackedSuffixes?: Set<string>;
     akariPreviewStreamId?: string;
+    /** v1 マルチソースで代表ソース以外に開いた動画ストリーム id（代表は akariPreviewStreamId） */
+    akariPreviewExtraStreamIds?: string[];
     akariPreviewAssetStreamIds?: string[];
     akariPreviewSeekable?: boolean;
     akariPreviewMuted?: boolean;
@@ -284,6 +396,9 @@ interface PreviewWidgetMarker extends WebviewWidget {
     akariPreviewMutedTracksByScope?: { cuts?: number[]; audio?: number[]; layers?: number[] };
     akariPreviewAllTracksMutedScopes?: string[];
     akariPreviewAllTracksHiddenScopes?: string[];
+    /** forwardPlaybackTick が常時更新する直近再生位置。HEVC フォールバックのリロード時の
+     *  再生位置復元に使う（raw kind は reviewTransportByEdit に乗らないため別経路が要る）。 */
+    akariPreviewLastKnownTime?: number;
 }
 
 // akari-transcript の AKARI_TRANSCRIPT_SEEK_REQUESTED.id（akari-transcript-commands.ts）とミラー。
@@ -291,6 +406,9 @@ interface PreviewWidgetMarker extends WebviewWidget {
 const TRANSCRIPT_SEEK_COMMAND_ID = 'akari.transcript.seekRequested';
 // akari-annotations 側の PREVIEW_PLAYBACK_TICK_EVENT とミラー。
 const PREVIEW_PLAYBACK_TICK_EVENT = 'akari.preview.playbackTick';
+// raw preview は editUri を持たないため、注釈パネルへ「現在フォーカス中の素材 URI + source 秒」を
+// outer window の専用イベントで渡す。録音セッションの transport には合流させない。
+const RAW_PREVIEW_ANNOTATION_STATE_EVENT = 'akari.preview.rawAnnotationState';
 const TIMELINE_OVERLAY_SELECTED_EVENT = 'akari.timeline.overlaySelected';
 // CF-select: overlay 選択同期チャンネルの layers 版（akari-annotations 側と文字列のみミラー）。
 const TIMELINE_LAYER_SELECTED_EVENT = 'akari.timeline.layerSelected';
@@ -327,6 +445,11 @@ const REVIEW_SESSION_STOP_EVENT = 'akari.review.session.stop';
 const REVIEW_SESSION_REFRESH_EVENT = 'akari.review.session.refresh';
 const REVIEW_SESSION_OPEN_FOLDER_EVENT = 'akari.review.session.openFolder';
 const REVIEW_SESSION_STATE_EVENT = 'akari.review.session.state';
+// M2 (task.md): 右パネルの選択/ペン/四角ボタンからの mode request。akari-annotations 側と
+// 文字列だけミラーする（既存 5 定数と同じ配線パターン）。
+const REVIEW_TOOL_MODE_SET_EVENT = 'akari.review.toolMode.set';
+// M3 (task.md 指示2): 注釈パネルの「選択を解除」導線からの request。同じミラー配線パターン。
+const REVIEW_UI_SELECTION_CLEAR_EVENT = 'akari.review.uiSelection.clear';
 
 // akari-annotations の ATTACH_AKARI_ANNOTATIONS_PASSIVE.id（akari-annotations-commands.ts）とミラー。
 // cross-package import を避けるため文字列 ID のみで CommandRegistry.executeCommand に渡す。
@@ -337,6 +460,11 @@ const ATTACH_TIMELINE_PASSIVE_COMMAND_ID = 'akari.annotations.attachPassive';
 const ENSURE_PREVIEW_VISIBLE_COMMAND: Command = { id: 'akari.preview.ensureVisible' };
 const SEEK_OUTPUT_PREVIEW_COMMAND: Command = { id: 'akari.preview.seekOutput' };
 const TOGGLE_OUTPUT_PREVIEW_PLAYBACK_COMMAND: Command = { id: 'akari.preview.togglePlayback' };
+// task/2026-08-09-drop-hevc-proxy: withOpenTimeout はモデル読み込み・createVideoStream・
+// setHTML だけを包む（webview 自体の起動・レンダリングは待たない — setHTML が返れば operation は
+// 完了扱い）。resolveStreamVideoUri がもう resolveHevcProxy を呼ばなくなった今、この区間に
+// メディアのデコードや変換は一切含まれない。実際の変換（handleHevcFallbackRequest 経由）は
+// widget が開いた後、webview からの再生失敗通知に応じて別経路で走るため、この定数の対象外。
 const PREVIEW_OPEN_TIMEOUT_MS = 10_000;
 const PREVIEW_OPEN_ATTEMPTS = 2;
 const PREVIEW_OPEN_ERROR_MESSAGE = '動画プレビューを開けませんでした。しばらく待ってから、もう一度お試しください。';
@@ -394,6 +522,12 @@ interface ReviewSessionControlRequest {
     editUri?: string;
 }
 
+// task.md 指示2/6: 右パネルのツールボタン列/ショートカットからの mode 切替 request
+// （REVIEW_TOOL_MODE_SET_EVENT。akari-review-panel-widget.ts 側と文字列だけミラー）。
+interface ReviewToolModeSetRequest extends ReviewSessionControlRequest {
+    mode?: ReviewToolMode;
+}
+
 interface PreviewSessionSettings {
     muted: boolean;
     captionsVisible: boolean;
@@ -419,7 +553,12 @@ const EMPTY_SUMMARY: EditSummary = {
     cuts: [],
     indicators: []
 };
-const SKIPPED_DIRECTORIES = new Set(['.git', '.akari', 'node_modules']);
+// v0（単一 source）を v1 と同じ「id → ソース」表で扱うための既定 id。
+// cuts[].src を持たない v0 のカットは全てこの id を指す。
+const DEFAULT_SOURCE_ID = '__default__';
+// ドットディレクトリ（.git/.akari/.claude 等）と node_modules は名前探索の対象外。
+// スキル同梱の開発用フィクスチャ（.claude/skills/**/dev-fixtures/）を拾わないための除外。
+const isSkippedSearchDirectory = (name: string): boolean => name.startsWith('.') || name === 'node_modules';
 const PLAYABLE_VIDEO_MIME_TYPES = new Map<string, string>([
     ['.mp4', 'video/mp4'],
     ['.mov', 'video/mp4'],
@@ -433,6 +572,10 @@ const CLAIMED_VIDEO_EXTENSIONS = new Set([
 ]);
 const UNSUPPORTED_FORMAT_MESSAGE = 'この形式はアプリ内プレビューに未対応です。書き出し後の MP4 をプレビューできます。';
 const OUTSIDE_WORKSPACE_MESSAGE = 'ワークスペース外の動画はプレビューできません。';
+// 新規プロジェクトの edit.json は素材が入る前は空（`{}`）。project-scaffold が作成時点で
+// 置くようになった（2026-08-08）ため、素材を入れる前に「編集データ」を開くのが通常の順序に
+// なった。ソース未宣言は不正ではないので、エラーではなくこの案内を出す。
+const EMPTY_PROJECT_MESSAGE = 'まだ動画が入っていません。左の「素材」に動画をドラッグして取り込むと、ここで仕上がりを確認できます。';
 const THREE_SCENE_KEYS = new Set([
     'model',
     'camera',
@@ -466,13 +609,23 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     protected readonly previewSessionSettings = new Map<string, PreviewSessionSettings>();
     protected readonly pendingOutputInitialSeek = new Map<string, number>();
     protected readonly reviewTransportByEdit = new Map<string, ReviewTransportSnapshot>();
+    // task/2026-08-09-drop-hevc-proxy: 実際に再生失敗した動画（videoUri.toString() をキー）だけを
+    // 憶えておくフォールバック台帳。既定経路（resolveStreamVideoUri）はここに載っている場合だけ
+    // プロキシを使う。新規生成のトリガーは handleHevcFallbackRequest のみ（このプロセスの生存中は
+    // 一度成功/失敗した判定を使い回す — アプリ再起動でクリアされる程度の弱いキャッシュで十分）。
+    protected readonly hevcFallbackProxyUris = new Map<string, string>();
+    protected readonly hevcFallbackAttempted = new Set<string>();
     protected overlayWriteTail = Promise.resolve();
     protected layerWriteTail = Promise.resolve();
     protected cutWriteTail = Promise.resolve();
     protected captionWriteTail = Promise.resolve();
     protected readonly lifecycleDisposables = new DisposableCollection();
     protected reviewSessionRecorder: ReviewSessionRecorder | undefined;
+    protected reviewSessionRecordingIndicator: ReviewSessionRecordingIndicator | undefined;
+    protected readonly reviewSessionStateByEdit = new Map<string, ReviewSessionUiState>();
     protected retryWidgetSequence = 0;
+    protected activeRawPreviewWidget: PreviewWidgetMarker | undefined;
+    protected rawPreviewActivation = 0;
 
     @inject(WidgetManager)
     protected readonly widgetManager: WidgetManager;
@@ -499,6 +652,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     protected readonly openerService: OpenerService;
 
     onStart(): void {
+        this.reviewSessionRecordingIndicator = new ReviewSessionRecordingIndicator();
         this.reviewSessionRecorder = new ReviewSessionRecorder(
             this.previewService,
             state => this.forwardReviewSessionState(state)
@@ -522,6 +676,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 });
             }
         });
+        // 右の注釈パネルへ入力フォーカスを移しても main area の対象タブは変わらない。
+        // activeWidget ではなく current main widget を見ることで、入力中も raw 素材文脈を維持する。
+        this.lifecycleDisposables.push(this.shell.onDidChangeCurrentWidget(() => {
+            this.syncRawPreviewAnnotationContext();
+            this.syncReviewSessionStateForCurrentPreview();
+        }));
         this.registerSeekHandler();
         this.registerEnsureVisibleCommand();
         this.registerOutputSeekCommand();
@@ -869,6 +1029,8 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         this.lifecycleDisposables.dispose();
         void this.reviewSessionRecorder?.dispose();
         this.reviewSessionRecorder = undefined;
+        this.reviewSessionRecordingIndicator?.dispose();
+        this.reviewSessionRecordingIndicator = undefined;
     }
 
     protected registerReviewSessionEvents(): void {
@@ -913,6 +1075,22 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             if (detail) {
                 void this.showReviewAnnotationStrokes(detail);
             }
+        });
+        register(REVIEW_TOOL_MODE_SET_EVENT, event => {
+            const detail = (event as CustomEvent<ReviewToolModeSetRequest>).detail;
+            const editUri = detail?.editUri ? this.normalizeReviewEditUri(detail.editUri) : undefined;
+            if (!editUri || !detail?.mode || !this.reviewSessionRecorder) {
+                return;
+            }
+            this.reviewSessionRecorder.setToolMode(editUri, detail.mode);
+        });
+        register(REVIEW_UI_SELECTION_CLEAR_EVENT, event => {
+            const detail = (event as CustomEvent<ReviewSessionControlRequest>).detail;
+            const editUri = detail?.editUri ? this.normalizeReviewEditUri(detail.editUri) : undefined;
+            if (!editUri || !this.reviewSessionRecorder) {
+                return;
+            }
+            this.reviewSessionRecorder.clearUiSelection(editUri);
         });
     }
 
@@ -993,14 +1171,50 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     }
 
     protected forwardReviewSessionState(state: ReviewSessionUiState): void {
+        this.reviewSessionRecordingIndicator?.setActive(state.active);
         window.dispatchEvent(new CustomEvent(REVIEW_SESSION_STATE_EVENT, { detail: state }));
         const editUri = this.normalizeReviewEditUri(state.editUri);
-        const widget = editUri ? this.openOutputPreviews.get(editUri) : undefined;
-        if (widget?.isAttached) {
-            widget.sendMessage({
-                type: 'akari-preview-set-review-recording',
-                active: state.active
-            });
+        if (!editUri) {
+            return;
+        }
+        this.reviewSessionStateByEdit.set(editUri, state);
+        for (const widget of [...this.openOutputPreviews.values(), ...this.openPreviews.values()]) {
+            this.applyReviewSessionStateToPreview(widget, state);
+        }
+    }
+
+    protected reviewEditUriForPreview(widget: PreviewWidgetMarker): string | undefined {
+        return resolveReviewPreviewEditUri({
+            editUri: widget.akariPreviewEditUri?.normalizePath().toString(),
+            relatedEditUri: widget.akariPreviewRelatedEditUri?.normalizePath().toString()
+        });
+    }
+
+    protected applyReviewSessionStateToPreview(
+        widget: PreviewWidgetMarker,
+        state: ReviewSessionUiState
+    ): void {
+        const previewEditUri = this.reviewEditUriForPreview(widget);
+        const stateEditUri = this.normalizeReviewEditUri(state.editUri);
+        if (!widget.isAttached || !previewEditUri || previewEditUri !== stateEditUri) {
+            return;
+        }
+        widget.sendMessage({
+            type: 'akari-preview-set-review-recording',
+            active: state.active,
+            mode: state.toolMode
+        });
+    }
+
+    protected syncReviewSessionStateForCurrentPreview(): void {
+        const widget = this.shell.getCurrentWidget('main') as PreviewWidgetMarker | undefined;
+        if (!widget || ![...this.openOutputPreviews.values(), ...this.openPreviews.values()].includes(widget)) {
+            return;
+        }
+        const editUri = this.reviewEditUriForPreview(widget);
+        const state = editUri ? this.reviewSessionStateByEdit.get(editUri) : undefined;
+        if (state) {
+            this.applyReviewSessionStateToPreview(widget, state);
         }
     }
 
@@ -1261,7 +1475,14 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
 
     protected reportOpenFailure(uri: URI, error: unknown): void {
         console.error('[akari-preview] failed to open preview', uri.toString(), error);
-        void this.messages.error(`${uri.path.base}: ${PREVIEW_OPEN_ERROR_MESSAGE}`);
+        // データ起因（TypeError = edit.json の検証エラー等）は「しばらく待て」では直らないので、
+        // 実因メッセージをそのまま出す。原因不明のときだけ従来の汎用文言に落とす。
+        const reason = error instanceof Error && error.message ? error.message : undefined;
+        void this.messages.error(
+            reason
+                ? `${uri.path.base}: 動画プレビューを開けませんでした — ${reason}`
+                : `${uri.path.base}: ${PREVIEW_OPEN_ERROR_MESSAGE}`
+        );
     }
 
     protected async configurePreview(
@@ -1335,6 +1556,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             if (this.isWaveformFetchRequest(message)) {
                 void this.handleWaveformFetch(widget, message);
             }
+            if (this.isHevcFallbackRequest(message)) {
+                void this.handleHevcFallbackRequest(widget, identityUri, kind, message);
+            }
             if (this.isOpenOutputRequest(message)) {
                 void this.handleOpenOutputRequest(widget);
             }
@@ -1370,6 +1594,15 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             }
             if (this.isReviewStrokeEndRequest(message)) {
                 this.forwardReviewStrokeEnd(widget, message);
+            }
+            if (this.isReviewRectStartRequest(message)) {
+                this.forwardReviewRectStart(widget, message);
+            }
+            if (this.isReviewRectEndRequest(message)) {
+                this.forwardReviewRectEnd(widget, message);
+            }
+            if (this.isReviewToolModeRequest(message)) {
+                this.forwardReviewToolModeRequest(widget, message);
             }
         }));
         const handleFilesChanged = (event: FileChangesEvent): void => {
@@ -1427,6 +1660,11 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             }
             void this.disposePreviewStreams(widget);
         });
+        const reviewEditUri = this.reviewEditUriForPreview(widget);
+        const reviewState = reviewEditUri ? this.reviewSessionStateByEdit.get(reviewEditUri) : undefined;
+        if (reviewState) {
+            this.applyReviewSessionStateToPreview(widget, reviewState);
+        }
     }
 
     protected isPlaybackTickRequest(message: any): message is PreviewPlaybackTickRequest {
@@ -1437,8 +1675,14 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     }
 
     protected forwardPlaybackTick(widget: PreviewWidgetMarker, message: PreviewPlaybackTickRequest): void {
+        // editUri の有無に関わらず常時更新（HEVC フォールバックの再生位置復元用 — raw kind は
+        // 下の reviewTransportByEdit に乗らないため、これが唯一の position 保持経路になる）。
+        widget.akariPreviewLastKnownTime = message.time;
         const editUri = widget.akariPreviewEditUri;
         if (!editUri) {
+            if (this.activeRawPreviewWidget === widget) {
+                this.forwardRawPreviewAnnotationState(widget, 'playback');
+            }
             return;
         }
         const normalizedEditUri = editUri.normalizePath().toString();
@@ -1455,6 +1699,48 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 time: message.time,
                 playing: message.playing
             }
+        }));
+    }
+
+    protected forwardRawPreviewAnnotationState(
+        widget: PreviewWidgetMarker,
+        reason: 'focus' | 'playback'
+    ): void {
+        const mediaUri = widget.akariPreviewVideoUri?.normalizePath().toString();
+        if (!mediaUri) {
+            return;
+        }
+        window.dispatchEvent(new CustomEvent(RAW_PREVIEW_ANNOTATION_STATE_EVENT, {
+            detail: {
+                active: true,
+                activation: this.rawPreviewActivation,
+                mediaUri,
+                sourceT: Number.isFinite(widget.akariPreviewLastKnownTime)
+                    ? Math.max(0, widget.akariPreviewLastKnownTime!)
+                    : 0,
+                reason
+            }
+        }));
+    }
+
+    protected syncRawPreviewAnnotationContext(): void {
+        const mainWidget = this.shell.getCurrentWidget('main');
+        const rawWidget = [...this.openPreviews.values()].find(widget => widget === mainWidget);
+        const transition = transitionRawPreviewFocus({
+            activation: this.rawPreviewActivation,
+            activeWidgetId: this.activeRawPreviewWidget?.id
+        }, rawWidget?.id);
+        if (!transition.changed) {
+            return;
+        }
+        this.rawPreviewActivation = transition.activation;
+        this.activeRawPreviewWidget = rawWidget;
+        if (rawWidget) {
+            this.forwardRawPreviewAnnotationState(rawWidget, 'focus');
+            return;
+        }
+        window.dispatchEvent(new CustomEvent(RAW_PREVIEW_ANNOTATION_STATE_EVENT, {
+            detail: { active: false, activation: this.rawPreviewActivation, reason: 'focus' }
         }));
     }
 
@@ -1511,7 +1797,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         widget: PreviewWidgetMarker,
         message: PreviewReviewStrokeStartRequest
     ): void {
-        const editUri = widget.akariPreviewEditUri?.normalizePath().toString();
+        const editUri = this.reviewEditUriForPreview(widget);
         if (editUri) {
             this.reviewSessionRecorder?.handleStrokeStart(editUri, message.frame);
         }
@@ -1526,9 +1812,63 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         widget: PreviewWidgetMarker,
         message: PreviewReviewStrokeEndRequest
     ): void {
-        const editUri = widget.akariPreviewEditUri?.normalizePath().toString();
+        const editUri = this.reviewEditUriForPreview(widget);
         if (editUri) {
             this.reviewSessionRecorder?.handleStrokeEnd(editUri, message.points);
+        }
+    }
+
+    // task.md 指示4: rect ツールの start/end -- pen の isReviewStrokeStartRequest/
+    // forwardReviewStrokeStart と対をなす配線。
+    protected isReviewRectStartRequest(message: any): message is PreviewReviewRectStartRequest {
+        const frame = message?.frame;
+        return message?.type === 'akari-preview-review-rect-start'
+            && Number.isFinite(frame?.timelineT)
+            && Number.isFinite(frame?.sourceT)
+            && (frame?.cutIndex === null
+                || (Number.isInteger(frame?.cutIndex) && frame.cutIndex >= 0));
+    }
+
+    protected forwardReviewRectStart(
+        widget: PreviewWidgetMarker,
+        message: PreviewReviewRectStartRequest
+    ): void {
+        const editUri = this.reviewEditUriForPreview(widget);
+        if (editUri) {
+            this.reviewSessionRecorder?.handleRectStart(editUri, message.frame);
+        }
+    }
+
+    protected isReviewRectEndRequest(message: any): message is PreviewReviewRectEndRequest {
+        const box = message?.box;
+        return message?.type === 'akari-preview-review-rect-end'
+            && Array.isArray(box) && box.length === 4 && box.every((value: unknown) => Number.isFinite(value));
+    }
+
+    protected forwardReviewRectEnd(
+        widget: PreviewWidgetMarker,
+        message: PreviewReviewRectEndRequest
+    ): void {
+        const editUri = this.reviewEditUriForPreview(widget);
+        if (editUri) {
+            this.reviewSessionRecorder?.handleRectEnd(editUri, message.box);
+        }
+    }
+
+    // task.md 指示3: pen-toggle（既存入口）からの mode request。右パネルのボタン/ショートカット
+    // と同じ ReviewSessionRecorder.setToolMode に着地させる（正本は host 側の 1 箇所のみ）。
+    protected isReviewToolModeRequest(message: any): message is PreviewReviewToolModeRequest {
+        return message?.type === 'akari-preview-review-tool-mode-request'
+            && ['neutral', 'pen', 'rect', 'select'].includes(message?.mode);
+    }
+
+    protected forwardReviewToolModeRequest(
+        widget: PreviewWidgetMarker,
+        message: PreviewReviewToolModeRequest
+    ): void {
+        const editUri = this.reviewEditUriForPreview(widget);
+        if (editUri) {
+            this.reviewSessionRecorder?.setToolMode(editUri, message.mode);
         }
     }
 
@@ -1603,7 +1943,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         }));
     }
 
-    protected queueRefresh(widget: PreviewWidgetMarker, identityUri: URI, kind: 'raw' | 'output'): void {
+    protected queueRefresh(
+        widget: PreviewWidgetMarker,
+        identityUri: URI,
+        kind: 'raw' | 'output',
+        seekTimeOverride?: number
+    ): void {
         const previous = widget.akariPreviewRefresh ?? Promise.resolve();
         const refresh = (): Promise<void> => {
             const editUri = kind === 'output' ? widget.akariPreviewEditUri : undefined;
@@ -1616,7 +1961,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 widget,
                 identityUri,
                 kind,
-                transport?.timelineT
+                seekTimeOverride ?? transport?.timelineT
             );
         };
         widget.akariPreviewRefresh = previous.then(
@@ -1635,7 +1980,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     protected queueCaptionsUpdate(widget: PreviewWidgetMarker): void {
         const previous = widget.akariPreviewCaptionsUpdate ?? Promise.resolve();
         widget.akariPreviewCaptionsUpdate = previous.then(async () => {
-            const captions = await this.loadPreviewCaptions(widget.akariPreviewCaptionsUri);
+            const captions = await this.loadPreviewCaptions(widget.akariPreviewCaptionsUri, widget.akariPreviewEditUri);
             widget.sendMessage({ type: 'akari-preview-captions-update', captions });
         }).catch(error => console.error('[akari-preview] failed to update captions', error));
     }
@@ -1656,6 +2001,10 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         const videoUri = kind === 'output' ? model.sourceUri : identityUri;
         if (!videoUri) {
             await this.disposeAssetStreams(model.assetStreamIds);
+            if (model.emptyProject) {
+                this.showMessageCard(widget, identityUri, EMPTY_PROJECT_MESSAGE, identityUri, kind);
+                return;
+            }
             throw new Error(`${identityUri.toString()} の source.path を解決できませんでした。`);
         }
         const extension = videoUri.path.ext.toLowerCase();
@@ -1679,12 +2028,46 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         // what actually gets streamed to <video>; videoUri itself (source identity: captions
         // lookup, file watch, seek commands, title) stays untouched below.
         const streamVideoUri = await this.resolveStreamVideoUri(videoUri, model);
-        const videoStream = await this.previewService.createVideoStream({
-            videoUri: streamVideoUri.toString()
-        }).catch(async error => {
-            await this.disposeAssetStreams(model.assetStreamIds);
-            throw error;
-        });
+        // task/2026-08-10-preview-bug-sweep (B1): ffprobe ground truth for the audio-detected
+        // notice, run alongside createVideoStream so it adds no extra latency to open. Never
+        // allowed to fail the whole open — an unknown result just suppresses the notice below.
+        const [videoStream, hasSourceAudio] = await Promise.all([
+            this.previewService.createVideoStream({
+                videoUri: streamVideoUri.toString()
+            }).catch(async error => {
+                await this.disposeAssetStreams(model.assetStreamIds);
+                throw error;
+            }),
+            this.previewService.probeAudioPresence({ videoUri: videoUri.toString() })
+                .then(result => result.hasAudio)
+                .catch(() => undefined)
+        ]);
+        // v1 マルチソース: 代表ソース以外の cuts[].src 先も webview から再生できるよう
+        // それぞれストリームを開く（代表ソースは上の videoStream を再利用）。
+        // 全ストリームは同一のローカルサーバ由来なので CSP の media-src は据え置きでよい。
+        const extraVideoStreams = new Map<string, { id: string; url: string }>();
+        const sourceUrlById: Record<string, string> = {};
+        if (kind === 'output' && model.sourcesById) {
+            for (const [sourceId, entry] of model.sourcesById) {
+                if (model.sourceUri && entry.uri.toString() === model.sourceUri.toString()) {
+                    sourceUrlById[sourceId] = videoStream.url;
+                    continue;
+                }
+                if (!PLAYABLE_VIDEO_MIME_TYPES.has(entry.uri.path.ext.toLowerCase())
+                    || !(await this.isInsideWorkspace(entry.uri))) {
+                    console.warn('[akari-preview] sources[] の素材を再生できません（形式か配置）', entry.uri.toString());
+                    continue;
+                }
+                try {
+                    const streamUri = await this.resolveStreamVideoUri(entry.uri, model);
+                    const stream = await this.previewService.createVideoStream({ videoUri: streamUri.toString() });
+                    extraVideoStreams.set(sourceId, stream);
+                    sourceUrlById[sourceId] = stream.url;
+                } catch (error) {
+                    console.warn('[akari-preview] sources[] のストリームを開けませんでした', entry.uri.toString(), error);
+                }
+            }
+        }
         if (widget.isDisposed) {
             await Promise.all([
                 this.disposeVideoStreamId(videoStream.id),
@@ -1701,6 +2084,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             return;
         }
         widget.akariPreviewStreamId = videoStream.id;
+        widget.akariPreviewExtraStreamIds = [...extraVideoStreams.values()].map(stream => stream.id);
         widget.akariPreviewAssetStreamIds = model.assetStreamIds;
         widget.akariPreviewEditUri = model.editUri;
         widget.akariPreviewRelatedEditUri = model.relatedEditUri;
@@ -1797,41 +2181,28 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             videoStream.url,
             model,
             assets,
-            initialSeekTime
+            initialSeekTime,
+            sourceUrlById,
+            hasSourceAudio
         ));
     }
 
-    // Picks the URI that actually gets streamed to <video>: an explicit edit.json source.proxy
-    // wins outright (no ffprobe call — the pipeline already declared it authoritative); otherwise
-    // asks the backend to lazily generate/reuse an H.264 proxy when the source probes as HEVC.
-    // Blocks refreshPreview() until the RPC settles (no separate "generating…" UI state — see
-    // report for the tradeoff). Any failure (ffmpeg/ffprobe missing, generation error, RPC
-    // rejection) silently falls back to the original videoUri: worst case is unchanged pre-
-    // existing behavior (the <video> error handler's showPlaybackError already covers an
-    // undecodable source), never a new failure mode.
+    // Picks the URI that actually gets streamed to <video>. task/2026-08-09-drop-hevc-proxy:
+    // in principle this just returns the source as-is — <video> decodes HEVC in hardware fine on
+    // the platforms actually measured (see the task's internal report), so probing/transcoding
+    // proactively was pure unnecessary latency (it was the cause of the 10s open timeout, not a
+    // safety net for it). An explicit edit.json source.proxy still wins outright (pipeline-
+    // declared, so it's authoritative regardless of what would otherwise be probed). The only
+    // other case where this returns something other than videoUri is when that exact source
+    // already failed to play once in this session and a proxy was generated for it — see
+    // handleHevcFallbackRequest, the sole place that calls previewService.resolveHevcProxy (and
+    // therefore the sole place that can trigger an ffmpeg transcode). No probing happens here.
     protected async resolveStreamVideoUri(videoUri: URI, model: PreviewModel): Promise<URI> {
         if (model.sourceProxyUri) {
             return model.sourceProxyUri;
         }
-        const [workspaceRoot] = await this.workspaceService.roots;
-        if (!workspaceRoot) {
-            return videoUri;
-        }
-        try {
-            const result = await this.previewService.resolveHevcProxy({
-                videoUri: videoUri.toString(),
-                projectRootUri: workspaceRoot.resource.toString()
-            });
-            if (result.status === 'ready') {
-                return new URI(result.proxyUri);
-            }
-            if (result.status === 'unavailable') {
-                console.warn(`[akari-preview] HEVC プロキシを生成できませんでした（元動画のまま再生します）: ${result.reason}`);
-            }
-        } catch (error) {
-            console.warn('[akari-preview] HEVC プロキシの解決に失敗しました（元動画のまま再生します）', error);
-        }
-        return videoUri;
+        const cachedProxyUri = this.hevcFallbackProxyUris.get(videoUri.toString());
+        return cachedProxyUri ? new URI(cachedProxyUri) : videoUri;
     }
 
     protected showMessageCard(
@@ -1872,80 +2243,98 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
     protected async loadPreviewModel(editUri: URI): Promise<PreviewModel> {
         const [workspaceRoot] = await this.workspaceService.roots;
         const captionsUri = locatePreviewCaptions(editUri, workspaceRoot?.resource);
-        const captions = await this.loadPreviewCaptions(captionsUri);
+        const captions = await this.loadPreviewCaptions(captionsUri, editUri);
         const assetStreams = new Map<string, { id: string; url: string }>();
         const assetUris: URI[] = [];
         let sourceUri: URI | undefined;
         let sourceProxyUri: URI | undefined;
+        const sourcesById = new Map<string, { uri: URI; proxyUri?: URI }>();
         try {
             const edit = JSON.parse(await this.readText(editUri));
-            if (typeof edit?.source?.path !== 'string' || !edit.source.path.trim()) {
-                throw new TypeError('edit.json の source.path が不正です。');
+            // edit.json は v0（単一 source）と v1（sources[] + cuts[].src）の両方が公開契約
+            // （packages/schemas/edit.schema.json）。どちらも「id → URI」の表に正規化し、
+            // 以降は表引きで扱う。v0 は既定 id 一つだけの表になる。
+            const declaredSources: Array<{ id: string; path: unknown; proxy?: unknown }> =
+                Array.isArray(edit?.sources)
+                    ? edit.sources.map((value: any) => ({
+                        id: typeof value?.id === 'string' ? value.id : '',
+                        path: value?.path,
+                        proxy: value?.proxy
+                    }))
+                    : [{ id: DEFAULT_SOURCE_ID, path: edit?.source?.path, proxy: edit?.source?.proxy }];
+            // ソースの宣言が 1 つも無い = 素材投入前の新規プロジェクト。`source` キー自体が
+            // 無い（`{}`）か `sources: []` の 2 形。壊れた宣言（path が非文字列など）とは区別し、
+            // ここでは投げずに空プロジェクトとして返す（呼び出し側が案内カードを出す）。
+            const hasNoDeclaredSource = Array.isArray(edit?.sources)
+                ? edit.sources.length === 0
+                : edit?.source === undefined || edit?.source === null;
+            if (hasNoDeclaredSource) {
+                return {
+                    editUri,
+                    summary: EMPTY_SUMMARY,
+                    sourcesById,
+                    overlayUris: [],
+                    assetUris: [],
+                    assetStreamIds: [],
+                    captionsUri,
+                    captions,
+                    emptyProject: true
+                };
+            }
+            for (const declared of declaredSources) {
+                if (typeof declared.path !== 'string' || !declared.path.trim()) {
+                    throw new TypeError(Array.isArray(edit?.sources)
+                        ? `edit.json の sources[${declared.id || '?'}].path が不正です。`
+                        : 'edit.json の source.path が不正です。');
+                }
+                if (!declared.id) {
+                    throw new TypeError('edit.json の sources[].id が不正です。');
+                }
+                const uri = this.resolveEditAssetUri(declared.path, editUri);
+                let proxyUri: URI | undefined;
+                if (typeof declared.proxy === 'string' && declared.proxy.trim()) {
+                    const candidate = this.resolveEditAssetUri(declared.proxy, editUri);
+                    proxyUri = await this.fileService.exists(candidate) ? candidate : undefined;
+                }
+                sourcesById.set(declared.id, { uri, ...(proxyUri ? { proxyUri } : {}) });
             }
             const emphasisWords = this.normalizeEmphasisWords(edit?.emphasis_words);
-            sourceUri = this.resolveEditAssetUri(edit.source.path, editUri);
-            // edit.json's schema already declares an explicit source.proxy field (v0 sourceV0 /
-            // v1 sourceV1, see packages/schemas/edit.schema.json) that no consumer reads yet. If
-            // it's set, it wins over the HEVC-triggered proxy this task adds below (read-only —
-            // never written back). Falls through to HEVC detection if the declared file is
-            // missing, same as how layers[].kind==='baked' treats a missing preview sidecar.
-            if (typeof edit?.source?.proxy === 'string' && edit.source.proxy.trim()) {
-                const candidate = this.resolveEditAssetUri(edit.source.proxy, editUri);
-                sourceProxyUri = await this.fileService.exists(candidate) ? candidate : undefined;
-            }
+            // 代表ソース（字幕の探索・ファイル監視・タイトル・単一ソース時の従来経路）は
+            // 先頭カットが参照するソース。無ければ宣言順の先頭。
+            const firstCutSourceId = Array.isArray(edit?.cuts)
+                ? edit.cuts.map((cut: any) => cut?.src).find((id: unknown) => typeof id === 'string' && sourcesById.has(id))
+                : undefined;
+            const primaryId = firstCutSourceId ?? [...sourcesById.keys()][0];
+            sourceUri = sourcesById.get(primaryId)?.uri;
+            // 宣言済み proxy（v0 sourceV0 / v1 sourceV1 の source.proxy）は上のソース表構築時に
+            // 解決済み。存在するときだけ HEVC 検出（refreshPreview）より優先される（読み取り専用・
+            // 書き戻さない）。ファイルが無ければ HEVC 検出へ落ちる（baked レイヤーの preview
+            // サイドカーが無いときと同じ扱い）。
+            sourceProxyUri = sourcesById.get(primaryId)?.proxyUri;
             const isTruthyObject = (value: unknown): boolean => Boolean(value)
                 && typeof value === 'object' && !Array.isArray(value);
             const width = this.positiveNumber(edit?.output?.width, EMPTY_SUMMARY.output.width);
             const height = this.positiveNumber(edit?.output?.height, EMPTY_SUMMARY.output.height);
             const cuts: EditSummaryCut[] = [];
             for (const value of Array.isArray(edit?.cuts) ? edit.cuts : []) {
-                const inSeconds = this.finiteNumber(value?.in, NaN);
-                const outSeconds = this.finiteNumber(value?.out, NaN);
-                if (Number.isFinite(inSeconds) && Number.isFinite(outSeconds) && outSeconds > inSeconds) {
-                    let speed: number | undefined;
-                    if (value?.speed !== undefined) {
-                        if (typeof value.speed === 'number' && Number.isFinite(value.speed) && value.speed > 0) {
-                            speed = value.speed;
-                        } else {
-                            console.warn('[akari-preview] cut.speed を無視しました（正の有限 number ではありません）', value.speed);
-                        }
-                    }
-                    let transitionOut: EditSummaryCut['transitionOut'];
-                    if (value?.transition_out !== undefined && value.transition_out !== null) {
-                        const transition = value.transition_out;
-                        const validType = transition?.type === 'dissolve'
-                            || transition?.type === 'fade-black'
-                            || transition?.type === 'fade-white';
-                        const validDuration = typeof transition?.duration === 'number'
-                            && Number.isFinite(transition.duration) && transition.duration > 0;
-                        if (transition && typeof transition === 'object' && !Array.isArray(transition)
-                            && validType && validDuration) {
-                            transitionOut = { type: transition.type, duration: transition.duration };
-                        } else {
-                            console.warn('[akari-preview] cut.transition_out を無視しました（type/duration 不正）', transition);
-                        }
-                    }
-                    const at = typeof value?.at === 'number' && Number.isFinite(value.at) && value.at >= 0
-                        ? value.at : undefined;
-                    const track = Number.isInteger(value?.track) && value.track >= 0 ? value.track : 0;
-                    cuts.push({
-                        in: inSeconds,
-                        out: outSeconds,
-                        ...(value?.transform && typeof value.transform === 'object' && !Array.isArray(value.transform)
-                            ? { transform: this.transform(value.transform) } : {}),
-                        ...(typeof value?.opacity === 'number' && Number.isFinite(value.opacity)
-                            && value.opacity >= 0 && value.opacity <= 1 ? { opacity: value.opacity } : {}),
-                        ...(speed !== undefined ? { speed } : {}),
-                        ...(transitionOut ? { transitionOut } : {}),
-                        ...(at !== undefined ? { at } : {}),
-                        track
-                    });
-                } else {
-                    console.warn('[akari-preview] cuts entry を無視しました（in/out 不正）', value);
+                // buildCutSummaryFields は akari-preview-open-handler.ts の外に出した純関数
+                // （common/edit-summary-fields.ts）。crop/perspective 欠落バグ（2026-08-06）の
+                // 再発防止として、この呼び出し自体を配線検査テストの対象にしている
+                // （test/edit-summary-fields.test.mjs）。
+                const result = buildCutSummaryFields(
+                    value,
+                    primaryId,
+                    id => sourcesById.has(id),
+                    v => this.transform(v),
+                    (message, detail) => console.warn(message, detail)
+                );
+                if (result.ok && result.fields) {
+                    cuts.push(result.fields as EditSummaryCut);
                 }
             }
             const overlays: EditSummaryOverlay[] = [];
             const overlayUris: URI[] = [];
+            const unsupportedGltfWarnings: string[] = [];
             for (const value of Array.isArray(edit?.overlays) ? edit.overlays : []) {
                 if (value?.track !== undefined && (!Number.isInteger(value.track) || value.track < 0)) {
                     console.warn('[akari-preview] overlay track が不正なため track 0 として表示します', value?.id);
@@ -1962,7 +2351,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                         console.warn(`[akari-preview] failed to read overlay fragment ${fragmentUri.toString()}`, error);
                     }
                 }
-                html = await this.resolveThreeSceneAssets(html, editUri, assetStreams, assetUris);
+                html = await this.resolveThreeSceneAssets(html, editUri, assetStreams, assetUris, unsupportedGltfWarnings);
                 overlays.push({
                     id: String(value?.id ?? ''),
                     html,
@@ -1978,51 +2367,24 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             for (let index = 0; index < (Array.isArray(edit?.layers) ? edit.layers.length : 0); index += 1) {
                 const value = edit.layers[index];
                 const label = `layers[${index}]`;
-                const validObject = value && typeof value === 'object' && !Array.isArray(value);
-                const validId = typeof value?.id === 'string' && Boolean(value.id.trim());
-                const validT = typeof value?.t === 'number' && Number.isFinite(value.t) && value.t >= 0;
-                const validDuration = typeof value?.duration === 'number'
-                    && Number.isFinite(value.duration) && value.duration > 0;
-                const validKind = value?.kind === 'baked' || value?.kind === 'video';
-                const validSrc = typeof value?.src === 'string' && Boolean(value.src.trim());
-                if (!validObject || !validId || !validT || !validDuration || !validKind || !validSrc) {
-                    console.warn(`[akari-preview] ${label} を無視しました（id/t/duration/kind/src 不正）`, value);
+                // buildLayerSummaryBase は akari-preview-open-handler.ts の外に出した純関数
+                // （common/edit-summary-fields.ts）。crop/perspective 欠落バグ（2026-08-06
+                // shell-summary-field-gap）の再発防止として、この呼び出し自体を配線検査テストの
+                // 対象にしている（test/edit-summary-fields.test.mjs）。
+                const result = buildLayerSummaryBase(
+                    value,
+                    label,
+                    v => this.transform(v),
+                    LAYER_BLEND_TO_CSS,
+                    (message, detail) => console.warn(message, detail)
+                );
+                if (!result.ok || !result.base) {
                     continue;
                 }
-
-                let opacity = 1;
-                if (value.opacity !== undefined) {
-                    if (typeof value.opacity === 'number' && Number.isFinite(value.opacity)
-                        && value.opacity >= 0 && value.opacity <= 1) {
-                        opacity = value.opacity;
-                    } else {
-                        console.warn(`[akari-preview] ${label}.opacity は 1 で近似します（0〜1 の有限 number ではありません）`, value.opacity);
-                    }
+                if (result.unsupportedBlend) {
+                    unsupportedBlendCount += 1;
                 }
-                let blend = 'normal';
-                if (value.blend !== undefined) {
-                    const mapped = typeof value.blend === 'string'
-                        ? LAYER_BLEND_TO_CSS.get(value.blend)
-                        : undefined;
-                    if (mapped) {
-                        blend = mapped;
-                    } else {
-                        unsupportedBlendCount += 1;
-                        console.warn(`[akari-preview] ${label}.blend は normal で近似します（未対応値）`, value.blend);
-                    }
-                }
-
-                const base: Omit<EditSummaryLayer, 'src' | 'proxyMissing'> = {
-                    id: value.id,
-                    t: value.t,
-                    duration: value.duration,
-                    kind: value.kind,
-                    track: Number.isInteger(value.track) && value.track >= 0 ? value.track : 0,
-                    transform: this.transform(value.transform),
-                    opacity,
-                    blend,
-                    chromaKey: value.kind === 'video' && isTruthyObject(value.chroma_key)
-                };
+                const base: Omit<EditSummaryLayer, 'src' | 'proxyMissing' | 'isImage'> = result.base;
                 let sourceUri: URI;
                 try {
                     sourceUri = this.resolveEditAssetUri(value.src, editUri);
@@ -2031,6 +2393,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                     continue;
                 }
                 if (value.kind === 'baked') {
+                    // 'baked' は常に previewProxyUri() の .preview.webm サイドカーを配信する（元の
+                    // value.src の拡張子に関わらず）ため、isImage は常に false — このブランチの
+                    // 挙動は本タスクで一切変えない（対象は 'video' kind の画像のみ、司令塔裁定1）。
                     const sidecarUri = this.previewProxyUri(sourceUri);
                     if (!assetUris.some(uri => uri.toString() === sidecarUri.toString())) {
                         assetUris.push(sidecarUri);
@@ -2049,7 +2414,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                     } catch (error) {
                         console.warn(`[akari-preview] ${label} の preview proxy を配信できません`, error);
                     }
-                    layers.push({ ...base, ...(src ? { src } : {}), proxyMissing: !src });
+                    layers.push({ ...base, ...(src ? { src } : {}), proxyMissing: !src, isImage: false });
                     continue;
                 }
 
@@ -2061,7 +2426,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                         assetStreams.set(key, stream);
                         assetUris.push(sourceUri);
                     }
-                    layers.push({ ...base, src: stream.url, proxyMissing: false });
+                    // 'video' kind はソースファイルをそのまま配信する（サイドカー変換なし）ので、
+                    // 配信 URL は元の value.src と同じバイト列 -- 拡張子判定がそのまま安全に使える。
+                    layers.push({ ...base, src: stream.url, proxyMissing: false, isImage: isImageLayerSrc(value.src) });
                 } catch (error) {
                     console.warn(`[akari-preview] ${label} を無視しました（video レイヤーを配信できません）`, error);
                 }
@@ -2131,10 +2498,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 (cut as { transition_out?: { type?: unknown } } | null)?.transition_out?.type === 'dissolve')) {
                 indicators.push('ディゾルブ切り替え');
             }
+            indicators.push(...unsupportedGltfWarnings);
             return {
                 editUri,
                 sourceUri,
                 sourceProxyUri,
+                sourcesById,
                 overlayUris,
                 assetUris,
                 assetStreamIds: [...assetStreams.values()].map(stream => stream.id),
@@ -2164,6 +2533,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 editUri,
                 sourceUri,
                 sourceProxyUri,
+                sourcesById,
                 summary: EMPTY_SUMMARY,
                 overlayUris: [],
                 assetUris: [],
@@ -2361,11 +2731,42 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         return { bgm, sfx, narration };
     }
 
+    // task/2026-08-10-preview-bug-sweep (B3): binary glTF (.glb) header/JSON-chunk sniff for
+    // extensions the pinned Three.js runtime (packages/overlay-runtime/src/three-runtime.js) has
+    // no loader for (no DRACOLoader/KTX2Loader wired — confirmed via
+    // skills/overlay-authoring/3d.md "Draco/KTX2 は未対応" and by reproduction: a
+    // KHR_draco_mesh_compression model settles into status "error" while an otherwise-identical
+    // uncompressed model reaches "ready"). Detection only — this can't make the runtime decode
+    // Draco/KTX2 (that needs a vendored decoder in packages/overlay-runtime, out of this task's
+    // file boundary); it turns an unexplained stuck-looking fallback into a visible, actionable
+    // "プレビュー未対応の項目" indicator (see indicators.push below) instead.
+    protected detectUnsupportedGltfExtensions(bytes: Uint8Array): string[] {
+        const UNSUPPORTED_GLTF_EXTENSIONS = ['KHR_draco_mesh_compression', 'KHR_texture_basisu'];
+        try {
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            if (view.byteLength < 20 || view.getUint32(0, true) !== 0x46546c67) {
+                return [];
+            }
+            const jsonChunkLength = view.getUint32(12, true);
+            const jsonChunkType = view.getUint32(16, true);
+            if (jsonChunkType !== 0x4e4f534a || view.byteLength < 20 + jsonChunkLength) {
+                return [];
+            }
+            const jsonBytes = bytes.subarray(20, 20 + jsonChunkLength);
+            const json = JSON.parse(new TextDecoder('utf-8').decode(jsonBytes)) as { extensionsUsed?: unknown };
+            const used = new Set(Array.isArray(json.extensionsUsed) ? json.extensionsUsed : []);
+            return UNSUPPORTED_GLTF_EXTENSIONS.filter(extension => used.has(extension));
+        } catch {
+            return [];
+        }
+    }
+
     protected async resolveThreeSceneAssets(
         html: string,
         editUri: URI,
         assetStreams: Map<string, { id: string; url: string }>,
-        assetUris: URI[]
+        assetUris: URI[],
+        unsupportedGltfWarnings: string[]
     ): Promise<string> {
         if (!html.includes('data-akari-3d-scene')) {
             return html;
@@ -2408,7 +2809,20 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                     }
                     return stream.url;
                 };
-                descriptor.model = await resolveAsset(descriptor.model, 'data-akari-3d-scene.model');
+                const modelPath: string = descriptor.model;
+                descriptor.model = await resolveAsset(modelPath, 'data-akari-3d-scene.model');
+                try {
+                    const modelContent = await this.fileService.readFile(editUri.parent.resolve(modelPath));
+                    const unsupported = this.detectUnsupportedGltfExtensions(modelContent.value.buffer);
+                    if (unsupported.length > 0) {
+                        unsupportedGltfWarnings.push(
+                            `3D モデル ${modelPath} が ${unsupported.join('/')} 圧縮のため読み込めません` +
+                            `（書き出しも同様に失敗します。非圧縮で書き出し直してください）`
+                        );
+                    }
+                } catch (error) {
+                    console.warn('[akari-preview] failed to inspect 3D model for unsupported glTF extensions', modelPath, error);
+                }
                 if (descriptor.environment?.map !== undefined) {
                     if (typeof descriptor.environment.map !== 'string' || !descriptor.environment.map) {
                         throw new TypeError('environment.map は正距円筒画像の相対パスである必要があります');
@@ -2450,11 +2864,18 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         return document.body.innerHTML;
     }
 
-    protected async loadPreviewCaptions(captionsUri: URI | undefined): Promise<PreviewCaption[]> {
+    protected async loadPreviewCaptions(captionsUri: URI | undefined, editUri?: URI): Promise<PreviewCaption[]> {
         if (!captionsUri) {
             return [];
         }
         try {
+            if (editUri) {
+                const resolved = await this.previewService.resolveCaptionDisplay({
+                    captionsUri: captionsUri.toString(),
+                    editUri: editUri.toString()
+                });
+                if (resolved) return parseResolvedPreviewCaptions(resolved);
+            }
             return parsePreviewCaptions(await this.readText(captionsUri));
         } catch (error) {
             if (await this.fileService.exists(captionsUri)) {
@@ -2475,8 +2896,7 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             for (const candidate of candidates) {
                 try {
                     const parsed = JSON.parse(await this.readText(candidate));
-                    if (typeof parsed?.source?.path === 'string'
-                        && this.pathBase(parsed.source.path) === videoUri.path.base) {
+                    if (editReferencesRawMedia(parsed, candidate.toString(), videoUri.toString())) {
                         return candidate;
                     }
                 } catch {
@@ -2503,7 +2923,11 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 return;
             }
             const children = [...(stat.children ?? [])]
-                .filter(child => !SKIPPED_DIRECTORIES.has(child.resource.path.base))
+                // ドット始まりは一律飛ばす（isSkippedSearchDirectory = ドット始まり + node_modules）。
+                // 実害 2 系統（いずれも 2026-08-04 実機）: (1) .claude のスキル同梱フィクスチャの
+                // edit.json を拾って謎タイムラインが開く (2) .backups / .pretest-* 等の
+                // バックアップ置き場を拾ってタイムラインとプレビューが別ファイルに割れる
+                .filter(child => !isSkippedSearchDirectory(child.resource.path.base))
                 .sort((left, right) => left.resource.toString().localeCompare(right.resource.toString()));
             for (const child of children) {
                 await visit(child.resource);
@@ -2533,28 +2957,57 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             if (!overlay) {
                 throw new Error(`オーバーレイが見つかりません: ${request.overlayId}`);
             }
+            // 断片テキスト編集の html patch は overlays[].html が指す断片ファイルへ書く。
+            // 旧実装はここで html を黙って捨てて ok を返しており、contenteditable の編集が
+            // どのサーフェスでも一度も永続化されていなかった（edit.json へマージすると
+            // lint「html does not resolve to a regular file」で弾かれる — 契約上ファイル参照）
+            if (typeof request.patch.html === 'string') {
+                if (!request.patch.html.trim()) {
+                    throw new Error('html が空です');
+                }
+                if (typeof overlay.html !== 'string' || !overlay.html) {
+                    throw new Error(`overlays[].html がファイル参照ではありません: ${request.overlayId}`);
+                }
+                const projectRoot = editUri.parent;
+                const htmlPath = String(overlay.html);
+                // URI.resolve は '..' を正規化しない可能性があるため、セグメント検査で先に弾く
+                if (htmlPath.startsWith('/') || htmlPath.split(/[\\/]/).some(segment => segment === '..')) {
+                    throw new Error('プロジェクト外への書き込みは拒否しました');
+                }
+                const target = projectRoot.resolve(htmlPath);
+                if (!`${target.toString()}/`.startsWith(`${projectRoot.toString()}/`)) {
+                    throw new Error('プロジェクト外への書き込みは拒否しました');
+                }
+                if (!(await this.fileService.exists(target))) {
+                    throw new Error(`断片ファイルがありません: ${overlay.html}`);
+                }
+                this.recentWrites.set(target.toString(), Date.now());
+                await this.fileService.writeFile(target, BinaryBuffer.fromString(request.patch.html));
+            }
             if (request.patch.vars) {
                 overlay.vars = { ...this.objectRecord(overlay.vars), ...request.patch.vars };
             }
             if (request.patch.transform) {
                 overlay.transform = { ...this.objectRecord(overlay.transform), ...request.patch.transform };
             }
-            const candidateText = `${JSON.stringify(edit, undefined, 2)}\n`;
-            const lintResult = await this.previewService.lintEditCandidate({
-                editUri: editUri.toString(),
-                candidateText
-            });
-            if (!lintResult.pass) {
-                widget.sendMessage({
-                    type: 'akari-preview-overlay-write-response',
-                    requestId: request.requestId,
-                    ok: false,
-                    error: lintResult.errors[0] ?? 'edit-lint が変更を拒否しました'
+            if (request.patch.vars || request.patch.transform) {
+                const candidateText = `${JSON.stringify(edit, undefined, 2)}\n`;
+                const lintResult = await this.previewService.lintEditCandidate({
+                    editUri: editUri.toString(),
+                    candidateText
                 });
-                return;
+                if (!lintResult.pass) {
+                    widget.sendMessage({
+                        type: 'akari-preview-overlay-write-response',
+                        requestId: request.requestId,
+                        ok: false,
+                        error: lintResult.errors[0] ?? 'edit-lint が変更を拒否しました'
+                    });
+                    return;
+                }
+                this.recentWrites.set(editUri.toString(), Date.now());
+                await this.fileService.writeFile(editUri, BinaryBuffer.fromString(candidateText));
             }
-            this.recentWrites.set(editUri.toString(), Date.now());
-            await this.fileService.writeFile(editUri, BinaryBuffer.fromString(candidateText));
             widget.sendMessage({
                 type: 'akari-preview-overlay-write-response',
                 requestId: request.requestId,
@@ -2596,6 +3049,70 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         return undefined;
     }
 
+    // ㉔ layers[].crop の schema 定義（edit.schema.json #layerCrop — 0..1 正規化・x+w<=1・y+h<=1）と
+    // 同じ制約をここで先に弾く（validateLayerTransformPatch と同じ「不正値は書き込まない」の担保）。
+    protected validateLayerCropPatch(patch: LayerCropPatch | undefined): string | undefined {
+        if (!patch) {
+            return undefined;
+        }
+        for (const field of ['x', 'y'] as const) {
+            if (!Number.isFinite(patch[field]) || patch[field] < 0 || patch[field] > 1) {
+                return `crop.${field} は 0 から 1 の範囲の有限数である必要があります。`;
+            }
+        }
+        for (const field of ['w', 'h'] as const) {
+            if (!Number.isFinite(patch[field]) || patch[field] <= 0 || patch[field] > 1) {
+                return `crop.${field} は 0 より大きく 1 以下の有限数である必要があります。`;
+            }
+        }
+        if (patch.x + patch.w > 1 + 1e-9) {
+            return 'crop.x + crop.w は 1 以下である必要があります。';
+        }
+        if (patch.y + patch.h > 1 + 1e-9) {
+            return 'crop.y + crop.h は 1 以下である必要があります。';
+        }
+        return undefined;
+    }
+
+    // ㉖ layers[].perspective の schema 定義（edit.schema.json #layerPerspective — corners は
+    // [TL,TR,BL,BR] の 4 要素・各 [x,y] は 0..1）と同じ制約をここで先に弾く。patch.perspective ===
+    // null（明示的な解除）は常に有効。退化四角形（面積がほぼ 0）の拒否も
+    // packages/schemas/bin/validate-edit.mjs の validateLayerPerspective と同じシューレース公式で
+    // 揃える（意図的なコード重複 — 検収ゲートを edit-lint に一本化する契約どおり、ここでの拒否は
+    // 「早期に分かりやすいエラーを返す」ための先弾きであり、真の正本は edit-lint 経由の schema 検証）。
+    protected validateLayerPerspectivePatch(patch: LayerPerspectivePatch | null | undefined): string | undefined {
+        if (patch === undefined || patch === null) {
+            return undefined;
+        }
+        const corners = patch.corners;
+        if (!Array.isArray(corners) || corners.length !== 4) {
+            return 'perspective.corners は [TL,TR,BL,BR] の 4 要素配列である必要があります。';
+        }
+        const names = ['TL', 'TR', 'BL', 'BR'];
+        for (let i = 0; i < 4; i += 1) {
+            const corner = corners[i];
+            if (!Array.isArray(corner) || corner.length !== 2) {
+                return `perspective.corners[${i}] (${names[i]}) は [x, y] の 2 要素配列である必要があります。`;
+            }
+            const [x, y] = corner;
+            if (!Number.isFinite(x) || x < 0 || x > 1 || !Number.isFinite(y) || y < 0 || y > 1) {
+                return `perspective.corners[${i}] (${names[i]}) は 0 から 1 の範囲の有限数である必要があります。`;
+            }
+        }
+        const [tl, tr, bl, br] = corners;
+        const ring = [tl, tr, br, bl];
+        let area2 = 0;
+        for (let i = 0; i < ring.length; i += 1) {
+            const [x1, y1] = ring[i];
+            const [x2, y2] = ring[(i + 1) % ring.length];
+            area2 += x1 * y2 - x2 * y1;
+        }
+        if (Math.abs(area2) < 1e-4) {
+            return 'perspective.corners は退化した四角形（面積がほぼ 0）であってはなりません。';
+        }
+        return undefined;
+    }
+
     protected async handleLayerWrite(widget: PreviewWidgetMarker, request: LayerWriteRequest): Promise<void> {
         const respond = (ok: boolean, error?: string): void => {
             widget.sendMessage({
@@ -2610,7 +3127,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             respond(false, '編集中の edit.json がありません');
             return;
         }
-        const validationError = this.validateLayerTransformPatch(request.patch.transform);
+        const validationError = this.validateLayerTransformPatch(request.patch.transform)
+            ?? this.validateLayerCropPatch(request.patch.crop)
+            ?? this.validateLayerPerspectivePatch(request.patch.perspective);
         if (validationError) {
             respond(false, validationError);
             return;
@@ -2627,6 +3146,18 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             }
             if (request.patch.transform) {
                 layer.transform = { ...this.objectRecord(layer.transform), ...request.patch.transform };
+            }
+            if (request.patch.crop) {
+                layer.crop = { ...request.patch.crop };
+            }
+            if (request.patch.perspective !== undefined) {
+                // null = explicit clear (removes layer.perspective entirely, matching the
+                // schema's "absent = no perspective, byte-identical render" default).
+                if (request.patch.perspective === null) {
+                    delete layer.perspective;
+                } else {
+                    layer.perspective = { corners: request.patch.perspective.corners.map(([x, y]) => [x, y]) };
+                }
             }
             const candidateText = `${JSON.stringify(edit, undefined, 2)}\n`;
             const lintResult = await this.previewService.lintEditCandidate({
@@ -2805,6 +3336,70 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             && typeof message.requestId === 'string';
     }
 
+    protected isHevcFallbackRequest(message: any): message is HevcFallbackRequest {
+        return message?.type === 'akari-preview-hevc-fallback-request'
+            && typeof message.requestId === 'string';
+    }
+
+    // task/2026-08-09-drop-hevc-proxy: 唯一 previewService.resolveHevcProxy を呼ぶ経路
+    // （＝唯一 ffmpeg 変換を新規に起動しうる経路）。open は既に完了しているので、ここで
+    // await しても開く処理そのものはブロックしない。成功したら widget を丸ごとリロードする
+    // （refreshPreview が sourceUrlById/segments を含む状態を作り直すため、複数ソース
+    // （cuts[].src）を含む構成でも古い URL が混ざらない — v1 マルチソースの代表ソース以外
+    // （sources[] の追加ソース）はこのフォールバック対象外のまま。実測未確認、report 参照）。
+    // 再生位置は akariPreviewLastKnownTime（forwardPlaybackTick が常時更新）から復元する。
+    protected async handleHevcFallbackRequest(
+        widget: PreviewWidgetMarker,
+        identityUri: URI,
+        kind: 'raw' | 'output',
+        request: HevcFallbackRequest
+    ): Promise<void> {
+        const respond = (ok: boolean, error?: string): void => {
+            widget.sendMessage({
+                type: 'akari-preview-hevc-fallback-response',
+                requestId: request.requestId,
+                ok,
+                ...(error ? { error } : {})
+            });
+        };
+        const videoUri = widget.akariPreviewVideoUri;
+        if (!videoUri) {
+            respond(false, '動画ソースが特定できません');
+            return;
+        }
+        const key = videoUri.toString();
+        if (this.hevcFallbackAttempted.has(key)) {
+            respond(false, 'このソースは既にフォールバックを試行済みです');
+            return;
+        }
+        this.hevcFallbackAttempted.add(key);
+        const [workspaceRoot] = await this.workspaceService.roots;
+        if (!workspaceRoot) {
+            respond(false, 'ワークスペースが開かれていません');
+            return;
+        }
+        try {
+            const result = await this.previewService.resolveHevcProxy({
+                videoUri: key,
+                projectRootUri: workspaceRoot.resource.toString()
+            });
+            if (result.status !== 'ready') {
+                respond(false, result.status === 'unavailable' ? result.reason : '変換対象ではありませんでした');
+                return;
+            }
+            this.hevcFallbackProxyUris.set(key, result.proxyUri);
+        } catch (error) {
+            console.warn('[akari-preview] HEVC フォールバック生成に失敗しました', error);
+            respond(false, error instanceof Error ? error.message : String(error));
+            return;
+        }
+        if (widget.isDisposed) {
+            return;
+        }
+        respond(true);
+        this.queueRefresh(widget, identityUri, kind, widget.akariPreviewLastKnownTime);
+    }
+
     protected isOpenOutputRequest(message: any): message is OpenOutputRequest {
         return message?.type === 'akari-preview-open-output-request';
     }
@@ -2828,7 +3423,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         videoSource: string,
         model: PreviewModel,
         assets: OverlayRuntimeAssets,
-        initialSeekTime?: number
+        initialSeekTime?: number,
+        sourceUrlById: Record<string, string> = {},
+        hasSourceAudio?: boolean
     ): string {
         const { width, height } = model.summary.output;
         // render-cut captions.mjs の既定とパリティ（stage は出力 px 論理空間）:
@@ -2841,6 +3438,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             editPath: model.editUri?.toString() ?? null,
             relatedEditUri: model.relatedEditUri?.toString() ?? null,
             videoUri: videoUri.toString(),
+            // v1 マルチソース: ソース id → ストリーム URL。webview は cuts[].src が
+            // 変わる継ぎ目で <video> をこの表から差し替える（v0 は 1 件のみの表）
+            videoSources: sourceUrlById,
+            // task/2026-08-10-preview-bug-sweep (B1): ffprobe ground truth, undefined when
+            // unknown (ffprobe unavailable or probe failed) — never treated as "silent" client-side.
+            hasSourceAudio: hasSourceAudio ?? null,
             initialSeekTime: Number.isFinite(initialSeekTime) ? initialSeekTime : null,
             muted: model.session?.muted ?? false,
             captionsVisible: model.session?.captionsVisible ?? true,
@@ -2858,8 +3461,8 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; media-src ${this.escapeHtml(this.streamOrigin(videoSource))}; connect-src ${this.escapeHtml(this.streamOrigin(videoSource))} blob:; img-src ${this.escapeHtml(this.streamOrigin(videoSource))} blob: data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:">
 <style>
 ${this.inlineStyle(assets.interactionCss)}
-@font-face { font-family: "Noto Sans JP"; src: url("${assets.captionFontDataUri}") format("truetype-variations"); font-weight: 100 900; font-style: normal; }
-:root { color-scheme: dark; font-family: "Noto Sans JP", sans-serif; }
+${captionFontFaceCss(assets.captionFontDataUri)}
+:root { color-scheme: dark; font-family: "${CAPTION_FONT_FAMILY}", sans-serif; }
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #141414; color: #eee; }
 body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
@@ -2871,7 +3474,7 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
 #zoom-layer { position: absolute; inset: 0; overflow: hidden; will-change: transform; }
 #preview-video { position: absolute; top: 0; left: 0; object-fit: contain; }
 #preview-layers { position: absolute; top: 0; left: 0; width: ${width}px; height: ${height}px; transform-origin: 0 0; overflow: hidden; pointer-events: none; }
-#preview-layers > video { position: absolute; display: none; max-width: none; max-height: none; transform-origin: 50% 50%; pointer-events: auto; cursor: pointer; }
+#preview-layers > video, #preview-layers > img { position: absolute; display: none; max-width: none; max-height: none; transform-origin: 50% 50%; pointer-events: auto; cursor: pointer; }
 #layer-select-box { position: absolute; z-index: 1900; box-sizing: border-box; border: 1.5px solid #4da3ff; box-shadow: 0 0 0 1px rgba(0,0,0,0.35); pointer-events: none; display: none; }
 #layer-select-box.is-active { display: block; }
 #layer-select-box .akari-layer-handle { position: absolute; width: 12px; height: 12px; margin: -6px; border: 1.5px solid #4da3ff; border-radius: 3px; background: #fff; pointer-events: auto; }
@@ -2881,6 +3484,47 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
 #layer-select-box .akari-layer-handle-se { top: 100%; left: 100%; cursor: nwse-resize; }
 #layer-select-box .akari-layer-handle-rotate { top: 0; left: 50%; margin-top: -34px; border-radius: 50%; cursor: grab; }
 #layer-select-box .akari-layer-rotate-stem { position: absolute; top: -28px; left: 50%; width: 1.5px; height: 28px; background: #4da3ff; transform: translateX(-50%); pointer-events: none; }
+/* クロップモード: 移動/リサイズ/回転ハンドルと衝突しないよう select box 側の操作系だけ隠す
+   （枠自体は #layer-crop-box が別枠として表示する）。 */
+#layer-select-box.akari-crop-mode-hide-handles .akari-layer-handle,
+#layer-select-box.akari-crop-mode-hide-handles .akari-layer-rotate-stem { display: none; }
+/* クロップ編集オーバーレイ: 外枠はレイヤーの「クロップ無しなら見えていたはずの」全面フレーム
+   （transform.rotate を outer 自身の中心まわりに適用 — pivot はソースフレーム中心固定。crop の
+   現在値による pivot ドリフトを避け、常に自分の中心で回る素直な参照系にする＝編集時だけの近似）。
+   overflow:hidden で box-shadow スプレッドを外枠内に閉じ込め、クロップ窓の外側だけを暗くする。 */
+#layer-crop-box { position: absolute; z-index: 1950; overflow: hidden; outline: 1px dashed rgba(255,255,255,0.5); pointer-events: none; display: none; }
+#layer-crop-box.is-active { display: block; }
+#layer-crop-box .akari-layer-crop-rect { position: absolute; box-sizing: border-box; outline: 1.5px solid #4da3ff; box-shadow: 0 0 0 2000px rgba(0,0,0,0.45); pointer-events: none; }
+#layer-crop-box .akari-layer-crop-handle { position: absolute; width: 12px; height: 12px; margin: -6px; box-sizing: border-box; border: 1.5px solid #4da3ff; border-radius: 2px; background: #fff; pointer-events: auto; }
+#layer-crop-box .akari-layer-crop-handle-n, #layer-crop-box .akari-layer-crop-handle-s { left: 50%; cursor: ns-resize; }
+#layer-crop-box .akari-layer-crop-handle-e, #layer-crop-box .akari-layer-crop-handle-w { top: 50%; cursor: ew-resize; }
+#layer-crop-box .akari-layer-crop-handle-nw, #layer-crop-box .akari-layer-crop-handle-se { cursor: nwse-resize; }
+#layer-crop-box .akari-layer-crop-handle-ne, #layer-crop-box .akari-layer-crop-handle-sw { cursor: nesw-resize; }
+#layer-crop-box .akari-layer-crop-handle-nw { top: 0; left: 0; }
+#layer-crop-box .akari-layer-crop-handle-n { top: 0; }
+#layer-crop-box .akari-layer-crop-handle-ne { top: 0; left: 100%; }
+#layer-crop-box .akari-layer-crop-handle-e { left: 100%; }
+#layer-crop-box .akari-layer-crop-handle-se { top: 100%; left: 100%; }
+#layer-crop-box .akari-layer-crop-handle-s { top: 100%; }
+#layer-crop-box .akari-layer-crop-handle-sw { top: 100%; left: 0; }
+#layer-crop-box .akari-layer-crop-handle-w { top: 0; }
+#layer-crop-toggle { position: absolute; z-index: 1960; display: none; width: 22px; height: 22px; box-sizing: border-box; border-radius: 4px; border: 1px solid #4da3ff; background: rgba(20,20,20,0.85); color: #cfe6ff; font-size: 13px; line-height: 20px; text-align: center; cursor: pointer; pointer-events: auto; user-select: none; }
+#layer-crop-toggle.is-target-active { display: flex; align-items: center; justify-content: center; }
+#layer-crop-toggle.is-crop-mode { background: #4da3ff; color: #0b1a2a; }
+/* ㉖ layers[].perspective（v0）: プリセット(右奥/左奥/上奥/下奥) + 角度ツマミのみ（4隅の直接
+   ドラッグハンドルは次段）。トグルはクロップトグルの隣（左）に並べ、常に同じ場所に留まる。 */
+#layer-perspective-toggle { position: absolute; z-index: 1960; display: none; width: 22px; height: 22px; box-sizing: border-box; border-radius: 4px; border: 1px solid #4da3ff; background: rgba(20,20,20,0.85); color: #cfe6ff; font-size: 13px; line-height: 20px; text-align: center; cursor: pointer; pointer-events: auto; user-select: none; }
+#layer-perspective-toggle.is-target-active { display: flex; align-items: center; justify-content: center; }
+#layer-perspective-toggle.is-panel-open { background: #4da3ff; color: #0b1a2a; }
+#layer-perspective-toggle.is-declared { border-color: #ffb84d; }
+#layer-perspective-panel { position: absolute; z-index: 1970; display: none; flex-direction: column; gap: 6px; padding: 8px; width: 168px; box-sizing: border-box; border-radius: 6px; border: 1px solid #4da3ff; background: rgba(20,20,20,0.92); color: #cfe6ff; font-size: 11px; pointer-events: auto; user-select: none; }
+#layer-perspective-panel.is-open { display: flex; }
+#layer-perspective-panel .akari-perspective-presets { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+#layer-perspective-panel .akari-perspective-preset { border: 1px solid #4da3ff; border-radius: 4px; background: rgba(255,255,255,0.06); color: #cfe6ff; font-size: 11px; padding: 4px 2px; cursor: pointer; }
+#layer-perspective-panel .akari-perspective-preset.is-active { background: #4da3ff; color: #0b1a2a; }
+#layer-perspective-panel .akari-perspective-angle-row { display: flex; align-items: center; gap: 6px; }
+#layer-perspective-panel .akari-perspective-angle-row input[type=range] { flex: 1; }
+#layer-perspective-panel .akari-perspective-clear { align-self: flex-end; border: none; background: none; color: #ff8a8a; font-size: 11px; cursor: pointer; padding: 2px 4px; }
 #cut-select-box { position: absolute; z-index: 1900; box-sizing: border-box; border: 1.5px solid #4da3ff; box-shadow: 0 0 0 1px rgba(0,0,0,0.35); pointer-events: none; display: none; }
 #cut-select-box.is-active { display: block; }
 #cut-select-box .akari-cut-handle { position: absolute; width: 12px; height: 12px; margin: -6px; border: 1.5px solid #4da3ff; border-radius: 3px; background: #fff; pointer-events: auto; }
@@ -2949,6 +3593,23 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
         <div id="preview-layers"></div>
         <div id="overlay-stage"><div id="transition-plate"></div><div id="caption-plate"></div></div>
         <div id="layer-select-box"><div class="akari-layer-rotate-stem"></div><div class="akari-layer-handle akari-layer-handle-nw" data-akari-handle="nw"></div><div class="akari-layer-handle akari-layer-handle-ne" data-akari-handle="ne"></div><div class="akari-layer-handle akari-layer-handle-sw" data-akari-handle="sw"></div><div class="akari-layer-handle akari-layer-handle-se" data-akari-handle="se"></div><div class="akari-layer-handle akari-layer-handle-rotate" data-akari-handle="rotate"></div></div>
+        <div id="layer-crop-box"><div class="akari-layer-crop-rect"><div class="akari-layer-crop-handle akari-layer-crop-handle-nw" data-akari-crop-handle="nw"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-n" data-akari-crop-handle="n"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-ne" data-akari-crop-handle="ne"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-e" data-akari-crop-handle="e"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-se" data-akari-crop-handle="se"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-s" data-akari-crop-handle="s"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-sw" data-akari-crop-handle="sw"></div><div class="akari-layer-crop-handle akari-layer-crop-handle-w" data-akari-crop-handle="w"></div></div></div>
+        <div id="layer-crop-toggle" title="クロップモード切替 (Esc で終了)">⛶</div>
+        <div id="layer-perspective-toggle" title="パース変形パネル">◈</div>
+        <div id="layer-perspective-panel">
+          <div class="akari-perspective-presets">
+            <button type="button" class="akari-perspective-preset" data-akari-perspective-preset="right">右奥</button>
+            <button type="button" class="akari-perspective-preset" data-akari-perspective-preset="left">左奥</button>
+            <button type="button" class="akari-perspective-preset" data-akari-perspective-preset="top">上奥</button>
+            <button type="button" class="akari-perspective-preset" data-akari-perspective-preset="bottom">下奥</button>
+          </div>
+          <div class="akari-perspective-angle-row">
+            <span>角度</span>
+            <input type="range" min="0" max="75" step="1" value="30" data-akari-perspective-angle />
+            <span data-akari-perspective-angle-value>30°</span>
+          </div>
+          <button type="button" class="akari-perspective-clear" data-akari-perspective-clear>パースを解除</button>
+        </div>
         <div id="cut-select-box"><div class="akari-cut-handle akari-cut-handle-nw" data-akari-handle="nw"></div><div class="akari-cut-handle akari-cut-handle-ne" data-akari-handle="ne"></div><div class="akari-cut-handle akari-cut-handle-sw" data-akari-handle="sw"></div><div class="akari-cut-handle akari-cut-handle-se" data-akari-handle="se"></div></div>
         <div id="caption-select-box"></div>
         <canvas id="pen-layer" aria-hidden="true"></canvas>
@@ -3006,6 +3667,7 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
   </div>
 </div>
 <script>window.__akariPreview = ${initialState};</script>
+<script>window.__akariCaptionFontReady = (async () => { await document.fonts.load(${JSON.stringify(CAPTION_FONT_LOAD_DESCRIPTOR)}); await document.fonts.ready; if (!document.fonts.check(${JSON.stringify(CAPTION_FONT_LOAD_DESCRIPTOR)})) throw new Error('AKARI caption font did not load'); return true; })();</script>
 <script>${this.hostAdapterScript()}</script>
 <script>${this.inlineScript(assets.threeJavaScript)}</script>
 <script>${this.inlineScript(assets.threeRuntimeJavaScript)}</script>
@@ -3043,6 +3705,12 @@ body { display: grid; place-items: center; padding: 32px; }
             const initial = window.__akariPreview;
             const vscode = acquireVsCodeApi();
             const pending = new Map();
+            // ㉖ layers[].perspective（contract-2026-08-02-preview-parity.md §2.4.4）: updateStageScale
+            // (below, in this same IIFE) needs this at layout time, which runs before
+            // previewBootstrapScript's own copy of this function is ever reached -- so this script
+            // block injects its own copy rather than relying on cross-<script>-tag scope.
+            const computeLayerPerspectiveVisualFn = (${computeLayerPerspectiveVisual.toString()});
+            let perspectiveVisualWarned = false;
             let sequence = 0;
             let displayScale = 1;
             // frameScale: 出力キャンバス(output.width/height)を wrapper 内の出力フレーム矩形へ
@@ -3086,6 +3754,15 @@ body { display: grid; place-items: center; padding: 32px; }
                     const requestId = 'akari-preview-waveform-' + (++sequence);
                     pending.set(requestId, { kind: 'waveform-fetch', resolve, reject });
                     vscode.postMessage({ type: 'akari-preview-waveform-fetch', requestId });
+                }),
+                // task/2026-08-09-drop-hevc-proxy: <video> が実際に再生失敗したときだけ呼ぶ
+                // フォールバック要求。成功時はホスト側が widget を丸ごとリロードするので、呼び出し側
+                // (previewBootstrapScript) は resolve を特に処理しない — 失敗時だけ通常のエラー表示に
+                // 戻す。
+                resolveHevcFallback: errorCode => new Promise((resolve, reject) => {
+                    const requestId = 'akari-preview-hevc-fallback-' + (++sequence);
+                    pending.set(requestId, { kind: 'hevc-fallback', resolve, reject });
+                    vscode.postMessage({ type: 'akari-preview-hevc-fallback-request', requestId, errorCode });
                 })
             };
             const createPreviewAudio = () => {
@@ -3413,6 +4090,18 @@ body { display: grid; place-items: center; padding: 32px; }
             window.akari.reviewStrokeEnd = points => {
                 vscode.postMessage({ type: 'akari-preview-review-stroke-end', points });
             };
+            // window.akari 経由で公開する -- previewBootstrapScript は別 IIFE（hostAdapterScript
+            // とスコープを共有しない）ため、window.akari.reviewStrokeStart 等と同じく window 越しに
+            // 呼ぶ必要がある。
+            window.akari.reviewSetToolMode = mode => {
+                vscode.postMessage({ type: 'akari-preview-review-tool-mode-request', mode });
+            };
+            window.akari.reviewRectStart = frame => {
+                vscode.postMessage({ type: 'akari-preview-review-rect-start', frame });
+            };
+            window.akari.reviewRectEnd = box => {
+                vscode.postMessage({ type: 'akari-preview-review-rect-end', box });
+            };
             window.akari.reportOverlaySelection = overlayId => {
                 vscode.postMessage({ type: 'akari-preview-overlay-selected', overlayId });
             };
@@ -3449,7 +4138,8 @@ body { display: grid; place-items: center; padding: 32px; }
                 'layer-write': 'akari-preview-layer-write-response',
                 'cut-write': 'akari-preview-cut-write-response',
                 'caption-write': 'akari-preview-caption-write-response',
-                'waveform-fetch': 'akari-preview-waveform-fetch-response'
+                'waveform-fetch': 'akari-preview-waveform-fetch-response',
+                'hevc-fallback': 'akari-preview-hevc-fallback-response'
             };
             window.addEventListener('message', event => {
                 const message = event.data;
@@ -3464,7 +4154,9 @@ body { display: grid; place-items: center; padding: 32px; }
                         ? '動画データの読み込みに失敗しました'
                         : request.kind === 'caption-write'
                             ? 'captions.json の書き込みに失敗しました'
-                            : 'edit.json の書き込みに失敗しました';
+                            : request.kind === 'hevc-fallback'
+                                ? 'HEVC 互換変換に失敗しました'
+                                : 'edit.json の書き込みに失敗しました';
                     request.reject(new Error(message.error || fallback));
                     return;
                 }
@@ -3527,27 +4219,88 @@ body { display: grid; place-items: center; padding: 32px; }
                 layersStage.style.width = outputWidth + 'px';
                 layersStage.style.height = outputHeight + 'px';
                 layersStage.style.transform = stageTransform;
-                for (const layerVideo of layersStage.querySelectorAll('video')) {
+                for (const layerVideo of layersStage.querySelectorAll('video, img')) {
                     if (!(layerVideo.videoWidth > 0) || !(layerVideo.videoHeight > 0)) continue;
                     const x = Number(layerVideo.dataset.akariTransformX) || 0;
                     const y = Number(layerVideo.dataset.akariTransformY) || 0;
                     const scale = Number(layerVideo.dataset.akariTransformScale) || 1;
                     const rotate = Number(layerVideo.dataset.akariTransformRotate) || 0;
+                    // ㉔ layers[].crop（contract-2026-08-02-preview-parity.md）: render-cut は
+                    // crop→scale→rotate→opacity→overlay の順で合成する。プレビューは同じ最終見た目を、
+                    // 要素を1枚のまま clip-path: inset() で切り抜き、pivot（transform-origin と
+                    // translate の基準点）をクロップ矩形の中心へ動かすことで再現する（wrapper 要素の
+                    // 追加なし = 既存のヒットテスト/アルファ実測コードへの影響を最小化）。
+                    // crop 無し（既定 0,0,1,1）では pivot=50%/50% となり、既存の挙動と完全一致する。
+                    const cropX = Number(layerVideo.dataset.akariCropX) || 0;
+                    const cropY = Number(layerVideo.dataset.akariCropY) || 0;
+                    const cropWRaw = Number(layerVideo.dataset.akariCropW);
+                    const cropHRaw = Number(layerVideo.dataset.akariCropH);
+                    const cropW = Number.isFinite(cropWRaw) && cropWRaw > 0 ? cropWRaw : 1;
+                    const cropH = Number.isFinite(cropHRaw) && cropHRaw > 0 ? cropHRaw : 1;
+                    const pivotXPct = (cropX + cropW / 2) * 100;
+                    const pivotYPct = (cropY + cropH / 2) * 100;
                     layerVideo.style.width = (layerVideo.videoWidth * scale) + 'px';
                     layerVideo.style.height = (layerVideo.videoHeight * scale) + 'px';
                     layerVideo.style.left = (outputWidth / 2 + x) + 'px';
                     layerVideo.style.top = (outputHeight / 2 + y) + 'px';
-                    layerVideo.style.transform = 'translate(-50%, -50%) rotate(' + rotate + 'deg)';
+                    layerVideo.style.transformOrigin = pivotXPct + '% ' + pivotYPct + '%';
+                    // ㉖ layers[].perspective（contract-2026-08-02-preview-parity.md §2.4.4）: applies
+                    // after scale, before rotate (crop → scale → perspective → rotate). Appended as
+                    // the innermost (rightmost) transform function -- since transform-origin already
+                    // wraps the whole chain at the crop pivot, matrix3d receives pivot-relative
+                    // coordinates and composes correctly under the *existing* translate/rotate without
+                    // any extra bookkeeping (computeLayerPerspectiveVisualFn is built specifically for
+                    // this). The box it operates on is the crop rect's own *rendered* (already scaled)
+                    // pixel size, matching layer-perspective-visual.ts's box-size contract.
+                    let perspectiveFn = '';
+                    const perspectiveRaw = layerVideo.dataset.akariPerspectiveCorners;
+                    if (perspectiveRaw) {
+                        let corners = null;
+                        try { corners = JSON.parse(perspectiveRaw); } catch (_error) { corners = null; }
+                        const boxWidthPx = layerVideo.videoWidth * cropW * scale;
+                        const boxHeightPx = layerVideo.videoHeight * cropH * scale;
+                        // computeLayerPerspectiveVisualFn is a webview-injected copy (toString()
+                        // serialization, see this IIFE's top) -- guard the call so a future injection
+                        // regression degrades to "perspective not applied" instead of aborting the
+                        // rest of updateStageScale (crop/pivot/stage/pen-layer placement) every time
+                        // it runs, which is what made this fail silently and janky at once.
+                        try {
+                            const visual = corners ? computeLayerPerspectiveVisualFn({ corners }, boxWidthPx, boxHeightPx) : null;
+                            if (visual) perspectiveFn = ' ' + visual.transformFunction;
+                        } catch (error) {
+                            if (!perspectiveVisualWarned) {
+                                perspectiveVisualWarned = true;
+                                console.warn('[akari-preview] layer perspective visual failed; rendering without perspective', error);
+                            }
+                        }
+                    }
+                    layerVideo.style.transform = 'translate(-' + pivotXPct + '%, -' + pivotYPct + '%) rotate(' + rotate + 'deg)' + perspectiveFn;
+                    layerVideo.style.clipPath = (cropX > 0 || cropY > 0 || cropW < 1 || cropH < 1)
+                        ? 'inset(' + (cropY * 100) + '% ' + (Math.max(0, (1 - cropX - cropW)) * 100) + '% '
+                            + (Math.max(0, (1 - cropY - cropH)) * 100) + '% ' + (cropX * 100) + '%)'
+                        : '';
                 }
-                if (video.dataset.akariCutTransformActive === 'true') {
-                    const x = Number(video.dataset.akariTransformX) || 0;
-                    const y = Number(video.dataset.akariTransformY) || 0;
-                    const scale = Number(video.dataset.akariTransformScale) || 1;
-                    const rotate = Number(video.dataset.akariTransformRotate) || 0;
-                    video.style.transform = 'translate(' + (x * frameScale) + 'px, '
-                        + (y * frameScale) + 'px) scale(' + scale + ') rotate(' + rotate + 'deg)';
+                // ㉕ cuts[].framing（contract-2026-08-02-preview-parity.md §2.4.2）: この cut.transform
+                // 部分（PIP 位置決め）は video.style.transform の一部にすぎず、時間で変化する framing
+                // ズームは previewBootstrapScript 側（tick() 毎フレーム）が別途書き込む。二つの書き手が
+                // 競合しないよう、ここでは「cut.transform だけの文字列」を dataset に置くに留め、実際の
+                // video.style.transform への反映は window.akari.applyCutFramingVisual に委譲する
+                // （bootstrap 未初期化の最初の呼び出しだけ、フォールバックとして自分で直接書く）。
+                const baseTransform = video.dataset.akariCutTransformActive === 'true'
+                    ? (() => {
+                        const x = Number(video.dataset.akariTransformX) || 0;
+                        const y = Number(video.dataset.akariTransformY) || 0;
+                        const scale = Number(video.dataset.akariTransformScale) || 1;
+                        const rotate = Number(video.dataset.akariTransformRotate) || 0;
+                        return 'translate(' + (x * frameScale) + 'px, '
+                            + (y * frameScale) + 'px) scale(' + scale + ') rotate(' + rotate + 'deg)';
+                    })()
+                    : '';
+                video.dataset.akariBaseTransform = baseTransform;
+                if (window.akari.applyCutFramingVisual) {
+                    window.akari.applyCutFramingVisual();
                 } else {
-                    video.style.transform = '';
+                    video.style.transform = baseTransform;
                 }
                 stage.style.left = frameRect.x + 'px';
                 stage.style.top = frameRect.y + 'px';
@@ -3616,6 +4369,9 @@ body { display: grid; place-items: center; padding: 32px; }
             // できず、値を JSON として埋め込む形でのみ共有できる（統合点調査・report.md 参照）。
             // 実際の描画ロジック（グロー/スパークル/フェード）はここに残したまま無変更。
             const PEN_TUNING = ${JSON.stringify(PEN_TUNING)};
+            // task.md 指示4 (rect tool): normalized drag -> [x,y,w,h] box, same shape as
+            // review.json's region.box (../common/rect-tool-visual.ts).
+            const normalizeRectFromPointsFn = (${normalizeRectFromPoints.toString()});
             const playIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"></path></svg>';
             const pauseIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm6 0h4v14h-4z"></path></svg>';
             const fullscreenIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5v2H6v3zm11-5h5v5h-2V6h-3zm3 11h2v5h-5v-2h3zM9 18v2H4v-5h2v3z"></path></svg>';
@@ -3659,6 +4415,25 @@ body { display: grid; place-items: center; padding: 32px; }
             let transitionPlates = [];
             let totalTimelineDuration = 0;
             let segments = [];
+            // ㉕ cuts[].framing / cuts[].freeze（contract-2026-08-02-preview-parity.md §2.4.2/2.4.3）。
+            const computeCutFramingVisualFn = (${computeCutFramingVisual.toString()});
+            const checkCutFreezeCrossingFn = (${checkCutFreezeCrossing.toString()});
+            // ㉖ layers[].perspective（contract-2026-08-02-preview-parity.md §2.4.4）。
+            const computeLayerPerspectiveVisualFn = (${computeLayerPerspectiveVisual.toString()});
+            // ㉗ layers[].crop の錨補正（contract-2026-08-02-preview-parity.md §2.4.1・
+            // 2026-08-06 crop-handle-anchor-fix）。
+            const cropAnchorCorrectedTransformFn = (${cropAnchorCorrectedTransform.toString()});
+            // ㉘ layers[].keyframes（contract-2026-08-09-transform-keyframes-v0.md）。renderLayers
+            // が毎フレーム呼び、layer.keyframes があれば dataset.akariTransformX/Y/Scale/Rotate・
+            // akariCropX/Y/W/H・akariPerspectiveCorners を上書きしてから updateLayerLayout を叩く
+            // （既存の crop pivot / clip-path / matrix3d 描画コードを丸ごと再利用するため）。
+            const computeLayerKeyframesVisualFn = (${computeLayerKeyframesVisual.toString()});
+            // RAF スロットリング（2026-08-09 raf-throttle）: ハンドルドラッグ中の pointermove は
+            // 毎回来るが、フル layout 再計算（updateStageScale）は1フレームに1回で十分。
+            const createRafThrottleFn = (${createRafThrottle.toString()});
+            // freeze の一時停止ホールド（近似実装。尺は伸ばさない — 詳細はコメント参照）。
+            let freezeHoldUntilMs = 0;
+            let freezeHoldConsumedForSegmentIndex = null;
             const probeMediaDurationSeconds = src => new Promise(resolve => {
                 const probe = new Audio();
                 probe.preload = 'metadata';
@@ -3725,12 +4500,22 @@ body { display: grid; place-items: center; padding: 32px; }
             let waveformResizeTimer = 0;
             let waveformDragPointer = null;
             let playbackErrored = false;
+            // task/2026-08-09-drop-hevc-proxy: ソースあたり 1 回だけ HEVC フォールバックを試す
+            // （video.addEventListener('error', ...) 参照）。
+            let hevcFallbackRequested = false;
             let audioNoticeShown = false;
             let activeCaption = null;
             let styledCaptionActive = false;
             let reviewRecordingActive = false;
+            // docs/contract-2026-08-11-review-session-ui-events.md #1 / internal
+            // annotation-everywhere §3 (M2): neutral/pen/rect/select, mirrored from
+            // ReviewSessionRecorder's toolModeState (host is authoritative -- see
+            // window.addEventListener('message', ...)'s akari-preview-set-review-recording case).
+            let reviewToolMode = 'neutral';
             let penModeActive = false;
+            let rectModeActive = false;
             let currentStroke = null;
+            let currentRect = null;
             let fadingStrokes = [];
             let sparkles = [];
             let lastStaticStrokePoints = null;
@@ -3836,6 +4621,37 @@ body { display: grid; place-items: center; padding: 32px; }
                 }
                 stroke.drawnIndex = Math.max(0, stroke.points.length - 1);
             };
+            // task.md 指示4: rect ツールの描画。pen と同じ platinum グラデーション/グロー質感を
+            // 矩形の輪郭に適用する（drawSegment の 4 辺版ではなく単純な strokeRect 2 パス -- pen ほど
+            // の視覚精度は不要で、コード量と回帰リスクを抑える判断。report.md に記載）。
+            const drawRectShape = (ctx, box) => {
+                const x = box[0] * penCanvasWidth;
+                const y = box[1] * penCanvasHeight;
+                const w = box[2] * penCanvasWidth;
+                const h = box[3] * penCanvasHeight;
+                ctx.save();
+                ctx.globalCompositeOperation = 'lighter';
+                ctx.globalAlpha = PEN_TUNING.glowAlpha;
+                ctx.strokeStyle = platinumGradient || '#eef2fb';
+                ctx.lineWidth = PEN_TUNING.coreWidthPx * 2.5;
+                ctx.strokeRect(x, y, w, h);
+                ctx.restore();
+                ctx.save();
+                ctx.globalAlpha = PEN_TUNING.coreAlpha;
+                ctx.strokeStyle = platinumGradient || '#eef2fb';
+                ctx.lineWidth = PEN_TUNING.coreWidthPx;
+                ctx.strokeRect(x, y, w, h);
+                ctx.restore();
+            };
+            const redrawRectFull = rect => {
+                rect.canvas.width = Math.max(1, Math.round(penCanvasWidth * penCanvasDpr));
+                rect.canvas.height = Math.max(1, Math.round(penCanvasHeight * penCanvasDpr));
+                rect.ctx.setTransform(penCanvasDpr, 0, 0, penCanvasDpr, 0, 0);
+                drawRectShape(rect.ctx, rect.box);
+            };
+            // fadingStrokes は完了済みの pen ストローク・rect の両方を保持する共有プール
+            // （フェードアウト演出を共通化するため）。kind タグで再描画方法だけ出し分ける。
+            const redrawFadingFull = item => (item.kind === 'rect' ? redrawRectFull(item) : redrawStrokeFull(item));
             const resizePenCanvases = () => {
                 const cssWidth = Math.max(1, Math.round(penLayer.clientWidth || 1));
                 const cssHeight = Math.max(1, Math.round(penLayer.clientHeight || 1));
@@ -3853,7 +4669,8 @@ body { display: grid; place-items: center; padding: 32px; }
                     for (const points of lastStaticStrokePoints) paintStaticStroke(points);
                 }
                 if (currentStroke) redrawStrokeFull(currentStroke);
-                for (const fading of fadingStrokes) redrawStrokeFull(fading);
+                if (currentRect) redrawRectFull(currentRect);
+                for (const fading of fadingStrokes) redrawFadingFull(fading);
                 recomposite();
             };
             const penFadeAlpha = (fading, timestamp) => {
@@ -3903,6 +4720,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 }
                 penCtx.globalAlpha = 1;
                 if (currentStroke) penCtx.drawImage(currentStroke.canvas, 0, 0, penCanvasWidth, penCanvasHeight);
+                if (currentRect) penCtx.drawImage(currentRect.canvas, 0, 0, penCanvasWidth, penCanvasHeight);
                 updateAndDrawSparkles(penCtx, timestamp || performance.now());
             };
             const drawPendingSegments = stroke => {
@@ -3919,7 +4737,8 @@ body { display: grid; place-items: center; padding: 32px; }
                 if (currentStroke) drawPendingSegments(currentStroke);
                 fadingStrokes = fadingStrokes.filter(fading => penFadeAlpha(fading, timestamp) > 0);
                 recomposite(timestamp);
-                const stillActive = currentStroke !== null || fadingStrokes.length > 0 || sparkles.length > 0;
+                const stillActive = currentStroke !== null || currentRect !== null
+                    || fadingStrokes.length > 0 || sparkles.length > 0;
                 penAnimationHandle = stillActive ? requestAnimationFrame(penTick) : 0;
             };
             const ensurePenLoopRunning = () => {
@@ -3935,12 +4754,31 @@ body { display: grid; place-items: center; padding: 32px; }
             const setPenModeActive = active => {
                 penModeActive = active === true && reviewRecordingActive && !isPlaying;
                 penToggle.setAttribute('aria-pressed', String(penModeActive));
-                penLayer.classList.toggle('is-active', penModeActive);
+                penLayer.classList.toggle('is-active', penModeActive || rectModeActive);
+            };
+            const setRectModeActive = active => {
+                rectModeActive = active === true && reviewRecordingActive && !isPlaying;
+                penLayer.classList.toggle('is-active', penModeActive || rectModeActive);
+            };
+            // ReviewSessionRecorder（host）が唯一の正本。ここはブロードキャストの反映と、
+            // 既存入口（pen-toggle）からの request の両方が通る単一の適用点。
+            const applyReviewToolMode = mode => {
+                reviewToolMode = mode;
+                setPenModeActive(mode === 'pen');
+                setRectModeActive(mode === 'rect');
             };
             const abortCurrentStroke = () => {
                 if (!currentStroke) return;
                 const pointerId = currentStroke.pointerId;
                 currentStroke = null;
+                if (penLayer.hasPointerCapture(pointerId)) {
+                    penLayer.releasePointerCapture(pointerId);
+                }
+            };
+            const abortCurrentRect = () => {
+                if (!currentRect) return;
+                const pointerId = currentRect.pointerId;
+                currentRect = null;
                 if (penLayer.hasPointerCapture(pointerId)) {
                     penLayer.releasePointerCapture(pointerId);
                 }
@@ -3963,7 +4801,7 @@ body { display: grid; place-items: center; padding: 32px; }
             };
             const createActiveStroke = (pointerId, firstPoint) => {
                 const bitmap = allocPenCanvas();
-                return { pointerId, points: [firstPoint], drawnIndex: 0, canvas: bitmap.canvas, ctx: bitmap.ctx };
+                return { kind: 'pen', pointerId, points: [firstPoint], drawnIndex: 0, canvas: bitmap.canvas, ctx: bitmap.ctx };
             };
             const showStaticAnnotationStrokes = strokeSets => {
                 clearStaticAnnotationStrokes();
@@ -3981,35 +4819,67 @@ body { display: grid; place-items: center; padding: 32px; }
                 recomposite();
             };
             const canDraw = () => penModeActive && reviewRecordingActive && !isPlaying;
-            penToggle.addEventListener('click', () => {
-                if (!reviewRecordingActive || isPlaying) return;
-                setPenModeActive(!penModeActive);
-            });
-            penLayer.addEventListener('pointerdown', event => {
-                if (!canDraw() || event.button !== 0 || currentStroke) return;
-                event.preventDefault();
-                clearStaticAnnotationStrokes();
-                penLayer.setPointerCapture(event.pointerId);
-                captureDrawRect();
-                const point = normalizedPenPoint(event);
+            const canDrawRect = () => rectModeActive && reviewRecordingActive && !isPlaying;
+            const currentFrame = () => {
                 const segment = segments[activeSegmentIndex];
-                const frame = {
+                return {
                     timelineT: outputTime,
                     sourceT: video.currentTime,
                     cutIndex: segment && segment.kind === 'src' && Number.isInteger(segment.cutIndex)
                         ? segment.cutIndex : null
                 };
-                currentStroke = createActiveStroke(event.pointerId, point);
-                window.akari.reviewStrokeStart(frame);
-                ensurePenLoopRunning();
+            };
+            // task.md 指示3: pen-toggle は既存の入口として残しつつ、実体は共有 toolMode への
+            // request に載せ替える（host が唯一の正本 -- 右パネルの選択/ペン/四角ボタンと同じ経路）。
+            // 楽観的にローカルへも即時反映し、host からのブロードキャストで再確認される。
+            penToggle.addEventListener('click', () => {
+                if (!reviewRecordingActive || isPlaying) return;
+                const nextMode = reviewToolMode === 'pen' ? 'neutral' : 'pen';
+                applyReviewToolMode(nextMode);
+                window.akari.reviewSetToolMode(nextMode);
+            });
+            penLayer.addEventListener('pointerdown', event => {
+                if (event.button !== 0) return;
+                if (canDraw() && !currentStroke) {
+                    event.preventDefault();
+                    clearStaticAnnotationStrokes();
+                    penLayer.setPointerCapture(event.pointerId);
+                    captureDrawRect();
+                    const point = normalizedPenPoint(event);
+                    currentStroke = createActiveStroke(event.pointerId, point);
+                    window.akari.reviewStrokeStart(currentFrame());
+                    ensurePenLoopRunning();
+                } else if (canDrawRect() && !currentRect) {
+                    event.preventDefault();
+                    clearStaticAnnotationStrokes();
+                    penLayer.setPointerCapture(event.pointerId);
+                    captureDrawRect();
+                    const point = normalizedPenPoint(event);
+                    const bitmap = allocPenCanvas();
+                    currentRect = {
+                        kind: 'rect', pointerId: event.pointerId, start: point,
+                        box: [point[0], point[1], 0, 0], canvas: bitmap.canvas, ctx: bitmap.ctx
+                    };
+                    window.akari.reviewRectStart(currentFrame());
+                    ensurePenLoopRunning();
+                }
             });
             penLayer.addEventListener('pointermove', event => {
-                if (!currentStroke || currentStroke.pointerId !== event.pointerId || !canDraw()) return;
-                event.preventDefault();
-                const coalesced = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : null;
-                const events = coalesced && coalesced.length > 0 ? coalesced : [event];
-                for (const raw of events) {
-                    currentStroke.points.push(normalizedPenPoint(raw));
+                if (currentStroke && currentStroke.pointerId === event.pointerId && canDraw()) {
+                    event.preventDefault();
+                    const coalesced = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : null;
+                    const events = coalesced && coalesced.length > 0 ? coalesced : [event];
+                    for (const raw of events) {
+                        currentStroke.points.push(normalizedPenPoint(raw));
+                    }
+                    return;
+                }
+                if (currentRect && currentRect.pointerId === event.pointerId && canDrawRect()) {
+                    event.preventDefault();
+                    const point = normalizedPenPoint(event);
+                    currentRect.box = normalizeRectFromPointsFn(currentRect.start, point);
+                    currentRect.ctx.clearRect(0, 0, currentRect.canvas.width, currentRect.canvas.height);
+                    drawRectShape(currentRect.ctx, currentRect.box);
                 }
             });
             const finishPenStroke = event => {
@@ -4026,8 +4896,30 @@ body { display: grid; place-items: center; padding: 32px; }
                 fadingStrokes.push(completed);
                 ensurePenLoopRunning();
             };
-            penLayer.addEventListener('pointerup', finishPenStroke);
-            penLayer.addEventListener('pointercancel', finishPenStroke);
+            const finishRect = event => {
+                if (!currentRect || currentRect.pointerId !== event.pointerId) return;
+                event.preventDefault();
+                const completed = currentRect;
+                currentRect = null;
+                if (penLayer.hasPointerCapture(event.pointerId)) {
+                    penLayer.releasePointerCapture(event.pointerId);
+                }
+                if (completed.box[2] <= 0 || completed.box[3] <= 0) return;
+                window.akari.reviewRectEnd(completed.box);
+                completed.fadeStartedAt = performance.now();
+                fadingStrokes.push(completed);
+                ensurePenLoopRunning();
+            };
+            // 既存のペン挙動どおり、pointercancel も pointerup と同じ finish 経路を通す
+            // （中断イベントでも 2 点以上あれば確定させる -- 元の finishPenStroke の挙動を維持）。
+            penLayer.addEventListener('pointerup', event => {
+                finishPenStroke(event);
+                finishRect(event);
+            });
+            penLayer.addEventListener('pointercancel', event => {
+                finishPenStroke(event);
+                finishRect(event);
+            });
             // Browser webviews cannot import packages/edit-lint/src/derive-tracks.mjs. Keep this
             // copy behavior-identical to that shared function: kind groups in fixed order, each
             // ref sorted ascending, followed by singleton captions/audio tracks.
@@ -4108,12 +5000,44 @@ body { display: grid; place-items: center; padding: 32px; }
                 if (typeof updateCutSelectBox === 'function') updateCutSelectBox();
             };
             const layerEntries = (Array.isArray(summary.layers) ? summary.layers : []).map((layer, index) => {
-                const layerVideo = document.createElement('video');
-                layerVideo.muted = true;
-                layerVideo.playsInline = true;
-                layerVideo.preload = 'auto';
+                // task 2026-08-10-image-layer-parity: layer.isImage はサーバ側（loadPreviewModel /
+                // isImageLayerSrc）が拡張子で確定済み（webview から見える src はストリーム URL で
+                // 元の拡張子を持たないことがあるため、ここで拡張子を再判定はしない）。
+                const layerIsImage = Boolean(layer.isImage);
+                const layerVideo = document.createElement(layerIsImage ? 'img' : 'video');
+                if (layerIsImage) {
+                    // ㉚ 画像レイヤー（司令塔裁定3）: <video> 固有の
+                    // videoWidth/videoHeight/readyState/paused/play/pause を <img> インスタンス自身に
+                    // 薄いファサードとして生やし、以降の配置・crop・アルファ実測・click 選択などの
+                    // 既存コード（video 用に書かれたレール）を無改修のまま乗せる。videoWidth/
+                    // videoHeight/readyState は都度評価する getter にする（ロード完了前後で値が
+                    // 変わる、video の同名プロパティと同じ性質）。
+                    Object.defineProperty(layerVideo, 'videoWidth', { get: () => layerVideo.naturalWidth });
+                    Object.defineProperty(layerVideo, 'videoHeight', { get: () => layerVideo.naturalHeight });
+                    Object.defineProperty(layerVideo, 'readyState', {
+                        get: () => (layerVideo.complete && layerVideo.naturalWidth > 0) ? 4 : 0
+                    });
+                    // 静止画に「再生中」は無い: renderLayers() の play()/pause() 呼び出しを無害な
+                    // no-op として吸収する（呼び出し側 = video 用の tick ロジックには手を入れない）。
+                    layerVideo.paused = true;
+                    layerVideo.play = () => Promise.resolve();
+                    layerVideo.pause = () => {};
+                    // video の 'loadedmetadata'（サイズ確定）と 'loadeddata'
+                    // （updateLayerSelectBox の再試行リスナー）を img の 'load' 1本から合成発火する。
+                    layerVideo.addEventListener('load', () => {
+                        layerVideo.dispatchEvent(new Event('loadedmetadata'));
+                        layerVideo.dispatchEvent(new Event('loadeddata'));
+                    });
+                } else {
+                    layerVideo.muted = true;
+                    layerVideo.playsInline = true;
+                    layerVideo.preload = 'auto';
+                    layerVideo.disablePictureInPicture = true;
+                }
                 layerVideo.tabIndex = -1;
-                layerVideo.disablePictureInPicture = true;
+                // アルファ実測（選択枠のコンテンツフィット・透明素通し）で canvas に描くため。
+                // ストリームサーバは Access-Control-Allow-Origin: * を返す
+                layerVideo.crossOrigin = 'anonymous';
                 layerVideo.dataset.akariLayerId = String(layer.id);
                 layerVideo.dataset.akariLayerIndex = String(index);
                 layerVideo.dataset.akariLayerKind = String(layer.kind);
@@ -4129,6 +5053,20 @@ body { display: grid; place-items: center; padding: 32px; }
                 layerVideo.dataset.akariTransformY = String(y);
                 layerVideo.dataset.akariTransformScale = String(scale);
                 layerVideo.dataset.akariTransformRotate = String(rotate);
+                const crop = layer.crop;
+                const cropW = crop && Number.isFinite(crop.w) && crop.w > 0 ? crop.w : 1;
+                const cropH = crop && Number.isFinite(crop.h) && crop.h > 0 ? crop.h : 1;
+                layerVideo.dataset.akariCropX = String(crop && Number.isFinite(crop.x) ? crop.x : 0);
+                layerVideo.dataset.akariCropY = String(crop && Number.isFinite(crop.y) ? crop.y : 0);
+                layerVideo.dataset.akariCropW = String(cropW);
+                layerVideo.dataset.akariCropH = String(cropH);
+                // ㉖ layers[].perspective（contract-2026-08-02-preview-parity.md §2.4.4）。absent/invalid
+                // (schema-invalid corners, etc.) is represented as an empty dataset value --
+                // updateStageScale's computeLayerPerspectiveVisualFn call already treats a falsy/
+                // unparseable value as "no perspective", so no separate validity flag is needed here.
+                const perspectiveCorners = layer.perspective && Array.isArray(layer.perspective.corners) ? layer.perspective.corners : null;
+                if (perspectiveCorners) layerVideo.dataset.akariPerspectiveCorners = JSON.stringify(perspectiveCorners);
+                else delete layerVideo.dataset.akariPerspectiveCorners;
                 const position = () => {
                     if (!(layerVideo.videoWidth > 0) || !(layerVideo.videoHeight > 0)) return;
                     if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
@@ -4151,6 +5089,23 @@ body { display: grid; place-items: center; padding: 32px; }
             // プレビュー内ドラッグ移動/リサイズ(=scale)/回転。確定(pointerup)時のみ layerWrite で
             // 書き戻す（既存 overlay ドラッグ編集と同じ確定タイミング）。
             let selectedLayerId = null;
+            // ㉔ クロップモード（2026-08-06 オーナー裁定: shell/Web 両面）。移動/リサイズ/回転と
+            // 操作が衝突しないための排他モード切替。選択が変わったら自動的に抜ける。
+            let cropModeActive = false;
+            const layerCropBox = document.getElementById('layer-crop-box');
+            const layerCropRect = layerCropBox.querySelector('.akari-layer-crop-rect');
+            const layerCropHandleElements = Array.from(layerCropBox.querySelectorAll('[data-akari-crop-handle]'));
+            const layerCropToggle = document.getElementById('layer-crop-toggle');
+            // ㉖ layers[].perspective（v0）: プリセット(右奥/左奥/上奥/下奥) + 角度ツマミのみ。4隅の
+            // 直接ドラッグハンドルは次段のため、クロップのようなハンドル/モードの仕組みは持たない。
+            let perspectivePanelOpen = false;
+            let activePerspectivePreset = null;
+            const layerPerspectiveToggle = document.getElementById('layer-perspective-toggle');
+            const layerPerspectivePanel = document.getElementById('layer-perspective-panel');
+            const layerPerspectivePresetButtons = Array.from(layerPerspectivePanel.querySelectorAll('[data-akari-perspective-preset]'));
+            const layerPerspectiveAngleInput = layerPerspectivePanel.querySelector('[data-akari-perspective-angle]');
+            const layerPerspectiveAngleValueEl = layerPerspectivePanel.querySelector('[data-akari-perspective-angle-value]');
+            const layerPerspectiveClearButton = layerPerspectivePanel.querySelector('[data-akari-perspective-clear]');
             const layerSelectBox = document.getElementById('layer-select-box');
             const layerHandleElements = Array.from(layerSelectBox.querySelectorAll('[data-akari-handle]'));
             const findLayerEntry = id => layerEntries.find(entry => String(entry.spec.id) === String(id));
@@ -4160,40 +5115,436 @@ body { display: grid; place-items: center; padding: 32px; }
                 scale: Number(entry.video.dataset.akariTransformScale) || 1,
                 rotate: Number(entry.video.dataset.akariTransformRotate) || 0
             });
+            // RAF スロットリング（2026-08-09 raf-throttle・オーナー実機フィードバック「サイズ変更が
+            // すごくもたつく」）: dataset への書き込みは常に同期（pointerup の確定読み取りが最新値を
+            // 読めるように）。重い方（updateLayerLayout = 全レイヤー + stage 再配置、と選択枠の再描画）
+            // だけを 1 フレーム 1 回へ間引く。ドラッグ終了直後は各 finish() 側で flush() して
+            // 最終値の反映を RAF 待ちにしない。
+            const layerTransformVisualThrottle = createRafThrottleFn(() => {
+                if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
+                updateLayerSelectBox();
+            });
             const applyLayerTransformNow = (entry, transform) => {
                 entry.video.dataset.akariTransformX = String(transform.x);
                 entry.video.dataset.akariTransformY = String(transform.y);
                 entry.video.dataset.akariTransformScale = String(transform.scale);
                 entry.video.dataset.akariTransformRotate = String(transform.rotate);
+                layerTransformVisualThrottle.call();
+            };
+            // ㉔ layers[].crop（0..1 正規化・ソースフレーム相対・静的）。CROP_MIN は空クロップ化を防ぐ
+            // 下限（ハンドルが操作不能になる縮退を避ける）。clampCrop は render-cut/src/layers.mjs の
+            // クランプと同じ意味論をプレビュー側で独立実装したもの（パリティ契約が明記する意図的な
+            // コード重複の方針に倣う — 2.2 節の描画既定などと同型）。
+            const CROP_MIN = 0.02;
+            const clampCrop = (x, y, w, h) => {
+                const cw = Math.min(1, Math.max(CROP_MIN, Number.isFinite(w) ? w : 1));
+                const ch = Math.min(1, Math.max(CROP_MIN, Number.isFinite(h) ? h : 1));
+                const cx = Math.min(1 - cw, Math.max(0, Number.isFinite(x) ? x : 0));
+                const cy = Math.min(1 - ch, Math.max(0, Number.isFinite(y) ? y : 0));
+                return { x: cx, y: cy, w: cw, h: ch };
+            };
+            const layerCropNow = entry => clampCrop(
+                Number(entry.video.dataset.akariCropX),
+                Number(entry.video.dataset.akariCropY),
+                Number(entry.video.dataset.akariCropW),
+                Number(entry.video.dataset.akariCropH)
+            );
+            // RAF スロットリング（2026-08-09 raf-throttle）: applyLayerTransformNow と同じ規律
+            // （dataset は同期・重い方だけ1フレーム1回）。crop 単独/crop+transform 一括のどちらも
+            // 同じ「レイヤーの見た目を測り直す」作業なので throttle インスタンスを共有する
+            // （同時に両方から呼ばれることはない = ドラッグは常に単一ジェスチャー）。
+            const layerCropVisualThrottle = createRafThrottleFn(() => {
                 if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
-                updateLayerSelectBox();
+                if (cropModeActive) updateLayerCropBox();
+                else updateLayerSelectBox();
+            });
+            const applyLayerCropNow = (entry, crop) => {
+                const c = clampCrop(crop.x, crop.y, crop.w, crop.h);
+                entry.video.dataset.akariCropX = String(c.x);
+                entry.video.dataset.akariCropY = String(c.y);
+                entry.video.dataset.akariCropW = String(c.w);
+                entry.video.dataset.akariCropH = String(c.h);
+                layerCropVisualThrottle.call();
+            };
+            // ㉗ クロップハンドル操作の錨補正（2026-08-06 crop-handle-anchor-fix）: crop と
+            // transform.x/y を同一フレームで一括更新する。crop 単独 → transform 単独の2段更新だと
+            // 中間フレームで一瞬だけ錨補正前の crop が画面に出てしまう（updateLayerLayout が
+            // 前者の呼び出し時点でまだ古い transform を使って描く）ため、必ずこちらを使う。
+            const applyLayerCropAndTransformNow = (entry, crop, transform) => {
+                const c = clampCrop(crop.x, crop.y, crop.w, crop.h);
+                entry.video.dataset.akariCropX = String(c.x);
+                entry.video.dataset.akariCropY = String(c.y);
+                entry.video.dataset.akariCropW = String(c.w);
+                entry.video.dataset.akariCropH = String(c.h);
+                entry.video.dataset.akariTransformX = String(transform.x);
+                entry.video.dataset.akariTransformY = String(transform.y);
+                entry.video.dataset.akariTransformScale = String(transform.scale);
+                entry.video.dataset.akariTransformRotate = String(transform.rotate);
+                layerCropVisualThrottle.call();
+            };
+            // ベイクテロップは全面サイズの透明動画なので、要素の箱で選択枠を描くと画面いっぱいに
+            // なり分かりにくい。現フレームのアルファを実測し、不透明領域（コンテンツ）へ枠を
+            // フィットさせ、透明部分のクリックは下へ素通しする。計測不能（CORS 等）時は従来挙動
+            const layerAlphaCanvasEl = document.createElement('canvas');
+            // 画面クライアント座標 → ソース動画のネイティブ px 座標への逆写像。pivot（回転・平行移動の
+            // 基準点、ソース px 空間）を外から渡せるようにし、通常のヒットテスト（pivot=クロップ中心 =
+            // 実際の合成基準点）とクロップモードの編集（pivot=全面中心 = 常に自分の中心で回る素直な
+            // 参照系）の両方から共有する。
+            const layerVideoPointForPivot = (entry, transform, pivotPx, clientX, clientY) => {
+                const p = window.akari.interaction && window.akari.interaction.stageLocalPoint
+                    ? window.akari.interaction.stageLocalPoint(clientX, clientY) : null;
+                if (!p) return null;
+                const outputWidth = Number(summary.output && summary.output.width) || 1280;
+                const outputHeight = Number(summary.output && summary.output.height) || 720;
+                const dx = p.x - (outputWidth / 2 + transform.x);
+                const dy = p.y - (outputHeight / 2 + transform.y);
+                const rad = -transform.rotate * Math.PI / 180;
+                const rx = dx * Math.cos(rad) - dy * Math.sin(rad);
+                const ry = dx * Math.sin(rad) + dy * Math.cos(rad);
+                return { x: rx / (transform.scale || 1) + pivotPx.x, y: ry / (transform.scale || 1) + pivotPx.y };
+            };
+            const layerVideoPointFor = (entry, clientX, clientY) => {
+                const t = layerTransformNow(entry);
+                const crop = layerCropNow(entry);
+                const pivotPx = {
+                    x: (crop.x + crop.w / 2) * entry.video.videoWidth,
+                    y: (crop.y + crop.h / 2) * entry.video.videoHeight
+                };
+                const point = layerVideoPointForPivot(entry, t, pivotPx, clientX, clientY);
+                if (!point) return null;
+                const { x: vx, y: vy } = point;
+                if (!(vx >= 0) || !(vy >= 0) || vx >= entry.video.videoWidth || vy >= entry.video.videoHeight) return null;
+                return { x: Math.floor(vx), y: Math.floor(vy) };
+            };
+            // 画面座標への正写像（layerVideoPointForPivot の逆）。videoRect はソース px 空間の矩形
+            // （全面フレーム or クロップ矩形）、pivotPx は回転・平行移動の基準点（同じくソース px）。
+            // updateLayerSelectBox（pivot=クロップ中心）とクロップモードの外枠/内枠描画
+            // （pivot=全面中心）の両方から共有する。
+            const layerScreenRectForVideoRect = (entry, transform, videoRect, pivotPx) => {
+                const frameRect = window.akari.computeOutputFrameRect();
+                const frameScale = window.akari.stageScale() || 1;
+                const outputWidth = Number(summary.output && summary.output.width) || 1280;
+                const outputHeight = Number(summary.output && summary.output.height) || 720;
+                const outputW = videoRect.w * transform.scale;
+                const outputH = videoRect.h * transform.scale;
+                const offX = (videoRect.x + videoRect.w / 2 - pivotPx.x) * transform.scale;
+                const offY = (videoRect.y + videoRect.h / 2 - pivotPx.y) * transform.scale;
+                const rad = transform.rotate * Math.PI / 180;
+                const rotOffX = offX * Math.cos(rad) - offY * Math.sin(rad);
+                const rotOffY = offX * Math.sin(rad) + offY * Math.cos(rad);
+                const outputCenterX = outputWidth / 2 + transform.x + rotOffX;
+                const outputCenterY = outputHeight / 2 + transform.y + rotOffY;
+                const screenW = outputW * frameScale;
+                const screenH = outputH * frameScale;
+                const screenCenterX = frameRect.x + outputCenterX * frameScale;
+                const screenCenterY = frameRect.y + outputCenterY * frameScale;
+                return { left: screenCenterX - screenW / 2, top: screenCenterY - screenH / 2, width: screenW, height: screenH, rotOffX, rotOffY };
+            };
+            const layerAlphaAtPoint = (entry, clientX, clientY) => {
+                try {
+                    if (!(entry.video.videoWidth > 0) || entry.video.readyState < 2) return 255;
+                    const vp = layerVideoPointFor(entry, clientX, clientY);
+                    if (!vp) return 0;
+                    layerAlphaCanvasEl.width = 1;
+                    layerAlphaCanvasEl.height = 1;
+                    const ctx = layerAlphaCanvasEl.getContext('2d', { willReadFrequently: true });
+                    ctx.clearRect(0, 0, 1, 1);
+                    ctx.drawImage(entry.video, vp.x, vp.y, 1, 1, 0, 0, 1, 1);
+                    return ctx.getImageData(0, 0, 1, 1).data[3];
+                } catch (_error) {
+                    return 255;
+                }
+            };
+            const measureLayerOpaqueBox = entry => {
+                try {
+                    const vw = entry.video.videoWidth;
+                    const vh = entry.video.videoHeight;
+                    if (!(vw > 0) || !(vh > 0) || entry.video.readyState < 2) return null;
+                    const shrink = Math.min(1, 320 / Math.max(vw, vh));
+                    const w = Math.max(1, Math.round(vw * shrink));
+                    const h = Math.max(1, Math.round(vh * shrink));
+                    layerAlphaCanvasEl.width = w;
+                    layerAlphaCanvasEl.height = h;
+                    const ctx = layerAlphaCanvasEl.getContext('2d', { willReadFrequently: true });
+                    ctx.clearRect(0, 0, w, h);
+                    ctx.drawImage(entry.video, 0, 0, w, h);
+                    const data = ctx.getImageData(0, 0, w, h).data;
+                    let minX = w, minY = h, maxX = -1, maxY = -1;
+                    for (let y = 0; y < h; y++) {
+                        for (let x = 0; x < w; x++) {
+                            if (data[(y * w + x) * 4 + 3] > 16) {
+                                if (x < minX) minX = x;
+                                if (x > maxX) maxX = x;
+                                if (y < minY) minY = y;
+                                if (y > maxY) maxY = y;
+                            }
+                        }
+                    }
+                    if (maxX < 0) return null;
+                    const sx = vw / w;
+                    const sy = vh / h;
+                    const pad = Math.max(4, sx * 1.5);
+                    return {
+                        x: Math.max(0, minX * sx - pad),
+                        y: Math.max(0, minY * sy - pad),
+                        w: Math.min(vw, (maxX - minX + 1) * sx + pad * 2),
+                        h: Math.min(vh, (maxY - minY + 1) * sy + pad * 2)
+                    };
+                } catch (_error) {
+                    return null;
+                }
             };
             const updateLayerSelectBox = () => {
                 const entry = selectedLayerId ? findLayerEntry(selectedLayerId) : undefined;
                 if (!entry || entry.video.style.display === 'none' || !(entry.video.videoWidth > 0)) {
                     layerSelectBox.classList.remove('is-active');
+                    positionLayerCropToggle(null);
+                    positionLayerPerspectiveToggle(null);
                     return;
                 }
-                const frameRect = window.akari.computeOutputFrameRect();
-                const frameScale = window.akari.stageScale() || 1;
-                const outputWidth = Number(summary.output && summary.output.width) || 1280;
-                const outputHeight = Number(summary.output && summary.output.height) || 720;
                 const transform = layerTransformNow(entry);
-                const outputW = entry.video.videoWidth * transform.scale;
-                const outputH = entry.video.videoHeight * transform.scale;
-                const outputCenterX = outputWidth / 2 + transform.x;
-                const outputCenterY = outputHeight / 2 + transform.y;
-                const screenW = outputW * frameScale;
-                const screenH = outputH * frameScale;
-                const screenCenterX = frameRect.x + outputCenterX * frameScale;
-                const screenCenterY = frameRect.y + outputCenterY * frameScale;
-                layerSelectBox.style.left = (screenCenterX - screenW / 2) + 'px';
-                layerSelectBox.style.top = (screenCenterY - screenH / 2) + 'px';
-                layerSelectBox.style.width = screenW + 'px';
-                layerSelectBox.style.height = screenH + 'px';
+                const crop = layerCropNow(entry);
+                // 枠は要素の箱ではなく不透明領域（コンテンツ）にフィットさせる（未計測なら計測）。
+                // フレーム未着で測れないうちは全面フォールバック枠を一瞬見せず、届いてから出す
+                if (entry.opaqueBox === undefined) {
+                    if (entry.video.readyState >= 2) {
+                        entry.opaqueBox = measureLayerOpaqueBox(entry);
+                    } else {
+                        layerSelectBox.classList.remove('is-active');
+                        entry.video.addEventListener('loadeddata', () => updateLayerSelectBox(), { once: true });
+                        return;
+                    }
+                }
+                const naturalBox = entry.opaqueBox || { x: 0, y: 0, w: entry.video.videoWidth, h: entry.video.videoHeight };
+                // ㉔ クロップ窓（ソース px 空間）と不透明領域の交差 = 実際に見えている範囲。交差が無い
+                // （クロップが不透明領域を完全に外した）場合はクロップ窓そのものへフォールバックする。
+                const cropBoxPx = {
+                    x: crop.x * entry.video.videoWidth,
+                    y: crop.y * entry.video.videoHeight,
+                    w: crop.w * entry.video.videoWidth,
+                    h: crop.h * entry.video.videoHeight
+                };
+                const ix0 = Math.max(naturalBox.x, cropBoxPx.x);
+                const iy0 = Math.max(naturalBox.y, cropBoxPx.y);
+                const ix1 = Math.min(naturalBox.x + naturalBox.w, cropBoxPx.x + cropBoxPx.w);
+                const iy1 = Math.min(naturalBox.y + naturalBox.h, cropBoxPx.y + cropBoxPx.h);
+                const cb = (ix1 > ix0 && iy1 > iy0) ? { x: ix0, y: iy0, w: ix1 - ix0, h: iy1 - iy0 } : cropBoxPx;
+                // ピボット（拡縮・回転の基準点）は実際の合成と同じくクロップ矩形の中心
+                // （render-cut は crop→scale→rotate→overlay の順で合成し、overlay の中心合わせは
+                // crop 後の frame 基準になるため — layers.mjs 参照）。
+                const pivotPx = {
+                    x: (crop.x + crop.w / 2) * entry.video.videoWidth,
+                    y: (crop.y + crop.h / 2) * entry.video.videoHeight
+                };
+                const box = layerScreenRectForVideoRect(entry, transform, cb, pivotPx);
+                layerSelectBox.style.left = box.left + 'px';
+                layerSelectBox.style.top = box.top + 'px';
+                layerSelectBox.style.width = box.width + 'px';
+                layerSelectBox.style.height = box.height + 'px';
                 layerSelectBox.style.transform = 'rotate(' + transform.rotate + 'deg)';
+                // ハンドルの拡縮・回転ピボット（= クロップ矩形の中心）を箱から逆算するためのオフセット
+                layerSelectBox.dataset.akariPivotOffX = String(box.rotOffX);
+                layerSelectBox.dataset.akariPivotOffY = String(box.rotOffY);
                 layerSelectBox.classList.add('is-active');
+                if (!cropModeActive) positionLayerCropToggle(box);
+                if (!cropModeActive) positionLayerPerspectiveToggle(box);
+                layerPerspectiveToggle.classList.toggle('is-declared', !!layerPerspectiveNow(entry));
             };
+            // クロップトグルボタンは通常枠/クロップ枠のどちらが出ていても常に同じ場所（右上角の外側）
+            // に留まり続ける（モード切替のたびに探し直させない）。box=null でレイヤー未選択として隠す。
+            const positionLayerCropToggle = box => {
+                if (!box) {
+                    layerCropToggle.classList.remove('is-target-active');
+                    return;
+                }
+                // 箱の上端が画面上端に近いと「箱の外側・上」が画面外へはみ出す。0 未満にはせず、
+                // 収まらないときは箱の内側上端へフォールバックする。
+                layerCropToggle.style.left = (box.left + box.width + 4) + 'px';
+                layerCropToggle.style.top = Math.max(4, box.top - 26) + 'px';
+                layerCropToggle.classList.add('is-target-active');
+            };
+            // クロップモードのオーバーレイ: 外枠はソースフレーム全体（クロップ無しなら見えていたはずの
+            // 範囲）、内枠が現在のクロップ窓。pivot は実合成と同じ「現在のクロップ矩形の中心」を使う
+            // （2026-08-06 crop-handle-anchor-fix 以前は全面中心固定の近似だったが、それだと錨補正
+            // 後の transform.x/y と噛み合わず外枠が編集中にドリフトして見えるため、実際の合成 pivot
+            // と統一した — layerScreenRectForVideoRect の呼び手（updateLayerSelectBox）と同型）。
+            const updateLayerCropBox = () => {
+                const entry = selectedLayerId ? findLayerEntry(selectedLayerId) : undefined;
+                if (!cropModeActive || !entry || entry.video.style.display === 'none' || !(entry.video.videoWidth > 0)) {
+                    layerCropBox.classList.remove('is-active');
+                    return;
+                }
+                const transform = layerTransformNow(entry);
+                const crop = layerCropNow(entry);
+                const vw = entry.video.videoWidth;
+                const vh = entry.video.videoHeight;
+                const pivotPx = { x: (crop.x + crop.w / 2) * vw, y: (crop.y + crop.h / 2) * vh };
+                const outer = layerScreenRectForVideoRect(entry, transform, { x: 0, y: 0, w: vw, h: vh }, pivotPx);
+                const inner = layerScreenRectForVideoRect(entry, transform, { x: crop.x * vw, y: crop.y * vh, w: crop.w * vw, h: crop.h * vh }, pivotPx);
+                layerCropBox.style.left = outer.left + 'px';
+                layerCropBox.style.top = outer.top + 'px';
+                layerCropBox.style.width = outer.width + 'px';
+                layerCropBox.style.height = outer.height + 'px';
+                layerCropBox.style.transform = 'rotate(' + transform.rotate + 'deg)';
+                layerCropRect.style.left = (inner.left - outer.left) + 'px';
+                layerCropRect.style.top = (inner.top - outer.top) + 'px';
+                layerCropRect.style.width = inner.width + 'px';
+                layerCropRect.style.height = inner.height + 'px';
+                layerCropBox.classList.add('is-active');
+                positionLayerCropToggle(outer);
+            };
+            const setCropMode = active => {
+                cropModeActive = !!(active && selectedLayerId);
+                // ㉖ クロップモードとパースパネルは排他（ハンドル/操作の衝突を避ける）。
+                if (cropModeActive && perspectivePanelOpen) setPerspectivePanelOpen(false);
+                layerCropToggle.classList.toggle('is-crop-mode', cropModeActive);
+                layerSelectBox.classList.toggle('akari-crop-mode-hide-handles', cropModeActive);
+                if (cropModeActive) {
+                    updateLayerCropBox();
+                } else {
+                    layerCropBox.classList.remove('is-active');
+                    updateLayerSelectBox();
+                }
+            };
+            // click ではなく pointerdown+pointerup（setPointerCapture 付き）で拾う — 再生中は毎フレーム
+            // positionLayerCropToggle が呼ばれてボタンが数 px 動くため、down/up の間にボタンが動くと
+            // click イベントの合成対象がズレて発火しなくなることがある（実マウス操作で再現・
+            // 実測確認済み）。ドラッグハンドルと同じ pointer capture 方式にして確実に拾う。
+            layerCropToggle.addEventListener('pointerdown', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                try { layerCropToggle.setPointerCapture(event.pointerId); } catch (_error) { /* not capturable */ }
+            });
+            layerCropToggle.addEventListener('pointerup', event => {
+                event.stopPropagation();
+                setCropMode(!cropModeActive);
+            });
+            window.addEventListener('keydown', event => {
+                if (event.key === 'Escape' && cropModeActive) setCropMode(false);
+            });
+            // ㉖ layers[].perspective（v0）: 常に同じ場所（クロップトグルの下）に留まるトグル + パネル。
+            // box=null でレイヤー未選択として隠す（クロップトグルと同じ規律）。
+            const positionLayerPerspectiveToggle = box => {
+                if (!box) {
+                    layerPerspectiveToggle.classList.remove('is-target-active');
+                    if (perspectivePanelOpen) setPerspectivePanelOpen(false);
+                    return;
+                }
+                layerPerspectiveToggle.style.left = (box.left + box.width + 4) + 'px';
+                layerPerspectiveToggle.style.top = Math.max(4, box.top - 26) + 26 + 4 + 'px';
+                layerPerspectiveToggle.classList.add('is-target-active');
+                if (perspectivePanelOpen) {
+                    layerPerspectivePanel.style.left = layerPerspectiveToggle.style.left;
+                    layerPerspectivePanel.style.top = (parseFloat(layerPerspectiveToggle.style.top) + 26 + 4) + 'px';
+                }
+            };
+            const layerPerspectiveNow = entry => {
+                const raw = entry.video.dataset.akariPerspectiveCorners;
+                if (!raw) return null;
+                try {
+                    const parsed = JSON.parse(raw);
+                    return Array.isArray(parsed) && parsed.length === 4 ? parsed : null;
+                } catch (_error) {
+                    return null;
+                }
+            };
+            const applyLayerPerspectiveNow = (entry, corners) => {
+                if (corners) entry.video.dataset.akariPerspectiveCorners = JSON.stringify(corners);
+                else delete entry.video.dataset.akariPerspectiveCorners;
+                layerPerspectiveToggle.classList.toggle('is-declared', !!corners);
+                if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
+            };
+            // プリセット→4隅の展開（v0）。SSOT は保存される4隅のみ — このツマミはオーサリング側の
+            // 便宜であり、schema には「プリセット」「角度」という概念自体は存在しない
+            // (contract-2026-08-02-preview-parity.md §2.4.4)。奥行き感は sin(角度) で圧縮量を決め、
+            // 該当する辺の中点方向へ両端点を寄せる（角度0=無変形、角度が大きいほど強い台形）。
+            const perspectivePresetCorners = (preset, angleDeg) => {
+                const compression = Math.max(0, Math.min(0.9, Math.sin((Number(angleDeg) || 0) * Math.PI / 180)));
+                const half = compression / 2;
+                if (preset === 'right') return [[0, 0], [1, half], [0, 1], [1, 1 - half]];
+                if (preset === 'left') return [[0, half], [1, 0], [0, 1 - half], [1, 1]];
+                if (preset === 'top') return [[half, 0], [1 - half, 0], [0, 1], [1, 1]];
+                if (preset === 'bottom') return [[0, 0], [1, 0], [half, 1], [1 - half, 1]];
+                return null;
+            };
+            const commitLayerPerspective = async (entry, corners) => {
+                const original = layerPerspectiveNow(entry);
+                applyLayerPerspectiveNow(entry, corners);
+                try {
+                    await window.akari.engine.layerWrite(entry.spec.id, { perspective: corners ? { corners } : null });
+                } catch (error) {
+                    console.warn('[akari-preview] layer perspective write rejected; reverting', error);
+                    applyLayerPerspectiveNow(entry, original);
+                }
+            };
+            const setPerspectivePanelOpen = open => {
+                perspectivePanelOpen = !!(open && selectedLayerId);
+                layerPerspectiveToggle.classList.toggle('is-panel-open', perspectivePanelOpen);
+                layerPerspectivePanel.classList.toggle('is-open', perspectivePanelOpen);
+                if (perspectivePanelOpen) {
+                    if (cropModeActive) setCropMode(false);
+                    updateLayerSelectBox();
+                }
+            };
+            layerPerspectiveToggle.addEventListener('pointerdown', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                try { layerPerspectiveToggle.setPointerCapture(event.pointerId); } catch (_error) { /* not capturable */ }
+            });
+            layerPerspectiveToggle.addEventListener('pointerup', event => {
+                event.stopPropagation();
+                setPerspectivePanelOpen(!perspectivePanelOpen);
+            });
+            for (const button of layerPerspectivePresetButtons) {
+                button.addEventListener('pointerdown', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    try { button.setPointerCapture(event.pointerId); } catch (_error) { /* not capturable */ }
+                });
+                button.addEventListener('pointerup', event => {
+                    event.stopPropagation();
+                    if (!selectedLayerId) return;
+                    const entry = findLayerEntry(selectedLayerId);
+                    if (!entry) return;
+                    const preset = button.getAttribute('data-akari-perspective-preset');
+                    activePerspectivePreset = preset;
+                    for (const other of layerPerspectivePresetButtons) other.classList.toggle('is-active', other === button);
+                    const corners = perspectivePresetCorners(preset, layerPerspectiveAngleInput.value);
+                    void commitLayerPerspective(entry, corners);
+                });
+            }
+            layerPerspectiveAngleInput.addEventListener('input', () => {
+                layerPerspectiveAngleValueEl.textContent = layerPerspectiveAngleInput.value + '°';
+                if (!activePerspectivePreset || !selectedLayerId) return;
+                const entry = findLayerEntry(selectedLayerId);
+                if (!entry) return;
+                // ライブプレビューのみ（書き戻しはしない） -- ドラッグ中に毎回 lint/書き込みを
+                // 往復させないため、既存の crop ハンドルと同じ「確定時のみ書き戻す」規律に倣う。
+                applyLayerPerspectiveNow(entry, perspectivePresetCorners(activePerspectivePreset, layerPerspectiveAngleInput.value));
+            });
+            layerPerspectiveAngleInput.addEventListener('change', () => {
+                if (!activePerspectivePreset || !selectedLayerId) return;
+                const entry = findLayerEntry(selectedLayerId);
+                if (!entry) return;
+                void commitLayerPerspective(entry, perspectivePresetCorners(activePerspectivePreset, layerPerspectiveAngleInput.value));
+            });
+            layerPerspectiveClearButton.addEventListener('pointerdown', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                try { layerPerspectiveClearButton.setPointerCapture(event.pointerId); } catch (_error) { /* not capturable */ }
+            });
+            layerPerspectiveClearButton.addEventListener('pointerup', event => {
+                event.stopPropagation();
+                if (!selectedLayerId) return;
+                const entry = findLayerEntry(selectedLayerId);
+                if (!entry) return;
+                activePerspectivePreset = null;
+                for (const button of layerPerspectivePresetButtons) button.classList.remove('is-active');
+                void commitLayerPerspective(entry, null);
+            });
+            window.addEventListener('keydown', event => {
+                if (event.key === 'Escape' && perspectivePanelOpen) setPerspectivePanelOpen(false);
+            });
             const selectLayer = (layerId, options) => {
                 const report = !options || options.report !== false;
                 const nextId = layerId && findLayerEntry(layerId) ? layerId : null;
@@ -4201,10 +5552,19 @@ body { display: grid; place-items: center; padding: 32px; }
                     updateLayerSelectBox();
                     return;
                 }
+                if (cropModeActive) setCropMode(false);
+                if (perspectivePanelOpen) setPerspectivePanelOpen(false);
+                activePerspectivePreset = null;
+                for (const button of layerPerspectivePresetButtons) button.classList.remove('is-active');
                 selectedLayerId = nextId;
                 // ㉓ 選択の排他制御: layer を選ぶと cut/caption 選択は外れる（逆方向はそれぞれの select 側）。
                 if (nextId && typeof deselectCut === 'function') deselectCut({ report: true });
                 if (nextId && typeof deselectCaption === 'function') deselectCaption({ report: true });
+                if (nextId) {
+                    const measured = findLayerEntry(nextId);
+                    // 選択時点のフレームで測り直す（updateLayerSelectBox が遅延計測する）
+                    if (measured) measured.opaqueBox = undefined;
+                }
                 updateLayerSelectBox();
                 if (report) window.akari.reportLayerSelection(selectedLayerId);
             };
@@ -4226,11 +5586,14 @@ body { display: grid; place-items: center; padding: 32px; }
             const layerOutputBoundsForTransform = (entry, transform) => {
                 const outputWidth = Number(summary.output && summary.output.width) || 1280;
                 const outputHeight = Number(summary.output && summary.output.height) || 720;
+                // ㉔ crop 適用中は見えている（=スナップ対象になるべき）footprint が cropW/cropH 分
+                // 小さいので、フルサイズではなくクロップ後の寸法で bounds を組む。
+                const crop = layerCropNow(entry);
                 return outputBoundsForCenteredBox(
                     outputWidth / 2 + transform.x,
                     outputHeight / 2 + transform.y,
-                    (entry.video.videoWidth || 0) * transform.scale,
-                    (entry.video.videoHeight || 0) * transform.scale
+                    (entry.video.videoWidth || 0) * crop.w * transform.scale,
+                    (entry.video.videoHeight || 0) * crop.h * transform.scale
                 );
             };
             // センターピボットの拡縮（layers[]・cut は共に中心固定で scale する）を、
@@ -4302,15 +5665,19 @@ body { display: grid; place-items: center; padding: 32px; }
                     cleanup();
                     if (cancelled) {
                         applyLayerTransformNow(entry, original);
+                        // ドラッグ終了時に最終値が必ず反映されるよう、次の RAF を待たず今すぐ描画する。
+                        layerTransformVisualThrottle.flush();
                         return;
                     }
                     if (!moved) return;
+                    layerTransformVisualThrottle.flush();
                     const finalTransform = layerTransformNow(entry);
                     try {
                         await window.akari.engine.layerWrite(entry.spec.id, { transform: finalTransform });
                     } catch (error) {
                         console.warn('[akari-preview] layer transform write rejected; reverting', error);
                         applyLayerTransformNow(entry, original);
+                        layerTransformVisualThrottle.flush();
                     }
                 };
                 const onUp = upEvent => {
@@ -4335,14 +5702,23 @@ body { display: grid; place-items: center; padding: 32px; }
             // interaction chrome, which would make the target a descendant), look for a layer
             // video underneath via elementsFromPoint.
             stage.addEventListener('pointerdown', event => {
-                if (event.button !== 0 || zoom > 1.05 || event.target !== stage) return;
+                // ㉔ クロップモード中は移動/選択切り替えと操作が衝突しないよう、選択中レイヤーの
+                // ボディドラッグを含め本編ステージの通常操作を止める（ハンドルは別要素なので
+                // このガードの影響を受けない）。
+                if (event.button !== 0 || zoom > 1.05 || event.target !== stage || cropModeActive) return;
                 // ㉓ #preview-video も #overlay-stage の裏に隠れる同じ事情のため、layer video と
                 // 同じ elementsFromPoint 委譲に相乗りする（実際の z-order は zForTrack() 経由で
                 // cuts/layers が混在し得るため、ヒットテスト順=画面上の重なり順をそのまま使う）。
                 const hit = document.elementsFromPoint(event.clientX, event.clientY)
-                    .find(candidate => candidate === video
-                        || (candidate.tagName === 'VIDEO' && candidate.dataset
-                            && candidate.dataset.akariLayerId && candidate.style.display !== 'none'));
+                    .find(candidate => {
+                        if (candidate === video) return true;
+                        if (!((candidate.tagName === 'VIDEO' || candidate.tagName === 'IMG') && candidate.dataset
+                            && candidate.dataset.akariLayerId && candidate.style.display !== 'none')) return false;
+                        // 全面サイズの透明動画（ベイクテロップ）は箱で当てると画面全部が当たりになる。
+                        // クリック地点のアルファを実測し、透明部分は下（別レイヤー / 本編）へ素通し
+                        const candidateEntry = findLayerEntry(candidate.dataset.akariLayerId);
+                        return !candidateEntry || layerAlphaAtPoint(candidateEntry, event.clientX, event.clientY) > 16;
+                    });
                 if (!hit) return;
                 if (hit === video) {
                     if (video.dataset.akariCutIndex === '' || video.dataset.akariCutIndex === undefined) return;
@@ -4419,12 +5795,20 @@ body { display: grid; place-items: center; padding: 32px; }
             });
             for (const handle of layerHandleElements) {
                 handle.addEventListener('pointerdown', event => {
-                    if (event.button !== 0 || !selectedLayerId) return;
+                    if (event.button !== 0 || !selectedLayerId || cropModeActive) return;
                     const entry = findLayerEntry(selectedLayerId);
                     if (!entry) return;
                     const kind = handle.getAttribute('data-akari-handle');
                     const boxRect = layerSelectBox.getBoundingClientRect();
-                    const center = { x: boxRect.left + boxRect.width / 2, y: boxRect.top + boxRect.height / 2 };
+                    // 枠はコンテンツにフィットしているが、拡縮・回転のピボットは transform モデルの
+                    // 中心 = ビデオ中心のまま。箱中心からピボットオフセット（出力 px）を引き戻す
+                    const pivotPerOutput = (window.akari.stageScale() || 1) * (typeof zoom === 'number' && zoom > 0 ? zoom : 1);
+                    const pivotOffX = (Number(layerSelectBox.dataset.akariPivotOffX) || 0) * pivotPerOutput;
+                    const pivotOffY = (Number(layerSelectBox.dataset.akariPivotOffY) || 0) * pivotPerOutput;
+                    const center = {
+                        x: boxRect.left + boxRect.width / 2 - pivotOffX,
+                        y: boxRect.top + boxRect.height / 2 - pivotOffY
+                    };
                     if (kind === 'rotate') {
                         const startAngle = Math.atan2(event.clientY - center.y, event.clientX - center.x) * 180 / Math.PI;
                         beginLayerTransformDrag(entry, event, (moveEvent, original) => {
@@ -4433,6 +5817,9 @@ body { display: grid; place-items: center; padding: 32px; }
                         });
                     } else {
                         const startDistance = Math.max(1, Math.hypot(event.clientX - center.x, event.clientY - center.y));
+                        // ㉔ crop 適用中は見えている自然サイズが cropW/cropH 分小さいので、bounds→scale の
+                        // 逆算（solveCenteredResizeSnap の naturalWidth/Height）もそれに合わせる。
+                        const crop = layerCropNow(entry);
                         let dragSnap = { x: null, y: null };
                         beginLayerTransformDrag(entry, event, (moveEvent, original) => {
                             const distance = Math.hypot(moveEvent.clientX - center.x, moveEvent.clientY - center.y);
@@ -4444,7 +5831,7 @@ body { display: grid; place-items: center; padding: 32px; }
                             } else {
                                 const bounds = layerOutputBoundsForTransform(entry, { ...original, scale: nextScale });
                                 const solved = solveCenteredResizeSnap(
-                                    bounds, entry.video.videoWidth || 0, entry.video.videoHeight || 0,
+                                    bounds, (entry.video.videoWidth || 0) * crop.w, (entry.video.videoHeight || 0) * crop.h,
                                     nextScale, dragSnap
                                 );
                                 nextScale = solved.scale;
@@ -4455,19 +5842,132 @@ body { display: grid; place-items: center; padding: 32px; }
                     }
                 });
             }
+            // ㉔ クロップモードの 8 方向ハンドル（n/ne/e/se/s/sw/w/nw）。対辺（動かさない側）を
+            // アンカーに固定し、ドラッグ中の点（ソースフレーム正規化座標）で動かした側の辺を
+            // 更新する — CapCut 等の切り抜きハンドルと同型の挙動。確定(pointerup)時のみ
+            // layerWrite({crop, transform}) で書き戻す（既存 transform ハンドルと同じ確定
+            // タイミング）。
+            // ㉗ 錨補正（2026-08-06 crop-handle-anchor-fix）: crop の中心が実際の配置基準点
+            // （layerScreenRectForVideoRect 参照）なので、crop 変更だけを書き戻すと基準点自体が
+            // 動いて絵全体がずれる。cropAnchorCorrectedTransformFn が「ドラッグした辺以外は画面上
+            // 不動」になる transform.x/y を返し、crop と同一 patch で書く（ドラッグ中のライブ表示も
+            // 同じ補正を適用 — 確定時だけだと commit 瞬間にジャンプする）。pointer→ソース座標の
+            // マッピング（computeNext 内の layerVideoPointForPivot 呼び出し）はドラッグ開始時点の
+            // startTransform を最後まで使い続ける（ライブ補正で変わる transform.x/y を混ぜない）ため、
+            // この錨補正の追加はハンドル自体の追従性に影響しない。
+            for (const handle of layerCropHandleElements) {
+                handle.addEventListener('pointerdown', event => {
+                    if (event.button !== 0 || !selectedLayerId || !cropModeActive) return;
+                    const entry = findLayerEntry(selectedLayerId);
+                    if (!entry || !(entry.video.videoWidth > 0)) return;
+                    const dir = handle.getAttribute('data-akari-crop-handle');
+                    const startTransform = layerTransformNow(entry);
+                    const pivotPx = { x: entry.video.videoWidth / 2, y: entry.video.videoHeight / 2 };
+                    const original = layerCropNow(entry);
+                    const anchorRight = original.x + original.w;
+                    const anchorBottom = original.y + original.h;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const pointerId = event.pointerId;
+                    const captureTarget = event.currentTarget;
+                    let moved = false;
+                    let cancelled = false;
+                    try { captureTarget.setPointerCapture(pointerId); } catch (_error) { /* not capturable */ }
+                    const cleanup = () => {
+                        window.removeEventListener('pointermove', onMove);
+                        window.removeEventListener('pointerup', onUp);
+                        window.removeEventListener('pointercancel', onUp);
+                        window.removeEventListener('keydown', onKeyDown, true);
+                        if (captureTarget.hasPointerCapture && captureTarget.hasPointerCapture(pointerId)) {
+                            captureTarget.releasePointerCapture(pointerId);
+                        }
+                    };
+                    const computeNext = moveEvent => {
+                        const point = layerVideoPointForPivot(entry, startTransform, pivotPx, moveEvent.clientX, moveEvent.clientY);
+                        if (!point) return original;
+                        const fx = point.x / entry.video.videoWidth;
+                        const fy = point.y / entry.video.videoHeight;
+                        let nextX = original.x;
+                        let nextY = original.y;
+                        let nextRight = anchorRight;
+                        let nextBottom = anchorBottom;
+                        if (dir.indexOf('w') >= 0) nextX = Math.min(fx, anchorRight - CROP_MIN);
+                        if (dir.indexOf('e') >= 0) nextRight = Math.max(fx, original.x + CROP_MIN);
+                        if (dir.indexOf('n') >= 0) nextY = Math.min(fy, anchorBottom - CROP_MIN);
+                        if (dir.indexOf('s') >= 0) nextBottom = Math.max(fy, original.y + CROP_MIN);
+                        return clampCrop(nextX, nextY, nextRight - nextX, nextBottom - nextY);
+                    };
+                    // cropAnchorCorrectedTransformFn は x/y のみを返す（scale/rotate は補正で
+                    // 動かさない）ため、書き戻し用の完全な transform には startTransform の
+                    // scale/rotate を必ずマージする（欠けると dataset に "undefined" が書かれ
+                    // NaN → 既定値 1/0 へフォールバックし、スケール/回転が消し飛ぶ）。
+                    const correctedTransformFor = nextCrop => ({
+                        ...startTransform,
+                        ...cropAnchorCorrectedTransformFn(
+                            original, nextCrop, startTransform, entry.video.videoWidth, entry.video.videoHeight
+                        )
+                    });
+                    const onMove = moveEvent => {
+                        if (moveEvent.pointerId !== pointerId) return;
+                        moved = true;
+                        const nextCrop = computeNext(moveEvent);
+                        applyLayerCropAndTransformNow(entry, nextCrop, correctedTransformFor(nextCrop));
+                    };
+                    const finish = async () => {
+                        cleanup();
+                        if (cancelled) {
+                            applyLayerCropAndTransformNow(entry, original, startTransform);
+                            // ドラッグ終了時に最終値が必ず反映されるよう、次の RAF を待たず今すぐ描画する。
+                            layerCropVisualThrottle.flush();
+                            return;
+                        }
+                        if (!moved) return;
+                        layerCropVisualThrottle.flush();
+                        const finalCrop = layerCropNow(entry);
+                        const finalTransform = layerTransformNow(entry);
+                        try {
+                            await window.akari.engine.layerWrite(entry.spec.id, { crop: finalCrop, transform: finalTransform });
+                        } catch (error) {
+                            console.warn('[akari-preview] layer crop write rejected; reverting', error);
+                            applyLayerCropAndTransformNow(entry, original, startTransform);
+                            layerCropVisualThrottle.flush();
+                        }
+                    };
+                    const onUp = upEvent => {
+                        if (upEvent.pointerId !== undefined && upEvent.pointerId !== pointerId) return;
+                        void finish();
+                    };
+                    const onKeyDown = keyEvent => {
+                        if (keyEvent.key !== 'Escape') return;
+                        cancelled = true;
+                        void finish();
+                    };
+                    window.addEventListener('pointermove', onMove);
+                    window.addEventListener('pointerup', onUp);
+                    window.addEventListener('pointercancel', onUp);
+                    window.addEventListener('keydown', onKeyDown, true);
+                });
+            }
+            new ResizeObserver(() => updateLayerCropBox()).observe(wrapper);
             wrapper.addEventListener('click', event => {
                 if (!selectedLayerId && !cutSelected) return;
                 if (event.target.closest
-                    && (event.target.closest('#layer-select-box') || event.target.closest('#cut-select-box'))) {
+                    && (event.target.closest('#layer-select-box') || event.target.closest('#cut-select-box')
+                        || event.target.closest('#layer-crop-box') || event.target.closest('#layer-crop-toggle')
+                        || event.target.closest('#layer-perspective-toggle') || event.target.closest('#layer-perspective-panel'))) {
                     return;
                 }
                 // A click that lands on the stage over a layer video/preview-video reports
                 // event.target as the stage itself (see the delegated pointerdown handler above),
                 // so re-check via elementsFromPoint rather than event.target.closest here.
                 const hitSelectable = document.elementsFromPoint(event.clientX, event.clientY)
-                    .some(candidate => candidate === video
-                        || (candidate.tagName === 'VIDEO' && candidate.dataset
-                            && candidate.dataset.akariLayerId && candidate.style.display !== 'none'));
+                    .some(candidate => {
+                        if (candidate === video) return true;
+                        if (!((candidate.tagName === 'VIDEO' || candidate.tagName === 'IMG') && candidate.dataset
+                            && candidate.dataset.akariLayerId && candidate.style.display !== 'none')) return false;
+                        const candidateEntry = findLayerEntry(candidate.dataset.akariLayerId);
+                        return !candidateEntry || layerAlphaAtPoint(candidateEntry, event.clientX, event.clientY) > 16;
+                    });
                 if (hitSelectable) return;
                 if (selectedLayerId) selectLayer(null);
                 if (cutSelected) deselectCut();
@@ -4490,14 +5990,18 @@ body { display: grid; place-items: center; padding: 32px; }
                 scale: Number(video.dataset.akariTransformScale) || 1,
                 rotate: Number(video.dataset.akariTransformRotate) || 0
             });
+            // RAF スロットリング（2026-08-09 raf-throttle）: layer 側と同じ規律。
+            const cutTransformVisualThrottle = createRafThrottleFn(() => {
+                if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
+                updateCutSelectBox();
+            });
             const applyCutTransformNow = transform => {
                 video.dataset.akariCutTransformActive = 'true';
                 video.dataset.akariTransformX = String(transform.x);
                 video.dataset.akariTransformY = String(transform.y);
                 video.dataset.akariTransformScale = String(transform.scale);
                 video.dataset.akariTransformRotate = String(transform.rotate);
-                if (window.akari.updateLayerLayout) window.akari.updateLayerLayout();
-                updateCutSelectBox();
+                cutTransformVisualThrottle.call();
             };
             const updateCutSelectBox = () => {
                 const hasCut = video.dataset.akariCutIndex !== '' && video.dataset.akariCutIndex !== undefined;
@@ -4578,12 +6082,16 @@ body { display: grid; place-items: center; padding: 32px; }
                     cleanup();
                     if (cancelled) {
                         applyCutTransformNow(original);
+                        // ドラッグ終了時に最終値が必ず反映されるよう、次の RAF を待たず今すぐ描画する。
+                        cutTransformVisualThrottle.flush();
                         return;
                     }
                     if (!moved) return;
+                    cutTransformVisualThrottle.flush();
                     const cutIndex = Number(video.dataset.akariCutIndex);
                     if (!Number.isInteger(cutIndex) || cutIndex < 0) {
                         applyCutTransformNow(original);
+                        cutTransformVisualThrottle.flush();
                         return;
                     }
                     const finalTransform = cutTransformNow();
@@ -4592,6 +6100,7 @@ body { display: grid; place-items: center; padding: 32px; }
                     } catch (error) {
                         console.warn('[akari-preview] cut transform write rejected; reverting', error);
                         applyCutTransformNow(original);
+                        cutTransformVisualThrottle.flush();
                     }
                 };
                 const onUp = upEvent => {
@@ -4696,7 +6205,7 @@ body { display: grid; place-items: center; padding: 32px; }
                     captionSelectBox.classList.remove('is-active');
                     return;
                 }
-                const caption = captions.find(candidate => candidate.id === selectedCaptionId);
+                const caption = captions.find(candidate => (candidate.sourceCueId || candidate.id) === selectedCaptionId);
                 if (!caption) {
                     selectedCaptionId = null;
                     captionSelectBox.classList.remove('is-active');
@@ -4724,11 +6233,12 @@ body { display: grid; place-items: center; padding: 32px; }
                 if (event.button !== 0) return;
                 const time = video.currentTime || 0;
                 // 字幕ウィンドウ判定は共有カーネル（webview-kernel.js / caption-window.ts）
-                const caption = window.AkariEditKernel.findActiveCaption(captions, time);
+                const resolvedTimeline = captions.some(candidate => candidate.resolvedTimeline);
+                const caption = window.AkariEditKernel.findActiveCaption(captions, resolvedTimeline ? outputTime : time);
                 if (!caption || !caption.id) return;
                 event.preventDefault();
                 event.stopPropagation();
-                selectCaption(caption.id);
+                selectCaption(caption.sourceCueId || caption.id);
                 const pointerId = event.pointerId;
                 const startClientX = event.clientX;
                 const startClientY = event.clientY;
@@ -4764,7 +6274,7 @@ body { display: grid; place-items: center; padding: 32px; }
                         return;
                     }
                     try {
-                        await window.akari.engine.captionWrite(caption.id, { zone: candidateZone });
+                        await window.akari.engine.captionWrite(caption.sourceCueId || caption.id, { zone: candidateZone });
                         selectedCaptionZone = candidateZone;
                     } catch (error) {
                         console.warn('[akari-preview] caption zone write rejected; reverting', error);
@@ -4837,7 +6347,11 @@ body { display: grid; place-items: center; padding: 32px; }
                         return {
                             ...segment,
                             transform: cut ? cut.transform : undefined,
-                            opacity: cut ? cut.opacity : undefined
+                            opacity: cut ? cut.opacity : undefined,
+                            // ㉕ cuts[].framing / cuts[].freeze（contract-2026-08-02-preview-parity.md）:
+                            // 同じ理由（写像には関与しない見た目/再生情報）で元 cuts から補う。
+                            framing: cut ? cut.framing : undefined,
+                            freeze: cut ? cut.freeze : undefined
                         };
                     });
                     transitionPlates = map.transitionPlates;
@@ -4881,6 +6395,26 @@ body { display: grid; place-items: center; padding: 32px; }
             const findSegmentForSource = sourceTime => segments.findIndex(
                 segment => segment.kind === 'src' && sourceTime >= segment.in && sourceTime < segment.out
             );
+            // v1 マルチソース（edit.json sources[] + cuts[].src）。id → ストリーム URL の表を
+            // ホストから受け取り、カットの継ぎ目でソースが変わるときだけ <video> を差し替える。
+            // v0 / 単一ソースの案件は表が 1 件なので一度も差し替えが起きない。
+            const videoSources = initial.videoSources || {};
+            let currentVideoSourceId = null;
+            for (const [id, url] of Object.entries(videoSources)) {
+                if (url === video.getAttribute('src')) currentVideoSourceId = id;
+            }
+            // 差し替えたときだけ true を返す（呼び出し側は false なら即座に続行する）
+            const applySegmentSource = (segment, onReady) => {
+                const nextId = segment && segment.src;
+                if (!nextId || nextId === currentVideoSourceId) return false;
+                const nextUrl = videoSources[nextId];
+                if (!nextUrl) return false;
+                currentVideoSourceId = nextId;
+                video.addEventListener('loadedmetadata', () => onReady(), { once: true });
+                video.src = nextUrl;
+                video.load();
+                return true;
+            };
             const clampSourceTime = (sourceTime, preferredIndex) => {
                 const preferred = segments[preferredIndex];
                 if (preferred && preferred.kind === 'src'
@@ -4915,8 +6449,39 @@ body { display: grid; place-items: center; padding: 32px; }
                     ended: false
                 };
             };
+            // segment.freeze / framing.keyframes[].t の座標系（カット内・速度適用後の再生秒）に
+            // 合わせる。gap セグメントには意味がないため 0 を返す（呼び出し側はどのみち framing/freeze
+            // が無いことを先にガードするが、defensive に安全な既定値を返しておく）。
+            const playedCutLocalSeconds = segment => {
+                if (!segment || segment.kind !== 'src') return 0;
+                const speed = Number.isFinite(segment.speed) && segment.speed > 0 ? segment.speed : 1;
+                return ((video.currentTime || 0) - segment.in) / speed;
+            };
+            // ㉕ cuts[].framing の毎フレーム反映。hostAdapterScript 側の updateStageScale が書く
+            // cut.transform（PIP 位置決め）部分を dataset.akariBaseTransform 経由で受け取り、その
+            // 手前（内側）に framing のズーム/クロップを合成する。framing 無しの既存プロジェクトは
+            // baseTransform をそのまま書くだけなので見た目・回帰は無い。
+            const applyCutFramingVisual = () => {
+                const segment = segments[activeSegmentIndex];
+                const framing = segment && segment.kind === 'src' ? segment.framing : null;
+                const visual = computeCutFramingVisualFn(framing, playedCutLocalSeconds(segment));
+                const baseTransform = video.dataset.akariBaseTransform || '';
+                if (visual) {
+                    video.style.transformOrigin = visual.transformOrigin;
+                    video.style.transform = (baseTransform ? baseTransform + ' ' : '') + visual.transform;
+                } else {
+                    video.style.transformOrigin = '';
+                    video.style.transform = baseTransform;
+                }
+            };
+            window.akari.applyCutFramingVisual = applyCutFramingVisual;
             const enterSegment = index => {
                 if (index < 0 || index >= segments.length) return;
+                // ㉕ フリーズホールドはセグメント（カット）が変わったら破棄する（seek 含む
+                // enterSegment 呼び出し全経路がここを通る）。古い holdSeconds タイマーが新しい
+                // セグメントの tick() を誤って早期 return させるのを防ぐ。
+                freezeHoldUntilMs = 0;
+                freezeHoldConsumedForSegmentIndex = null;
                 activeSegmentIndex = index;
                 const segment = segments[index];
                 if (segment.kind === 'gap') {
@@ -4940,17 +6505,26 @@ body { display: grid; place-items: center; padding: 32px; }
                 const segmentDuration = segment.outEnd - segment.outStart;
                 const withinSegment = clamp(outputTime - segment.outStart, 0, segmentDuration);
                 const target = segment.in + withinSegment * segment.speed;
-                if (Math.abs((video.currentTime || 0) - target) > 0.0005) {
-                    video.currentTime = target;
-                }
-                if (isPlaying && video.paused) {
-                    void video.play().catch(error => console.error('[akari-preview] playback failed', error));
+                const seekAndResume = () => {
+                    if (Math.abs((video.currentTime || 0) - target) > 0.0005) {
+                        video.currentTime = target;
+                    }
+                    if (isPlaying && video.paused) {
+                        void video.play().catch(error => console.error('[akari-preview] playback failed', error));
+                    }
+                };
+                // v1 マルチソース: このカットが別ソースを指しているならストリームを差し替える。
+                // 差し替え直後は readyState が 0 に戻り currentTime 代入が無視されるため、
+                // loadedmetadata を待ってからシークする（単一ソースでは分岐しない）
+                if (!applySegmentSource(segment, seekAndResume)) {
+                    seekAndResume();
                 }
             };
             const stopAtNaturalEnd = () => {
                 if (!isPlaying) return;
                 window.akari.reviewTransport({ type: 'pause', timelineT: outputTime });
                 isPlaying = false;
+                freezeHoldUntilMs = 0;
                 video.pause();
                 if (window.akari.previewAudio) window.akari.previewAudio.pause();
             };
@@ -5030,11 +6604,20 @@ body { display: grid; place-items: center; padding: 32px; }
                 }
             };
             const applyInitialPosition = () => {
-                if (initialPositionApplied) return;
+                // segments is only trustworthy once rebuildSegments() has run against a real
+                // video.duration (i.e. after 'loadedmetadata'). The overlay-mount Promise.all
+                // below can resolve *before* 'loadedmetadata' (fast for an empty/no-cuts
+                // summary), which used to rebuild an empty fallback segment list, let this
+                // function mark itself done against that empty list, and skip enterSegment(0)
+                // forever -- leaving #preview-video's visibility stuck at 'hidden' (set by the
+                // next tick()'s applyCutsMuteState(), which hides whenever there is no active
+                // segment) until the user presses play. Bail out without setting the flag so the
+                // *next* call (once segments is real) can still do the real work.
+                if (initialPositionApplied || segments.length === 0) return;
                 initialPositionApplied = true;
                 if (Number.isFinite(initial.initialSeekTime)) {
                     seekTimelineTime(initial.initialSeekTime);
-                } else if (segments.length > 0) {
+                } else {
                     outputTime = segments[0].outStart;
                     enterSegment(0);
                 }
@@ -5439,6 +7022,12 @@ body { display: grid; place-items: center; padding: 32px; }
                     + escapeCaptionHtml(word.text) + '</span>';
             };
             const renderCaptionToken = (word, rangeStart, style) => {
+                if (style === 'reveal-word') {
+                    const delay = formatCaptionSeconds(Math.max(0, word.start - rangeStart));
+                    return '<span class="akari-caption__tok akari-caption__tok--reveal-word"'
+                        + ' style="--akari-tok-delay: ' + delay + 's">'
+                        + escapeCaptionHtml(word.text) + '</span>';
+                }
                 const emphasis = findMatchingEmphasis(word);
                 // 語レベル演出は caption の karaoke/pop より該当 token だけ優先する。
                 if (emphasis) return renderEmphasisCaptionToken(word, rangeStart, emphasis);
@@ -5480,6 +7069,10 @@ body { display: grid; place-items: center; padding: 32px; }
                         + '.akari-caption__reveal-group{grid-area:1 / 1;display:flex;flex-direction:column;gap:var(--plate-gap,4px);opacity:0;animation:akari-caption-reveal var(--akari-reveal-dur,0.2s) var(--akari-reveal-delay,0s) linear both paused;}'
                         + '@keyframes akari-caption-reveal{0%{opacity:0;transform:translateY(0.18em);}12%{opacity:1;transform:translateY(0);}99.99%{opacity:1;transform:translateY(0);}100%{opacity:0;transform:translateY(0);}}'
                     : '';
+                const revealWordCss = style === 'reveal-word'
+                    ? '@keyframes akari-caption-reveal-word{0%{opacity:0;}100%{opacity:1;}}'
+                        + '.akari-caption__tok--reveal-word{animation:akari-caption-reveal-word 0.01s var(--akari-tok-delay,0s) linear both paused;}'
+                    : '';
                 const blockMode = caption.textStyle && caption.textStyle.background
                     && caption.textStyle.background.mode === 'block';
                 const plateMarkup = blockMode
@@ -5499,8 +7092,10 @@ body { display: grid; place-items: center; padding: 32px; }
                 return '<div class="akari-caption akari-caption--' + rootStyle + '">'
                     + '<style>'
                     + '.akari-caption{position:absolute;inset:0;pointer-events:none;color:var(--caption-color,#fff);'
-                    + '-webkit-text-stroke:var(--caption-stroke,0.14em rgba(0,0,0,.9));paint-order:stroke fill;text-shadow:var(--caption-text-shadow,0 2px 8px rgba(0,0,0,.35));'
-                    + 'font-family:"Noto Sans JP",sans-serif;font-size:var(--caption-font-size,38px);font-weight:700;line-height:1.42;text-align:center;}'
+                    + '-webkit-text-stroke:var(--caption-webkit-text-stroke,var(--caption-stroke,0.14em rgba(0,0,0,.9)));'
+                    + 'paint-order:var(--caption-paint-order,stroke fill);'
+                    + 'text-shadow:var(--caption-text-shadow,0 2px 8px rgba(0,0,0,.35));'
+                    + 'font-family:"AKARI Noto Sans JP","Noto Sans JP",sans-serif;font-size:var(--caption-font-size,38px);font-weight:700;line-height:1.42;text-align:center;}'
                     + '.akari-caption__plate{position:absolute;top:var(--caption-top,auto);left:var(--caption-left,0);right:var(--caption-right,0);bottom:var(--caption-bottom,7%);display:flex;flex-direction:column;justify-content:var(--caption-justify-content,flex-start);align-items:var(--caption-align-items,stretch);gap:var(--plate-gap,4px);}'
                     + '.akari-caption__line{width:max-content;max-width:var(--caption-line-max-width,92%);margin:var(--caption-line-margin,0 auto);padding:var(--plate-pad-y,0.08em) var(--plate-pad-x,0.42em);border-radius:var(--plate-radius,10px);background:var(--plate-bg,transparent);text-align:var(--caption-text-align,center);white-space:pre;}'
                     + blockCss
@@ -5509,11 +7104,19 @@ body { display: grid; place-items: center; padding: 32px; }
                     + '@keyframes akari-caption-pop{0%{transform:translateY(0) scale(1);}50%{transform:translateY(-0.08em) scale(1.12);}100%{transform:translateY(0) scale(1);}}'
                     + '.akari-caption__tok--karaoke{animation:akari-caption-karaoke-lit var(--akari-tok-dur,0.2s) var(--akari-tok-delay,0s) linear both paused;}'
                     + '.akari-caption__tok--pop{animation:akari-caption-pop 0.2s var(--akari-tok-delay,0s) ease-out both paused;}'
+                    + revealWordCss
                     + revealCss
                     + emphasisCss
                     + '</style><div class="akari-caption__plate">' + plateMarkup + '</div></div>';
             };
             const renderPlainCaptionFragment = caption => {
+                if (caption.resolvedTimeline) {
+                    return ${JSON.stringify(RESOLVED_SINGLE_LINE_FRAGMENT_OPEN)}
+                        + ${JSON.stringify(RESOLVED_SINGLE_LINE_CAPTION_CSS)}
+                        + ${JSON.stringify(RESOLVED_SINGLE_LINE_FRAGMENT_MIDDLE)}
+                        + escapeCaptionHtml(caption.text)
+                        + ${JSON.stringify(RESOLVED_SINGLE_LINE_FRAGMENT_CLOSE)};
+                }
                 // 焼き込みと同じ自然な区切り（句読点 → 空白 → 文節境界 → 文字上限）で折り返す
                 const lines = splitCaptionLines(caption.text || '', captionLineBudget);
                 const markup = lines.map(line => '<p class="akari-caption__line">'
@@ -5528,26 +7131,19 @@ body { display: grid; place-items: center; padding: 32px; }
                         + '.akari-caption__block .akari-caption__line{width:auto;max-width:none;margin:0;padding:0;border-radius:0;background:transparent;}'
                     : '';
                 return '<div class="akari-caption"><style>'
-                    + '.akari-caption{position:absolute;inset:0;pointer-events:none;color:var(--caption-color,#fff);-webkit-text-stroke:var(--caption-stroke,0.14em rgba(0,0,0,.9));paint-order:stroke fill;text-shadow:var(--caption-text-shadow,0 2px 8px rgba(0,0,0,.35));font-family:"Noto Sans JP",sans-serif;font-size:var(--caption-font-size,38px);font-weight:700;line-height:1.42;text-align:center;}'
+                    + '.akari-caption{position:absolute;inset:0;pointer-events:none;color:var(--caption-color,#fff);-webkit-text-stroke:var(--caption-webkit-text-stroke,var(--caption-stroke,0.14em rgba(0,0,0,.9)));paint-order:var(--caption-paint-order,stroke fill);text-shadow:var(--caption-text-shadow,0 2px 8px rgba(0,0,0,.35));font-family:"AKARI Noto Sans JP","Noto Sans JP",sans-serif;font-size:var(--caption-font-size,38px);font-weight:700;line-height:1.42;text-align:center;}'
                     + '.akari-caption__plate{position:absolute;top:var(--caption-top,auto);left:var(--caption-left,0);right:var(--caption-right,0);bottom:var(--caption-bottom,7%);display:flex;flex-direction:column;justify-content:var(--caption-justify-content,flex-start);align-items:var(--caption-align-items,stretch);gap:var(--plate-gap,4px);}'
                     + '.akari-caption__line{width:max-content;max-width:var(--caption-line-max-width,92%);margin:var(--caption-line-margin,0 auto);padding:var(--plate-pad-y,0.08em) var(--plate-pad-x,0.42em);border-radius:var(--plate-radius,10px);background:var(--plate-bg,transparent);text-align:var(--caption-text-align,center);white-space:pre;}'
                     + blockCss
                     + '</style><div class="akari-caption__plate">' + plateMarkup + '</div></div>';
             };
-            const captionStyleVariableNames = [
-                '--caption-color', '--caption-font-size', '--caption-text-shadow',
-                '--plate-bg', '--plate-radius', '--plate-block-bg', '--plate-block-radius',
-                '--caption-top', '--caption-bottom',
-                '--caption-left', '--caption-right', '--caption-justify-content',
-                '--caption-align-items', '--caption-line-margin', '--caption-line-max-width',
-                '--caption-text-align'
-            ];
+            const captionStyleVariableNames = ${JSON.stringify(RESOLVED_CAPTION_STYLE_VARIABLE_NAMES)};
             const applyCaptionStyleVars = caption => {
                 for (const name of captionStyleVariableNames) {
                     captionPlate.style.removeProperty(name);
                 }
-                const textStyleActive = Boolean(caption && caption.textStyle
-                    && Object.keys(caption.textStyle).length > 0);
+                const textStyleActive = Boolean(caption && ((caption.textStyle
+                    && Object.keys(caption.textStyle).length > 0) || caption.resolvedTimeline));
                 if (!textStyleActive) return;
                 const vars = caption.textStyleVars || {};
                 for (const [name, value] of Object.entries(vars)) {
@@ -5561,17 +7157,18 @@ body { display: grid; place-items: center; padding: 32px; }
             const renderCaption = () => {
                 const activeSegment = segments[activeSegmentIndex];
                 const time = video.currentTime || 0;
+                const resolvedTimeline = captions.some(candidate => candidate.resolvedTimeline);
                 // 字幕ウィンドウ判定は共有カーネル（webview-kernel.js / caption-window.ts）
                 const caption = (activeSegment && activeSegment.kind === 'gap')
                     ? null
-                    : (window.AkariEditKernel.findActiveCaption(captions, time) || null);
+                    : (window.AkariEditKernel.findActiveCaption(captions, resolvedTimeline ? outputTime : time) || null);
                 if (caption !== activeCaption) {
                     activeCaption = caption;
                     applyCaptionStyleVars(caption);
                     const hasEmphasis = Boolean(caption && Array.isArray(caption.words)
                         && caption.words.some(word => findMatchingEmphasis(word)));
-                    const hasTextStyle = Boolean(caption && caption.textStyle
-                        && Object.keys(caption.textStyle).length > 0);
+                    const hasTextStyle = Boolean(caption && ((caption.textStyle
+                        && Object.keys(caption.textStyle).length > 0) || caption.resolvedTimeline));
                     const hasCaptionWords = Boolean(caption && Array.isArray(caption.words)
                         && caption.words.length > 0);
                     // reveal（明示 + 縦長の複数行自動昇格）も word ベースの styled 経路で描く
@@ -5582,11 +7179,13 @@ body { display: grid; place-items: center; padding: 32px; }
                     styledCaptionActive = Boolean(caption
                         && (hasTextStyle || (hasCaptionWords
                             && ((caption.style === 'karaoke' || caption.style === 'pop')
+                                || caption.style === 'reveal-word'
                                 || hasEmphasis || wantsCaptionReveal))));
                     captionPlate.classList.toggle('akari-caption-host--styled', styledCaptionActive);
                     if (styledCaptionActive) {
                         const usesWords = hasCaptionWords
                             && ((caption.style === 'karaoke' || caption.style === 'pop')
+                                || caption.style === 'reveal-word'
                                 || hasEmphasis || wantsCaptionReveal);
                         captionPlate.innerHTML = usesWords
                             ? renderStyledCaptionFragment(caption)
@@ -5625,6 +7224,12 @@ body { display: grid; place-items: center; padding: 32px; }
                 transitionPlate.style.opacity = String(opacity);
             };
             const renderLayers = timelineTime => {
+                // ㉘ layers[].keyframes（contract-2026-08-09-transform-keyframes-v0.md）: dataset
+                // が変わっても DOM スタイルには自動反映されない（updateStageScale が dataset ->
+                // style を書く唯一の場所）ので、このフレームで実際に何か上書きしたときだけ最後に
+                // 1 回まとめて呼ぶ -- keyframes の無いプロジェクト（大多数）はここで一切コストが
+                // 増えない。
+                let anyKeyframeApplied = false;
                 for (const entry of layerEntries) {
                     const layer = entry.spec;
                     const layerVideo = entry.video;
@@ -5645,6 +7250,35 @@ body { display: grid; place-items: center; padding: 32px; }
                     }
                     layerVideo.style.display = 'block';
                     const localTime = clamp(timelineTime - layer.t, 0, layer.duration);
+                    if (Array.isArray(layer.keyframes) && layer.keyframes.length >= 2) {
+                        // computeLayerKeyframesVisualFn is a webview-injected copy (toString()
+                        // serialization) -- guarded the same way computeLayerPerspectiveVisualFn's
+                        // call in updateStageScale is, so a future injection regression degrades to
+                        // "keyframes not applied" instead of aborting the rest of this loop.
+                        try {
+                            const resolved = computeLayerKeyframesVisualFn(layer.keyframes, localTime);
+                            if (resolved) {
+                                if (resolved.transform) {
+                                    layerVideo.dataset.akariTransformX = String(resolved.transform.x);
+                                    layerVideo.dataset.akariTransformY = String(resolved.transform.y);
+                                    layerVideo.dataset.akariTransformScale = String(resolved.transform.scale);
+                                    layerVideo.dataset.akariTransformRotate = String(resolved.transform.rotate);
+                                }
+                                if (resolved.crop) {
+                                    layerVideo.dataset.akariCropX = String(resolved.crop.x);
+                                    layerVideo.dataset.akariCropY = String(resolved.crop.y);
+                                    layerVideo.dataset.akariCropW = String(resolved.crop.w);
+                                    layerVideo.dataset.akariCropH = String(resolved.crop.h);
+                                }
+                                if (resolved.perspective) {
+                                    layerVideo.dataset.akariPerspectiveCorners = JSON.stringify(resolved.perspective.corners);
+                                }
+                                if (resolved.transform || resolved.crop || resolved.perspective) anyKeyframeApplied = true;
+                            }
+                        } catch (error) {
+                            console.warn('[akari-preview] layer keyframes visual failed; rendering without them', layer.id, error);
+                        }
+                    }
                     const mediaEnd = Number.isFinite(layerVideo.duration) && layerVideo.duration > 0
                         ? Math.max(0, layerVideo.duration - 0.001)
                         : layer.duration;
@@ -5663,6 +7297,7 @@ body { display: grid; place-items: center; padding: 32px; }
                         void layerVideo.play().catch(() => undefined);
                     }
                 }
+                if (anyKeyframeApplied && window.akari.updateLayerLayout) window.akari.updateLayerLayout();
             };
             const applyCutsMuteState = () => {
                 const segment = segments[activeSegmentIndex];
@@ -5676,6 +7311,20 @@ body { display: grid; place-items: center; padding: 32px; }
                 video.style.visibility = !segment || segment.kind === 'gap' || cutsTrackHidden ? 'hidden' : '';
             };
             const tick = (immediatePlaybackTick = false) => {
+                // ㉕ cuts[].freeze の一時停止ホールド中（contract-2026-08-02-preview-parity.md
+                // §2.4.3 の近似実装 — 尺は伸ばさない）: video / previewAudio を実時間で
+                // 一時停止したまま outputTime を進めず、rAF の連鎖だけ生かしておく。
+                if (freezeHoldUntilMs > 0) {
+                    if (performance.now() < freezeHoldUntilMs) {
+                        applyCutsMuteState();
+                        return;
+                    }
+                    freezeHoldUntilMs = 0;
+                    if (isPlaying) {
+                        if (video.paused) void video.play().catch(error => console.error('[akari-preview] freeze hold の再開に失敗しました', error));
+                        if (window.akari.previewAudio) void window.akari.previewAudio.resume();
+                    }
+                }
                 const segment = segments[activeSegmentIndex];
                 if (segment && segment.kind === 'gap') {
                     if (isPlaying) {
@@ -5697,9 +7346,21 @@ body { display: grid; place-items: center; padding: 32px; }
                 } else if (segment) {
                     outputTime = sourceToTimeline(video.currentTime || 0, activeSegmentIndex);
                     applyKeepRangeBoundary();
+                    const activeSegment = segments[activeSegmentIndex];
+                    if (isPlaying && activeSegment && activeSegment.kind === 'src'
+                        && freezeHoldConsumedForSegmentIndex !== activeSegmentIndex) {
+                        const freezeCheck = checkCutFreezeCrossingFn(activeSegment.freeze, playedCutLocalSeconds(activeSegment));
+                        if (freezeCheck.shouldHold) {
+                            freezeHoldConsumedForSegmentIndex = activeSegmentIndex;
+                            freezeHoldUntilMs = performance.now() + freezeCheck.holdSeconds * 1000;
+                            video.pause();
+                            if (window.akari.previewAudio) window.akari.previewAudio.pause();
+                        }
+                    }
                 } else {
                     outputTime = video.currentTime || 0;
                 }
+                applyCutFramingVisual();
                 renderLayers(outputTime);
                 updateLayerSelectBox();
                 renderTransitionPlate(outputTime);
@@ -5810,13 +7471,39 @@ body { display: grid; place-items: center; padding: 32px; }
                 updateTransport();
                 tick(true);
             };
+            // task/2026-08-09-drop-hevc-proxy: showPlaybackError の直後、その動画で初めての
+            // MEDIA_ERR_DECODE(3) / MEDIA_ERR_SRC_NOT_SUPPORTED(4) のときだけ呼ぶ。ホスト側で
+            // 変換に成功すれば widget が丸ごとリロードされる（このスクリプト自体が入れ替わる）ので
+            // ここでは resolve 後の後始末をしない。失敗時だけ通常のエラー文言に戻す。
+            const attemptHevcFallback = errorCode => {
+                if (hevcFallbackRequested) return;
+                hevcFallbackRequested = true;
+                previewMessageText.textContent = '動画をそのまま再生できませんでした。互換用に変換しています…';
+                previewMessageReload.hidden = true;
+                window.akari.engine.resolveHevcFallback(errorCode).catch(() => {
+                    if (!playbackErrored) return;
+                    previewMessageText.textContent = '動画を再生できませんでした。再読み込みを試してください。';
+                    previewMessageReload.hidden = false;
+                });
+            };
             previewMessageReload.addEventListener('click', () => video.load());
             const togglePlayback = () => {
                 if (playToggle.disabled) return;
                 if (!isPlaying) {
                     abortCurrentStroke();
+                    abortCurrentRect();
                     isPlaying = true;
-                    setPenModeActive(false);
+                    // 描画系ツール（pen/rect）は一時停止中のみ有効 -- select はそのまま維持する
+                    // （select ツールは再生中もクリックへ intent を乗せる意味を持つため、mode 自体は
+                    // pen/rect のときだけ neutral へ戻して host にも伝える。penModeActive/
+                    // rectModeActive はどのモードでも isPlaying=true で false になるよう再計算する）。
+                    if (reviewToolMode === 'pen' || reviewToolMode === 'rect') {
+                        applyReviewToolMode('neutral');
+                        window.akari.reviewSetToolMode('neutral');
+                    } else {
+                        setPenModeActive(false);
+                        setRectModeActive(false);
+                    }
                     window.akari.reviewTransport({ type: 'play', timelineT: outputTime });
                     if (window.akari.previewAudio) void window.akari.previewAudio.resume();
                     const segment = segments[activeSegmentIndex];
@@ -5830,6 +7517,9 @@ body { display: grid; place-items: center; padding: 32px; }
                     startAnimation();
                 } else {
                     isPlaying = false;
+                    // ㉕ 手動一時停止はフリーズホールドを打ち切る（保留中タイマーを引きずったまま
+                    // 次の再開で誤って再一時停止しない — contract-2026-08-02-preview-parity.md §2.4.3）。
+                    freezeHoldUntilMs = 0;
                     window.akari.reviewTransport({ type: 'pause', timelineT: outputTime });
                     if (window.akari.previewAudio) window.akari.previewAudio.pause();
                     video.pause();
@@ -5974,6 +7664,12 @@ body { display: grid; place-items: center; padding: 32px; }
             }, { passive: false });
             wrapper.addEventListener('pointerdown', event => {
                 if (penModeActive || zoom <= 1.05 || event.button !== 0) return;
+                // ズーム中のパン開始判定は capture 段で wrapper 配下の pointerdown を無条件に
+                // 奪っていたため、audio-notice の × 等インタラクティブ操作系の上で押しても
+                // preventDefault() が click 合成を止めてしまい押せなくなっていた（実測: Chromium は
+                // pointerdown.preventDefault() を呼ぶと後続の click を合成しない）。パンは
+                // 動画面そのものへのドラッグに限定し、ボタン等の上では素通しする。
+                if (event.target.closest && event.target.closest('button, [role="button"], input, textarea, select, a[href]')) return;
                 event.preventDefault();
                 event.stopPropagation();
                 wrapper.setPointerCapture(event.pointerId);
@@ -6089,12 +7785,15 @@ body { display: grid; place-items: center; padding: 32px; }
                 if (isPlaying) startAnimation();
             });
             video.addEventListener('play', () => {
-                // 無音素材の検知は 1 ドキュメントにつき 1 回だけ。再生開始から 1.5 秒後、
-                // まだ再生中で webkitAudioDecodedByteCount が 0（対応ブラウザのみ）なら無音とみなす。
+                // 無音素材の検知は 1 ドキュメントにつき 1 回だけ。判定は ffprobe による
+                // ソースファイルの実測（initial.hasSourceAudio、node 側 probeAudioPresence）を
+                // 正とする — webkitAudioDecodedByteCount はこのアプリが同梱する
+                // Electron/Chromium では常に 0 のまま張り付き（実測確認済み）、実際に音声が
+                // 再生されているソースでも誤検出する。hasSourceAudio が null（ffprobe 不在・
+                // 失敗で未確定）のときは、確証が無いまま出すと偽陽性の原因になるため表示しない。
                 window.setTimeout(() => {
                     if (audioNoticeShown || video.paused || video.ended) return;
-                    if (!('webkitAudioDecodedByteCount' in video)) return;
-                    if (video.webkitAudioDecodedByteCount === 0) {
+                    if (initial.hasSourceAudio === false) {
                         audioNoticeShown = true;
                         audioNotice.hidden = false;
                     }
@@ -6155,7 +7854,15 @@ body { display: grid; place-items: center; padding: 32px; }
                 }
                 applyRequestedOverlaySelection();
             });
-            video.addEventListener('error', showPlaybackError);
+            video.addEventListener('error', () => {
+                showPlaybackError();
+                const errorCode = video.error ? video.error.code : 0;
+                // MediaError.MEDIA_ERR_DECODE = 3, MEDIA_ERR_SRC_NOT_SUPPORTED = 4 — 「宣言は
+                // probably/maybe だったが実際には再生できなかった」ケースだけフォールバックを試す。
+                if (errorCode === 3 || errorCode === 4) {
+                    attemptHevcFallback(errorCode);
+                }
+            });
             audioNoticeDismiss.addEventListener('click', () => {
                 audioNotice.hidden = true;
             });
@@ -6167,7 +7874,12 @@ body { display: grid; place-items: center; padding: 32px; }
                     penToggle.hidden = !reviewRecordingActive;
                     if (!reviewRecordingActive) {
                         abortCurrentStroke();
-                        setPenModeActive(false);
+                        abortCurrentRect();
+                        applyReviewToolMode('neutral');
+                    } else if (typeof message.mode === 'string') {
+                        // ReviewSessionRecorder（host）が唯一の正本 -- 右パネルの選択/ペン/四角
+                        // ボタンやキーボードショートカットで切り替わった mode をここで反映する。
+                        applyReviewToolMode(message.mode);
                     }
                     updateTransport();
                     return;
@@ -6271,8 +7983,9 @@ body { display: grid; place-items: center; padding: 32px; }
                         if (message.field !== 'opacity') video.dataset.akariCutTransformActive = 'true';
                         applyLiveField(video);
                     } else if (typeof message.target.id === 'string') {
+                        const layerIdSelector = CSS.escape(message.target.id);
                         const layerVideo = layersStage.querySelector(
-                            'video[data-akari-layer-id="' + CSS.escape(message.target.id) + '"]'
+                            'video[data-akari-layer-id="' + layerIdSelector + '"], img[data-akari-layer-id="' + layerIdSelector + '"]'
                         );
                         if (layerVideo) applyLiveField(layerVideo);
                     }
@@ -6298,7 +8011,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 subtree: true
             });
 
-            Promise.all([window.akari.runtime.mount(summary), sfxDurationsReady]).then(() => {
+            Promise.all([window.__akariCaptionFontReady, window.akari.runtime.mount(summary), sfxDurationsReady]).then(() => {
                 applyOverlayTracks();
                 stage.append(transitionPlate, captionPlate);
                 const indicators = Array.isArray(summary.indicators) ? summary.indicators : [];
@@ -6313,7 +8026,10 @@ body { display: grid; place-items: center; padding: 32px; }
                     const items = indicators.map(item => INDICATOR_GLOSSARY[item]
                         ? item + ' = ' + INDICATOR_GLOSSARY[item]
                         : item).join(' / ');
-                    indicatorPopup.textContent = 'プレビュー未対応（書き出し時のみ適用）: ' + items;
+                    // task/2026-08-10-preview-bug-sweep (B3): dropped the blanket
+                    // "（書き出し時のみ適用）" claim — it doesn't hold for every indicator (e.g. an
+                    // unsupported-glTF-extension 3D model fails at export too, not just preview).
+                    indicatorPopup.textContent = 'プレビュー未対応: ' + items;
                 }
                 rebuildSegments();
                 applyInitialPosition();
@@ -6367,8 +8083,11 @@ body { display: grid; place-items: center; padding: 32px; }
     protected async disposePreviewStreams(widget: PreviewWidgetMarker): Promise<void> {
         const assetIds = widget.akariPreviewAssetStreamIds ?? [];
         widget.akariPreviewAssetStreamIds = [];
+        const extraIds = widget.akariPreviewExtraStreamIds ?? [];
+        widget.akariPreviewExtraStreamIds = [];
         await Promise.all([
             this.disposeVideoStream(widget),
+            ...extraIds.map(id => this.disposeVideoStreamId(id)),
             this.disposeAssetStreams(assetIds)
         ]);
     }
@@ -6491,10 +8210,6 @@ body { display: grid; place-items: center; padding: 32px; }
             ? base.replace(/\.mov$/i, '.preview.webm')
             : `${base}.preview.webm`;
         return sourceUri.parent.resolve(proxyBase);
-    }
-
-    protected pathBase(value: string): string {
-        return value.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
     }
 
     protected hash(value: string): string {

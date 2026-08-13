@@ -1,4 +1,5 @@
 import URI from '@theia/core/lib/common/uri';
+import { ResolvedCaptionDisplayPayload } from '../common/akari-preview-protocol';
 
 export const PREVIEW_CAPTION_ZONES = [
     'top-left', 'top', 'top-right',
@@ -29,10 +30,12 @@ export interface PreviewCaption {
     start: number;
     end: number;
     text: string;
-    style?: 'karaoke' | 'pop';
+    style?: 'karaoke' | 'pop' | 'reveal' | 'reveal-word';
     words?: { start: number; end: number; text: string }[];
     textStyle?: PreviewCaptionTextStyle;
     textStyleVars?: Record<string, string>;
+    sourceCueId?: string;
+    resolvedTimeline?: boolean;
 }
 
 export function locatePreviewCaptions(editUri: URI | undefined, workspaceRoot: URI | undefined): URI | undefined {
@@ -70,6 +73,7 @@ export function parsePreviewCaptions(source: string): PreviewCaption[] {
             continue;
         }
         const style = candidate.style === 'karaoke' || candidate.style === 'pop'
+            || candidate.style === 'reveal' || candidate.style === 'reveal-word'
             ? candidate.style
             : undefined;
         const words = Array.isArray(candidate.words)
@@ -85,11 +89,19 @@ export function parsePreviewCaptions(source: string): PreviewCaption[] {
                     : [];
             })
             : [];
-        const captionTextStyle = candidate.text_style === undefined
+        // text_style は「見た目の上書き」であって字幕の本体ではない。読めない値でも
+        // 字幕そのものは既定スタイルで出す（消さない）。null は「指定なし」— スキーマ検証も
+        // 共有カーネル mergeCaptionTextStyles も render-cut も Web UI も null を既定扱いする。
+        // 旧実装は null / 不正値のとき caption ごと捨てており、カラオケ字幕が無言で消えていた。
+        const captionTextStyle = candidate.text_style === undefined || candidate.text_style === null
             ? undefined
             : normalizeTextStyle(candidate.text_style);
-        if (candidate.text_style !== undefined && captionTextStyle === undefined) {
-            continue;
+        if (candidate.text_style !== undefined && candidate.text_style !== null
+            && captionTextStyle === undefined) {
+            console.warn(
+                '[akari-preview] text_style を読み取れないため既定スタイルで表示します',
+                typeof id === 'string' ? id : '(id なし)'
+            );
         }
         const textStyle = mergeTextStyles(defaultTextStyle, captionTextStyle);
         captions.push({
@@ -106,6 +118,22 @@ export function parsePreviewCaptions(source: string): PreviewCaption[] {
         });
     }
     return captions;
+}
+
+export function parseResolvedPreviewCaptions(payload: ResolvedCaptionDisplayPayload): PreviewCaption[] {
+    if (payload?.schema !== 'caption-layout/v1' || !Array.isArray(payload.captions)) {
+        throw new Error('resolved caption payload is invalid');
+    }
+    return payload.captions.map(cue => ({
+        id: cue.id,
+        sourceCueId: cue.source_cue_id,
+        resolvedTimeline: true,
+        start: cue.start,
+        end: cue.end,
+        text: cue.text,
+        ...(cue.text_style ? { textStyle: normalizeTextStyle(cue.text_style) } : {}),
+        ...(cue.style_vars ? { textStyleVars: cue.style_vars } : {})
+    }));
 }
 
 export function captionTextStyleVars(style: PreviewCaptionTextStyle | undefined): Record<string, string> {

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -12,6 +14,15 @@ function run(exampleDir) {
   return spawnSync(process.execPath, [cliPath, join(exampleRoot, exampleDir, "edit.json")], {
     encoding: "utf8",
   });
+}
+
+function runPatchedExample(mutator) {
+  const directory = mkdtempSync(join(tmpdir(), "akari-edit-schema-"));
+  const value = JSON.parse(readFileSync(join(exampleRoot, "edit-v0-sample", "edit.json"), "utf8"));
+  mutator(value);
+  const path = join(directory, "edit.json");
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  return spawnSync(process.execPath, [cliPath, path], { encoding: "utf8" });
 }
 
 test("existing v0 sample passes unchanged (non-regression)", () => {
@@ -211,6 +222,25 @@ test("audio.master.denoise/loudnorm are validated", () => {
   );
 });
 
+test("output.encoding master/x264 and audio.master.true_peak_dbtp pass", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.output.encoding = { quality: "master", encoder: "x264" };
+    edit.audio = { master: { denoise: "std", loudnorm: -14, true_peak_dbtp: -1.7 } };
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("output.encoding and true_peak_dbtp closed enums/range fail", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.output.encoding = { quality: "lossless", encoder: "gpu" };
+    edit.audio = { master: { true_peak_dbtp: -9.1 } };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /output\.encoding\.quality/u);
+  assert.match(executed.stderr, /output\.encoding\.encoder/u);
+  assert.match(executed.stderr, /audio\.master\.true_peak_dbtp/u);
+});
+
 test("layers with a baked fx and a chroma-keyed video PinP passes", () => {
   const executed = run("edit-layers-valid");
   assert.equal(executed.status, 0, executed.stderr);
@@ -236,6 +266,191 @@ test("layers[].blend must be a known ffmpeg blend mode", () => {
   const executed = run("edit-layers-invalid-bad-blend");
   assert.equal(executed.status, 1, executed.stdout);
   assert.match(executed.stderr, /layers\[0\]\.blend は .*のいずれかである必要があります/);
+});
+
+test("layers[].crop with x+w>1 (out of the source frame) is rejected", () => {
+  const executed = run("edit-layers-invalid-crop-out-of-bounds");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.crop\.x \+ layers\[0\]\.crop\.w は 1 以下である必要があります/);
+});
+
+test("layers[].crop.w must be > 0 and <= 1", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        crop: { x: 0, y: 0, w: 0, h: 0.5 },
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.crop\.w は 0 より大きく 1 以下の有限数である必要があります/);
+});
+
+test("layers[].perspective.corners must have exactly 4 [x,y] pairs", () => {
+  const executed = run("edit-layers-invalid-perspective-wrong-corner-count");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /layers\[0\]\.perspective\.corners は \[TL,TR,BL,BR\] の 4 要素配列である必要があります/,
+  );
+});
+
+test("layers[].perspective.corners components must be within 0..1", () => {
+  const executed = run("edit-layers-invalid-perspective-out-of-range");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /layers\[0\]\.perspective\.corners\[1\] \(TR\)\.x は 0 から 1 の範囲の有限数である必要があります/,
+  );
+});
+
+test("layers[].perspective.corners rejects a degenerate (zero-area) quad", () => {
+  const executed = run("edit-layers-invalid-perspective-degenerate");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /layers\[0\]\.perspective\.corners は退化した四角形（面積がほぼ 0）であってはなりません/,
+  );
+});
+
+test("layers with a perspective corner-pin (combined with crop) passes", () => {
+  const executed = run("edit-layers-valid");
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.match(executed.stdout, /^OK: /);
+});
+
+test("layers[].keyframes: mixed transform/crop/perspective points (3 points, some partial) passes", () => {
+  const executed = run("edit-layers-keyframes-valid");
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.match(executed.stdout, /^OK: /);
+});
+
+test("layers[].keyframes must have at least 2 points", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [{ t: 0, transform: { scale: 1 } }],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.keyframes は 2 件以上の配列である必要があります/);
+});
+
+test("layers[].keyframes[].t must be ascending with no duplicates", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [
+          { t: 1, transform: { scale: 1 } },
+          { t: 1, transform: { scale: 1.5 } },
+        ],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.keyframes\[\]\.t は昇順かつ重複禁止です/);
+});
+
+test("layers[].keyframes[] rejects unknown keys", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [
+          { t: 0, transform: { scale: 1 } },
+          { t: 1, transform: { scale: 1.5 }, panSpeed: 3 },
+        ],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.keyframes\[1\] に未知のキーがあります: panSpeed/);
+});
+
+test("layers[].keyframes[].easing must be linear or ease-in-out", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [
+          { t: 0, transform: { scale: 1 } },
+          { t: 1, transform: { scale: 1.5 }, easing: "bounce" },
+        ],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /layers\[0\]\.keyframes\[1\]\.easing は linear\/ease-in-out のいずれかである必要があります/);
+});
+
+test("layers[].keyframes[].crop is validated with the same rules as the static layers[].crop", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [
+          { t: 0, crop: { x: 0, y: 0, w: 1, h: 1 } },
+          { t: 1, crop: { x: 0.8, y: 0, w: 0.5, h: 1 } },
+        ],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /layers\[0\]\.keyframes\[1\]\.crop\.x \+ layers\[0\]\.keyframes\[1\]\.crop\.w は 1 以下である必要があります/,
+  );
+});
+
+test("layers[].keyframes[].perspective rejects a degenerate quad, same as the static layers[].perspective", () => {
+  const executed = runPatchedExample((value) => {
+    value.layers = [
+      {
+        id: "pinp-guest",
+        t: 1,
+        duration: 2,
+        kind: "video",
+        src: "footage/guest.mp4",
+        keyframes: [
+          { t: 0, perspective: { corners: [[0, 0], [1, 0], [0, 1], [1, 1]] } },
+          { t: 1, perspective: { corners: [[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]] } },
+        ],
+      },
+    ];
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /layers\[0\]\.keyframes\[1\]\.perspective\.corners は退化した四角形（面積がほぼ 0）であってはなりません/,
+  );
 });
 
 test("beats (見せ場マーカー) v0: 3 items with mixed kinds and optional basis pass", () => {
@@ -409,6 +624,14 @@ test("cuts[].track must be a non-negative integer", () => {
   assert.match(executed.stderr, /cuts\[0\]\.track は 0 以上の整数である必要があります/);
 });
 
+// docs/contract-2026-08-12-still-image-cut-source-v0.md: mp4 と png ソースが cuts[] に混在する
+// v1 edit.json はスキーマ検証を素通りする（判定は拡張子のみで sourceV1 自体の形は変わらない）。
+test("v1 cuts mixing an mp4 and a still-image (png) source passes", () => {
+  const executed = run("edit-cuts-still-image-source-valid");
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.match(executed.stdout, /^OK: /);
+});
+
 for (const fixture of [
   "edit-cuts-transform-omitted-valid",
   "edit-cuts-transform-full-valid",
@@ -433,6 +656,36 @@ for (const [fixture, expectedError] of [
     assert.match(executed.stderr, expectedError);
   });
 }
+
+test("cuts[].fx (画面 FX の参照表・器): stacked entries across multiple cuts pass", () => {
+  const executed = run("edit-cuts-fx-valid");
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.match(executed.stdout, /^OK: /);
+});
+
+// 2026-08-11 撤去: v0 の 5 id（noise/particles/vignette/flare/color-overlay）はオーナー裁定で
+// 製品面から撤去され、id の enum は string へ緩和された（presets/fx/ の FX_BUILDERS に未登録の
+// id は render 側の警告 + no-op に委ねる — スキーマ層ではハードフェイルさせない）。
+test("cuts[].fx[].id accepts any non-empty string (unknown/unregistered ids are schema-valid)", () => {
+  const executed = run("edit-cuts-fx-unknown-id-valid");
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.match(executed.stdout, /^OK: /);
+});
+
+test("cuts[].fx[].intensity must stay within [0, 1]", () => {
+  const executed = run("edit-cuts-fx-intensity-out-of-range-invalid");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(
+    executed.stderr,
+    /cuts\[0\]\.fx\[0\]\.intensity は 0 から 1 の範囲の有限数である必要があります/,
+  );
+});
+
+test("cuts[].fx[] rejects unknown keys", () => {
+  const executed = run("edit-cuts-fx-unknown-key-invalid");
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /cuts\[0\]\.fx\[0\] に未知のキーがあります: seed/);
+});
 
 test("layers[].track must be a non-negative integer", () => {
   const executed = run("edit-layers-track-invalid");
@@ -487,4 +740,135 @@ test("timeline track refs must be non-negative integers", () => {
   assert.equal(executed.status, 1, executed.stdout);
   assert.match(executed.stderr, /timeline\.tracks\[0\]\.ref は 0 以上の整数である必要があります/);
   assert.match(executed.stderr, /timeline\.tracks\[1\]\.ref は 0 以上の整数である必要があります/);
+});
+
+// docs/contract-2026-07-22-render-basics.md #6 (cuts[].framing: static crop / scale keyframes).
+// edit-v0-sample's cuts[0] is { in: 5, out: 10 } (5s at the default speed 1x), reused via
+// runPatchedExample so these cases don't need their own fixture directories.
+
+test("cuts[].framing.crop (static, output-relative) passes", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { crop: { x: 0.25, y: 0.25, w: 0.5, h: 0.5 } };
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("cuts[].framing.keyframes: 2-point zoom passes", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { keyframes: [{ t: 0, scale: 1 }, { t: 5, scale: 2 }] };
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("cuts[].framing.keyframes: 3-point staged shrink with explicit cx/cy passes", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = {
+      keyframes: [
+        { t: 0, scale: 3, cx: 0.4, cy: 0.6 },
+        { t: 2, scale: 2, cx: 0.5, cy: 0.5 },
+        { t: 5, scale: 1 },
+      ],
+    };
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("cuts[].framing.crop must fit inside the canvas (x + w <= 1, y + h <= 1)", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { crop: { x: 0.6, y: 0.7, w: 0.5, h: 0.5 } };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.crop は x \+ w <= 1/);
+  assert.match(executed.stderr, /framing\.crop は y \+ h <= 1/);
+});
+
+test("cuts[].framing.crop rejects an unknown key", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { crop: { x: 0, y: 0, w: 1, h: 1, zoom: 2 } };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.crop に未知のキーがあります: zoom/);
+});
+
+test("cuts[].framing.keyframes requires at least 2 points", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { keyframes: [{ t: 0, scale: 1.5 }] };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.keyframes は 2 件以上の配列である必要があります/);
+});
+
+test("cuts[].framing.keyframes[].t must be strictly ascending (no duplicates, no reordering)", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { keyframes: [{ t: 2, scale: 1 }, { t: 2, scale: 2 }] };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.keyframes\[\]\.t は昇順かつ重複禁止です/);
+});
+
+test("cuts[].framing.keyframes[].scale must be a positive number", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { keyframes: [{ t: 0, scale: 0 }, { t: 5, scale: 1 }] };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.keyframes\[0\]\.scale は 0 より大きい有限数である必要があります/);
+});
+
+test("cuts[].framing.keyframes[].cx/cy must stay within [0, 1]", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].framing = { keyframes: [{ t: 0, scale: 1, cx: 1.5 }, { t: 5, scale: 2, cy: -0.1 }] };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /framing\.keyframes\[0\]\.cx は 0 から 1 の範囲の有限数である必要があります/);
+  assert.match(executed.stderr, /framing\.keyframes\[1\]\.cy は 0 から 1 の範囲の有限数である必要があります/);
+});
+
+// docs/contract-2026-07-22-render-basics.md #7 (cuts[].freeze). Same base cut (5s at speed 1x).
+
+test("cuts[].freeze passes when at_sec is within the cut's playable duration", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].freeze = { at_sec: 2, duration_sec: 1 };
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("cuts[].freeze: null is tolerated as equivalent to omitted", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].freeze = null;
+  });
+  assert.equal(executed.status, 0, executed.stderr);
+});
+
+test("cuts[].freeze.at_sec must be non-negative", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].freeze = { at_sec: -1, duration_sec: 1 };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /cuts\[0\]\.freeze\.at_sec は 0 以上の有限数である必要があります/);
+});
+
+test("cuts[].freeze.duration_sec must be greater than zero", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].freeze = { at_sec: 1, duration_sec: 0 };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /cuts\[0\]\.freeze\.duration_sec は 0 より大きい有限数である必要があります/);
+});
+
+test("cuts[].freeze.at_sec cannot exceed the cut's own playable duration (speed-adjusted)", () => {
+  const executed = runPatchedExample((edit) => {
+    // cuts[0] is { in: 5, out: 10, speed: 2 } -> playable duration (10-5)/2 = 2.5s.
+    edit.cuts[0].speed = 2;
+    edit.cuts[0].freeze = { at_sec: 3, duration_sec: 1 };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /cuts\[0\]\.freeze\.at_sec はカットの再生尺（2\.5秒）を超えられません/);
+});
+
+test("cuts[].freeze rejects an unknown key", () => {
+  const executed = runPatchedExample((edit) => {
+    edit.cuts[0].freeze = { at_sec: 1, duration_sec: 1, hold_audio: true };
+  });
+  assert.equal(executed.status, 1, executed.stdout);
+  assert.match(executed.stderr, /cuts\[0\]\.freeze に未知のキーがあります: hold_audio/);
 });

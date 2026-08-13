@@ -54,6 +54,13 @@ analyze-project を実行するよう促す（analyze-project 自身は edit-pla
 チャットでの提示 → 回答は [approvals-and-generation.md](approvals-and-generation.md) の
 Checkpoint 1（方針）として運用し、確定内容を `decision-log.md`（[decision_log](#decision_log) 節の慣行）へ追記する。
 
+Checkpoint 1 で semantic keep/drop と source occurrence 順を承認した後、会話の間を短くする必要が
+ある場合は [workflow.md](workflow.md) の cut candidate bridge を追加 review に使う。report は
+`analysis.json` の filler/trouble と、承認済み occurrence 内に完全包含された -35 dB / 0.45 秒以上の
+silence を提示する。候補は自動採用しない。特に `UI_WAIT_UNRESOLVED`、
+`INFORMATION_RETENTION_REVIEW`、`PARTIAL_EVENT_OCCURRENCE` を人間が確認し、画面 keyframe があっても
+操作待ち解決済みとは扱わない。語時刻が不完全な source は pause 検出自体を行わない。
+
 ## サムネイル案
 
 3 経路（実フレーム / Codex 生成 / 混成）の候補画像を作り、チャットで比較提示する。
@@ -102,11 +109,14 @@ Checkpoint 1（方針）として運用し、確定内容を `decision-log.md`�
 自社ライブラリ AKARI Sounds — [catalog/audio/INDEX.md](../../catalog/audio/INDEX.md)）:
 
 ```sh
-node packages/audio-library-setup/bin/suggest-bgm.mjs --tone <トーン> [--tone <トーン>] [--tempo ゆったり|標準|高速] [--json]
+node packages/audio-library-setup/bin/suggest-bgm.mjs --from-decision-log <プロジェクト>/decision-log.md [--json]
 ```
 
-- `--tone` は方針で確定した作品トーン（表現選定と同じ 8 語彙:
+- 方針で確定した作品トーン（表現選定と同じ 8 語彙:
   真面目/親しみ/高級感/勢い/かわいい/無機質/エモい/シネマ。複合トーンは複数指定）。
+  `decision-log.md` の最新の `(direction, tone)` 行から `--from-decision-log` でそのまま渡す。
+  一時的に人が上書きするときだけ `--tone <トーン>`（複数可）または
+  `--tempo ゆったり|標準|高速` を併記し、これらの明示指定を decision-log より優先する。
   出力の `path` はローカル実体（`~/.akari/assets/audio/akari-sounds-bgm/`）で、
   そのまま `audio.bgm.path` に書ける。**未導入（`akari sounds` 未実行）なら CLI が案内を出す** —
   その場合は導入を促すか、従来どおりの手動検索に切り替える
@@ -114,8 +124,28 @@ node packages/audio-library-setup/bin/suggest-bgm.mjs --tone <トーン> [--tone
   決める（自動提案の結果を無承認で `edit.json` に書かない）。提示には
   「suggest-bgm の第 N 候補（tone: ◯◯）」と根拠を書き、別の候補や手動選定へ逸脱するときは
   理由を 1 行残す
+- 耳検証済みの宣言データがある環境（宣言パック導入時、または `--declarations` /
+  env `AKARI_SOUNDS_DECLARATIONS`）では、該当トラックが優先表示され、**サビ頭出し
+  （`audio.bgm.in` にそのまま書ける推奨秒）**・実測 BPM・曲構成（intro/サビ/outro）付きで
+  提案される。サビから敷きたい・見せ場に合わせたい場面ではこの値を使う
+  - 宣言がまだ無い曲でユーザーが「サビから敷きたい」と言ったときは、
+    [declare-audio](../declare-audio/SKILL.md) で自分で付けられることを案内する
+    （画面で 1 曲 1〜2 分。付けた宣言は以後の提案すべてに効く）
 - AKARI Sounds に合う系統が無い（該当なし・トーンが特殊）ときだけ、従来のスコープ層検索と
   外部補完（`catalog/audio/` の SFX 補完・候補リスト）へ広げる
+
+**効果音・ジングルの「あれば提案」は「場面の意味」から引く**（BGM の tone と違い、SFX は
+イベント級。語彙は 14 語固定 — 一覧は `--list`）:
+
+```sh
+node packages/audio-library-setup/bin/suggest-sfx.mjs --meaning 場面転換 [--json]
+```
+
+- 候補順がそのまま優先順（宣言表 `shared/sfx-suggest.mjs` の `MEANING_RULES`）。AKARI Sounds に
+  無い意味（拍手・失敗音の日本のお約束・和太鼓）は外部補完（`catalog/audio/` の存続エントリ）へ
+  正直に落ち、取得済みかどうかも表示される。行を発明せず、無い意味は最も近い行を借りて根拠に書く
+- 出力の `duration_sec` は発火タイミング設計（[beat-sync.md](beat-sync.md)）の入力である。
+  採用は同じく Checkpoint 2 の承認で決める
 
 候補が見つからないことを「あれば提案」と記録しない。BGM と SFX は `audio`、ナレーションは `audio.narration[]`、動画 B ロールは v1 の `sources[]` + `cuts[].src` へ格納できる（[execution.md](execution.md) §1）。公開契約のどのフィールドでも表せない演出だけ、計画上の採用と `edit.json` への格納可否を分けて提示する。単一中間マスターへ焼き込む場合は実行承認の対象にする。
 
@@ -128,6 +158,19 @@ node packages/audio-library-setup/bin/suggest-bgm.mjs --tone <トーン> [--tone
 `(category, subject)` を判断対象のキーとして、時刻順に追記する。各行に ISO 8601 日時、category、subject、決定、理由、決定者、関連 checkpoint を持たせる。同じキーの方針が変わっても過去行を直さず、新しい行を追加して以前の決定を参照する。
 
 **置き場所**（2026-07-22 改訂）: 固定 6 章 HTML の 1 節として埋め込む運用は retired。プロジェクト直下の独立ファイル `decision-log.md` に追記する（[analyze-project の decision-record.md](../analyze-project/decision-record.md) と共有する単一 SSOT — analyze-project の 2 パス目判断・取材 Q&A と、edit-plan の承認・生成判断が同じファイルへ時系列に積み重なる）。フィールド構成・追記専用の規律はここで変えていない。
+
+### 機械可読の方針行
+
+`(category, subject) = (direction, tone)` の行だけは、決定セルの先頭にインラインコード 1 個で
+JSON を置く。`tone` は表現選定と共通の 8 語彙から 1 個以上の配列、`tempo` は任意で
+`ゆったり` / `標準` / `高速` のいずれかとする。JSON の後ろには空白区切りで自由記述の補足を
+続けてよい。同じキーを更新するときも過去行は変えず、最後に追記した行を有効とする。
+
+```markdown
+| 日時 | category | subject | 決定 | 理由 | 決定者 | 関連 checkpoint |
+|---|---|---|---|---|---|---|
+| 2026-08-05T10:00:00+09:00 | direction | tone | `{"tone":["勢い"],"tempo":"高速"}` テンポ感を出したい | 冒頭で視聴者を引き込むため | オーナー | Checkpoint 1 |
+```
 
 次を決定として記録する。
 

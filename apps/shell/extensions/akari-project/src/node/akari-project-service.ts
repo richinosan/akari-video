@@ -2,12 +2,15 @@ import { injectable } from '@theia/core/shared/inversify';
 import URI from '@theia/core/lib/common/uri';
 import { execFile, spawn } from 'child_process';
 import { createHash } from 'crypto';
-import { constants, promises as fs, watch } from 'fs';
+import { constants, Dirent, existsSync, promises as fs, watch } from 'fs';
 import { basename, dirname, extname, join, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { promisify } from 'util';
 import {
     AkariProjectService,
+    AssetCatalogView,
+    AssetCatalogViewItem,
+    AssetResolveOutcome,
     DiffPreparationResult,
     DiffResourcePair,
     DroppedAsset,
@@ -17,10 +20,25 @@ import {
     DroppedVideoImportResult,
     EditLintOutcome,
     MaterialThumbnailOutcome,
-    ProjectGitEligibility
+    ProjectGitEligibility,
+    StoreConnectionStatus,
+    StoreDevicePollOutcome,
+    StoreDevicePollRequest,
+    StoreDeviceStartOutcome
 } from '../common/akari-project-protocol';
 import { deriveThumbnailCacheKey, thumbnailCacheFileName } from './thumbnail-cache';
 import { CATALOG_ROOT_UPWARD_MAX_DEPTH, resolveUpwardCatalogRoot } from './catalog-root-search';
+import { assetResolverSrcCandidates, editLintCliCandidates } from './packaged-tool-candidates';
+import { CATALOG_CATEGORIES, parseCatalogItemMeta } from '../common/catalog-reader';
+import { deriveAssetDistribution, mergeAssetCatalogViews, ResolverRawCatalogItem, selectResolverAudioFileRef, toResolverAssetCatalogViewItem } from '../common/asset-catalog-view';
+import { CatalogPack, parseCatalogPacksFile } from '../common/catalog-packs';
+import { resolveResolverPreviewUrl } from './resolver-preview-url';
+import {
+    pollDeviceConnection,
+    readCredentials,
+    removeCredentials,
+    startDeviceConnection
+} from 'akari-video/src/store-device-connect.mjs';
 
 const execFileAsync = promisify(execFile);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
@@ -76,6 +94,56 @@ export class AkariProjectServiceImpl implements AkariProjectService {
     /** Overridable for tests: lets the win32-only junction fallback be exercised from mac. */
     protected readonly platform: NodeJS.Platform = process.platform;
 
+    async getStoreConnectionStatus(): Promise<StoreConnectionStatus> {
+        return this.toStoreConnectionStatus(readCredentials());
+    }
+
+    async startStoreDeviceConnection(): Promise<StoreDeviceStartOutcome> {
+        const result = await startDeviceConnection();
+        if (result.status !== 'started') {
+            return { status: result.status, error: result.error };
+        }
+        return {
+            status: 'started',
+            baseUrl: result.baseUrl,
+            deviceCode: result.deviceCode,
+            userCode: result.userCode,
+            verificationUrl: result.verificationUrl,
+            intervalMs: result.intervalMs,
+            expiresAt: result.expiresAt
+        };
+    }
+
+    async pollStoreDeviceConnection(request: StoreDevicePollRequest): Promise<StoreDevicePollOutcome> {
+        const result = await pollDeviceConnection({
+            baseUrl: request.baseUrl,
+            deviceCode: request.deviceCode
+        });
+        if (result.status === 'approved') {
+            return { status: 'approved', connection: this.toStoreConnectionStatus(result.credentials) };
+        }
+        if (result.status === 'network-error' || result.status === 'error') {
+            return { status: result.status, error: result.error };
+        }
+        return { status: result.status };
+    }
+
+    async disconnectStoreAccount(): Promise<boolean> {
+        return removeCredentials();
+    }
+
+    protected toStoreConnectionStatus(credentials: { email?: string; url?: string } | null): StoreConnectionStatus {
+        if (!credentials?.url) {
+            return { connected: false };
+        }
+        return {
+            connected: true,
+            identifier: credentials.email || credentials.url,
+            email: credentials.email,
+            url: credentials.url
+        };
+    }
+
     async createProject(destinationUri: string): Promise<void> {
         const root = this.fsPath(destinationUri);
         await fs.mkdir(root, { recursive: true });
@@ -94,9 +162,13 @@ export class AkariProjectServiceImpl implements AkariProjectService {
         }
         await this.installProjectSkills(root);
         await this.ensureRuntimeDirectories(root);
-        await this.runGit(root, ['init']);
-        await this.runGit(root, ['add', '-A', '--', '.']);
-        await this.commitIfChanged(root, 'プロジェクトを作成');
+        try {
+            await this.runGit(root, ['init']);
+            await this.runGit(root, ['add', '-A', '--', '.']);
+            await this.commitIfChanged(root, 'プロジェクトを作成');
+        } catch (error) {
+            console.warn('[akari-project] initial git init failed:', error);
+        }
         await this.watchProject(destinationUri);
     }
 
@@ -172,6 +244,288 @@ export class AkariProjectServiceImpl implements AkariProjectService {
         } catch {
             return false;
         }
+    }
+
+    // --- カタログ「1 ビュー」（resolver 合成 + ローカル catalog/ のマージ） ---------------
+
+    /**
+     * getAssetCatalogView の本体。resolver 合成分（packages/asset-resolver）と
+     * ローカル catalog/ 分を並行取得し、`${category}/${id}` で重複排除する
+     * （resolver 側優先。同じ id をローカル catalog/ と resolver 側の両方に置くのは
+     * 移行期のみの想定だが、片方だけでも壊れないよう両方に対応する）。
+     * resolver 側が到達不能でも例外にせず空配列へフォールバックする（fail-soft — ローカル
+     * catalog/ の表示は resolver の可用性に引きずられない）。取得状態自体は `resolver`
+     * フィールドで返す — フロントはこれを見て「未取得（オフライン等）」と
+     * 「取得できたが 0 件」を区別する（catalog-account-first-ux task.md §1）。
+     */
+    async getAssetCatalogView(preferenceRoot: string | undefined): Promise<AssetCatalogView> {
+        const [resolverResult, local] = await Promise.all([
+            this.loadResolverCatalogItems(),
+            this.loadLocalCatalogViewItems(preferenceRoot)
+        ]);
+        return {
+            items: mergeAssetCatalogViews(local.items, resolverResult.items),
+            packs: local.packs,
+            resolver: {
+                status: resolverResult.status,
+                itemCount: resolverResult.items.length,
+                error: resolverResult.error
+            }
+        };
+    }
+
+    /**
+     * ローカル catalog/ の 1 ビュー変換（外部ソース系。「取り込む」「頼む」の対象）。
+     * ルート解決は resolveCatalogRoot（既存・frontend の loadCatalog と同じ規約）を
+     * そのまま再利用する。meta.json 欠落・壊れは例外にせず黙ってスキップする
+     * （catalog-reader.ts の寛容リーダー流儀 — 詳細な欠落件数はこの 1 ビューでは追わない）。
+     * installed 判定・分類バッジ導出・パック台帳の読み込みもここで行う（task.md §1）。
+     */
+    protected async loadLocalCatalogViewItems(preferenceRoot: string | undefined): Promise<{ items: AssetCatalogViewItem[]; packs: CatalogPack[] }> {
+        const rootUriString = await this.resolveCatalogRoot(preferenceRoot);
+        if (!rootUriString) {
+            return { items: [], packs: [] };
+        }
+        const root = fileURLToPath(rootUriString);
+        const [installedKeys, packs] = await Promise.all([
+            this.loadInstalledCatalogKeys(root),
+            this.loadCatalogPacks(root)
+        ]);
+        const items: AssetCatalogViewItem[] = [];
+        for (const category of CATALOG_CATEGORIES) {
+            let entries: string[];
+            try {
+                entries = await fs.readdir(join(root, category));
+            } catch {
+                continue;
+            }
+            for (const entry of entries) {
+                const itemDir = join(root, category, entry);
+                let raw: string;
+                try {
+                    raw = await fs.readFile(join(itemDir, 'meta.json'), 'utf8');
+                } catch {
+                    continue;
+                }
+                const parsed = parseCatalogItemMeta(raw);
+                if (!parsed) {
+                    continue;
+                }
+                const installed = installedKeys.has(`${parsed.category}/${parsed.id}`);
+                const localPreviewUrl = await this.resolveLocalCatalogPreviewUrl(itemDir);
+                items.push({
+                    origin: 'local',
+                    key: `${parsed.category}/${parsed.id}`,
+                    id: parsed.id,
+                    category: parsed.category,
+                    title: parsed.title,
+                    description: parsed.description,
+                    tags: parsed.tags ?? [],
+                    licenseSpdx: parsed.license?.spdx,
+                    whenToUse: parsed.when_to_use,
+                    sourceUrl: parsed.source?.url,
+                    previewUrl: localPreviewUrl ?? parsed.source?.preview_url,
+                    installed,
+                    distribution: deriveAssetDistribution({
+                        installed,
+                        licenseScope: parsed.license?.scope,
+                        remote: parsed.remote,
+                        tags: parsed.tags
+                    }),
+                    sourceAcquisition: parsed.source?.acquisition
+                });
+            }
+        }
+        return { items, packs };
+    }
+
+    /**
+     * `assets/<category>/<id>/` の実体有無（= 同梱済みかどうか）を、カタログルートの
+     * 兄弟ディレクトリ `assets/` からカテゴリごとに一括で読み取る。catalog/ と assets/ は
+     * リポ直下の兄弟ディレクトリ（公開リポの契約: catalog/ は参照メタデータのみ、
+     * assets/ は実際に同梱するファイル）。存在しない・読めないカテゴリは黙ってスキップする
+     * （fail-soft — 開発配置でも本番配置でも assets/ 不在は「何も同梱されていない」として扱う）。
+     */
+    protected async loadInstalledCatalogKeys(catalogRoot: string): Promise<Set<string>> {
+        const assetsRoot = join(dirname(catalogRoot), 'assets');
+        const installed = new Set<string>();
+        for (const category of CATALOG_CATEGORIES) {
+            let entries: Dirent[];
+            try {
+                entries = await fs.readdir(join(assetsRoot, category), { withFileTypes: true });
+            } catch {
+                continue;
+            }
+            for (const entry of entries) {
+                if (entry.isDirectory()) {
+                    installed.add(`${category}/${entry.name}`);
+                }
+            }
+        }
+        return installed;
+    }
+
+    /**
+     * `catalog/<category>/<id>/preview.png` の見本画像を webview がそのまま <img src> に
+     * 使える file: URI へ変換する（AssetCatalogViewItem.previewUrl は既に resolver 側の
+     * file: URI を受け付ける契約 — resolveResolverPreviewUrl 経由の既存カードで同じ形式が
+     * 動作実績あり）。無ければ undefined（呼び出し側は meta.json の source.preview_url へ
+     * フォールバックする）。
+     */
+    protected async resolveLocalCatalogPreviewUrl(itemDir: string): Promise<string | undefined> {
+        const previewPath = join(itemDir, 'preview.png');
+        return (await this.isFile(previewPath)) ? pathToFileURL(previewPath).toString() : undefined;
+    }
+
+    /**
+     * `catalog/packs.json`（パック台帳）を読む。不在・壊れた JSON はどちらも例外にせず
+     * 空配列（parseCatalogPacksFile 自体が寛容パーサー）。
+     */
+    protected async loadCatalogPacks(catalogRoot: string): Promise<CatalogPack[]> {
+        let raw: string;
+        try {
+            raw = await fs.readFile(join(catalogRoot, 'packs.json'), 'utf8');
+        } catch {
+            return [];
+        }
+        return parseCatalogPacksFile(raw);
+    }
+
+    /**
+     * resolver 合成カタログ（無料 + 購入済み + 取得状態）の 1 ビュー変換。
+     * `packages/asset-resolver` は type:"module" の純 ESM パッケージで、この拡張の
+     * バックエンドは tsc の module:"commonjs" でコンパイルされる。動的 import() は
+     * commonjs ターゲットだと `require()` へ降格されるため（実測で確認済み — TS 5.4 は
+     * dynamic import を Promise.resolve().then(() => require(...)) に変換する）、純
+     * ESM ファイルの読み込みには使えない（ERR_REQUIRE_ESM 相当で失敗する）。
+     * そのため resolver の関数は import せず、`node --input-type=module -e <script>`
+     * で別プロセス（ネイティブ ESM ローダー）を起動して composeState() の生の戻り値
+     * （base + items）だけを受け取る（子プロセス方式。task.md が明示したフォールバックを
+     * 採用）。previewUrl の組み立てとフィールド正規化は TypeScript 側の純関数
+     * （resolveResolverPreviewUrl / toResolverAssetCatalogViewItem）が担う —
+     * 文字列テンプレートの中身をできるだけ薄くし、ロジックを単体テスト可能にするため。
+     */
+    /**
+     * resolver 合成カタログの取得 + 取得状態。status='failed' になるのは
+     * (a) 開発配置に asset-resolver が見つからない (b) 子プロセスが非 0 終了
+     * （オフライン等 — composeState() 内の loadCatalog() がキャッシュも無ければ例外を投げ、
+     * それが未捕捉のままプロセスを非 0 終了させる） (c) 応答 JSON が解釈できない、の 3 パターン。
+     * いずれも fail-soft（ローカル catalog/ の表示は継続）だが、原因（error）は
+     * 開発者向け折りたたみでの手がかりに残す。
+     */
+    protected async loadResolverCatalogItems(): Promise<{ items: AssetCatalogViewItem[]; status: 'ok' | 'failed'; error?: string }> {
+        const srcDir = await this.findAssetResolverSrcDir();
+        if (!srcDir) {
+            return { items: [], status: 'failed', error: 'アセット resolver が見つかりません（開発配置を確認してください）' };
+        }
+        const stateModuleUrl = pathToFileURL(join(srcDir, 'state.mjs')).toString();
+        const script = `
+import { composeState } from ${JSON.stringify(stateModuleUrl)};
+const { base, items } = await composeState();
+process.stdout.write(JSON.stringify({ base, items }));
+`;
+        const { code, stdout, stderr } = await this.runResolverScript(script);
+        if (code !== 0) {
+            const message = (stderr || stdout).trim();
+            console.warn('[akari-project] resolver カタログの取得に失敗（ローカル catalog/ のみで継続）:', message);
+            return { items: [], status: 'failed', error: message || undefined };
+        }
+        let parsed: { base: string; items: Array<ResolverRawCatalogItem & { preview?: string }> };
+        try {
+            parsed = JSON.parse(stdout);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn('[akari-project] resolver カタログの応答を解釈できませんでした:', error);
+            return { items: [], status: 'failed', error: message };
+        }
+        const items = parsed.items.map(item => {
+            const previewUrl = resolveResolverPreviewUrl(item.preview, parsed.base);
+            // mediaUrl（試聴用の実体 URL）は previewUrl と同じ解決規則（絶対 URL はそのまま／
+            // base 相対キーは base 側の規約で解決）を適用する。選定元は files[] の音声ファイル
+            // （selectResolverAudioFileRef — audio カテゴリのみ・拡張子一致のみ）であり、
+            // preview（サムネ）と混同しない。resolveResolverPreviewUrl は「絶対 URL か
+            // base 相対キーかを解決して URL 文字列にする」汎用ロジックなのでそのまま再利用する。
+            const mediaUrl = resolveResolverPreviewUrl(selectResolverAudioFileRef(item), parsed.base);
+            return toResolverAssetCatalogViewItem(item, previewUrl, mediaUrl);
+        });
+        return { items, status: 'ok' };
+    }
+
+    /**
+     * resolver 直行の取得 + プロジェクト配置。resolve.mjs の resolve() をそのまま呼ぶ
+     * （fail-closed・sha256 検証・validate-asset・entitlements 判定は resolver 側の
+     * 実装をそのまま透過する — ここでは再実装しない）。
+     */
+    async resolveAsset(id: string, projectUri: string): Promise<AssetResolveOutcome> {
+        const srcDir = await this.findAssetResolverSrcDir();
+        if (!srcDir) {
+            return { success: false, error: 'アセット resolver が見つかりません（開発配置を確認してください）' };
+        }
+        const projectPath = this.fsPath(projectUri);
+        const resolveModuleUrl = pathToFileURL(join(srcDir, 'resolve.mjs')).toString();
+        const script = `
+import { resolve } from ${JSON.stringify(resolveModuleUrl)};
+try {
+  const result = await resolve(${JSON.stringify(id)}, { project: ${JSON.stringify(projectPath)} });
+  process.stdout.write(JSON.stringify({ success: true, projectDir: result.projectDir ?? null }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ success: false, error: error && error.message ? error.message : String(error) }));
+}
+`;
+        const { code, stdout, stderr } = await this.runResolverScript(script);
+        if (code !== 0) {
+            return { success: false, error: (stderr || stdout || `resolver スクリプトが異常終了しました (exit ${code})`).trim() };
+        }
+        let parsed: { success: boolean; projectDir?: string | null; error?: string };
+        try {
+            parsed = JSON.parse(stdout);
+        } catch {
+            return { success: false, error: `resolver の応答を解釈できませんでした: ${stdout.slice(0, 300)}` };
+        }
+        if (parsed.success && parsed.projectDir) {
+            return { success: true, projectAssetPath: parsed.projectDir };
+        }
+        if (parsed.success) {
+            return { success: false, error: '素材をライブラリへ取得しましたが、プロジェクトへの配置結果を確認できませんでした' };
+        }
+        return { success: false, error: parsed.error ?? '不明なエラーです' };
+    }
+
+    /**
+     * findEditLintCli と同じ「開発時 cwd 相対 / パッケージ時 __dirname 相対 /
+     * パッケージ時 resourcesPath 基点」の候補列挙規約（packaged-tool-candidates.ts の
+     * assetResolverSrcCandidates が純関数として切り出し済み）。state.mjs の存在で
+     * asset-resolver の src/ を特定する。
+     */
+    protected async findAssetResolverSrcDir(): Promise<string | undefined> {
+        const candidates = assetResolverSrcCandidates(__dirname, process.cwd(), this.resourcesPath());
+        for (const candidate of candidates) {
+            if (await this.isFile(join(candidate, 'state.mjs'))) {
+                return candidate;
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * ネイティブ ESM ローダーで inline スクリプトを走らせる（`--input-type=module -e`）。
+     * runNodeScript と同じ ELECTRON_RUN_AS_NODE 対応（Electron パッケージ版で
+     * process.execPath が Electron 実行体を指す場合に必要）。spawn 自体が失敗した
+     * 場合も例外を投げず code=2 として返す（呼び出し側の fail-soft 処理を単純にする）。
+     */
+    protected async runResolverScript(script: string): Promise<{ code: number; stdout: string; stderr: string }> {
+        return new Promise(resolvePromise => {
+            const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+                env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+                stdio: ['ignore', 'pipe', 'pipe']
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.on('data', chunk => stdout += chunk.toString());
+            child.stderr.on('data', chunk => stderr += chunk.toString());
+            child.on('error', error => resolvePromise({ code: 2, stdout, stderr: String(error) }));
+            child.on('exit', code => resolvePromise({ code: code ?? 2, stdout, stderr }));
+        });
     }
 
     async watchProject(projectUri: string): Promise<void> {
@@ -391,12 +745,7 @@ export class AkariProjectServiceImpl implements AkariProjectService {
     }
 
     protected async findEditLintCli(): Promise<string | undefined> {
-        const candidates = [
-            resolve(__dirname, '../edit-lint/bin/edit-lint.mjs'),
-            resolve(process.cwd(), '../../packages/edit-lint/bin/edit-lint.mjs'),
-            resolve(process.cwd(), 'packages/edit-lint/bin/edit-lint.mjs'),
-            resolve(__dirname, '../../../../../../../packages/edit-lint/bin/edit-lint.mjs')
-        ];
+        const candidates = editLintCliCandidates(__dirname, process.cwd(), this.resourcesPath());
         for (const candidate of candidates) {
             try {
                 if ((await fs.stat(candidate)).isFile()) {
@@ -407,6 +756,14 @@ export class AkariProjectServiceImpl implements AkariProjectService {
             }
         }
         return undefined;
+    }
+
+    /**
+     * Electron の `process.resourcesPath`（`Contents/Resources` を指す）。純 node の
+     * テスト実行など Electron 外では undefined — bundledMediaBinPath と同じ取得規約。
+     */
+    protected resourcesPath(): string | undefined {
+        return (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
     }
 
     /**
@@ -495,12 +852,27 @@ export class AkariProjectServiceImpl implements AkariProjectService {
 
     protected async resolveFfmpegPath(): Promise<string | undefined> {
         if (!this.ffmpegPathPromise) {
-            this.ffmpegPathPromise = this.locateFfmpegOnPath();
+            this.ffmpegPathPromise = this.locateFfmpeg();
         }
         return this.ffmpegPathPromise;
     }
 
-    /** ffmpeg を PATH から解決する（task.md 指定）。見つからなければ静かに undefined。 */
+    /**
+     * ffmpeg を解決する。優先順位は packages/media-bin の resolveFfmpeg と揃える
+     * （明示指定 env → PATH → アプリ同梱バイナリ）— akari-preview/hevc-proxy.ts と
+     * akari-annotations/media-cache.ts が既に同じ 3 段を実装しており、ここだけ PATH のみを
+     * 見ていたため、brew 未導入の PC では同梱 ffmpeg があるのにサムネが全部
+     * プレースホルダに落ちていた。見つからなければ静かに undefined（プレースホルダ運用）。
+     */
+    protected async locateFfmpeg(): Promise<string | undefined> {
+        if (process.env.AKARI_FFMPEG_BIN) {
+            return process.env.AKARI_FFMPEG_BIN;
+        }
+        const onPath = await this.locateFfmpegOnPath();
+        return onPath ?? this.bundledMediaBinPath('ffmpeg');
+    }
+
+    /** ffmpeg を PATH から解決する。見つからなければ undefined（呼び出し側が同梱へ落とす）。 */
     protected async locateFfmpegOnPath(): Promise<string | undefined> {
         const finder = this.platform === 'win32' ? 'where' : 'which';
         try {
@@ -509,6 +881,22 @@ export class AkariProjectServiceImpl implements AkariProjectService {
         } catch {
             return undefined;
         }
+    }
+
+    /**
+     * アプリ同梱バイナリの実体パス。apps/shell/package.json の extraResources
+     * （resources/vendor-ffmpeg → Resources/media-bin、prepackage の
+     * bundle-ffmpeg-binaries.mjs が生成）。開発時は resourcesPath が Electron 自身の
+     * Resources を指すため候補は存在せず、undefined になる。
+     */
+    protected bundledMediaBinPath(name: 'ffmpeg' | 'ffprobe'): string | undefined {
+        const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+        if (!resourcesPath) {
+            return undefined;
+        }
+        const exe = this.platform === 'win32' ? `${name}.exe` : name;
+        const candidate = join(resourcesPath, 'media-bin', exe);
+        return existsSync(candidate) ? candidate : undefined;
     }
 
     async prepareDiffs(projectUri: string): Promise<DiffPreparationResult> {

@@ -1,5 +1,5 @@
 import { PreferenceContribution } from '@theia/core/lib/common/preferences';
-import { CommandContribution } from '@theia/core/lib/common';
+import { CommandContribution, MenuContribution } from '@theia/core/lib/common';
 import { ContainerModule } from '@theia/core/shared/inversify';
 import {
     FrontendApplicationContribution,
@@ -7,12 +7,14 @@ import {
     WebSocketConnectionProvider,
     WidgetFactory
 } from '@theia/core/lib/browser';
+import { WindowTitleContribution } from '@theia/core/lib/browser/window/window-title-service';
 import { AkariHomeCommandContribution } from './akari-home-command-contribution';
 import { AkariHomeContribution } from './akari-home-contribution';
 import { AkariHomeWidget } from './akari-home-widget';
 import { AkariPreferenceContribution } from './akari-preferences';
 import { AkariSettingsWidget } from './akari-settings-widget';
 import { AkariSurfaceOpenHandler } from './akari-surface-open-handler';
+import { AkariWelcomeWindowTitleContribution } from './akari-welcome-window-title-contribution';
 import { AkariNewProjectService, AKARI_NEW_PROJECT_SERVICE_PATH } from '../common/akari-new-project-protocol';
 
 export default new ContainerModule(bind => {
@@ -41,8 +43,17 @@ export default new ContainerModule(bind => {
 
     // v4 ミニマル化（task 2026-08-02-home-v4-minimal）: ホームから撤去した
     // 進め方フォームの開く経路をコマンド 1 個として残す（裁定 R2）。
+    // 2026-08-07: File メニューの「新規プロジェクト作成」もここへ寄せたため
+    // MenuContribution も同じクラスから供給する。
     bind(AkariHomeCommandContribution).toSelf().inSingletonScope();
     bind(CommandContribution).toService(AkariHomeCommandContribution);
+    bind(MenuContribution).toService(AkariHomeCommandContribution);
+
+    // F11（task 2026-08-05-welcome-screen）: 未選択時のウィンドウタイトルを
+    // 「AKARI Video」だけにする（実測: Theia 既定の macOS テンプレートのままだと
+    // 「ホーム」になってしまう。akari-welcome-window-title-contribution.ts 参照）。
+    bind(AkariWelcomeWindowTitleContribution).toSelf().inSingletonScope();
+    bind(WindowTitleContribution).toService(AkariWelcomeWindowTitleContribution);
 
     // akari-shell-strip registers the same factory id for its Wave 0 placeholder.
     // WidgetManager builds a Map in contribution order, so this later registration

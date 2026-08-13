@@ -2,6 +2,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { computeCutTimelineOffsets, cutSpeed, segmentDuration } from "./cut-timeline.mjs";
+import { CAPTION_FONT_FILE_URL } from "./caption-font.mjs";
 
 const DEFAULT_MAX_CHARACTERS = 20;
 // 縦長（output.height > output.width）の既定。横長より 1 行を短く・文字を大きくする
@@ -15,21 +16,54 @@ const DEFAULT_FONT_SIZE_PX = 38;
 // 無い/バージョン違いの環境でも同一グリフでレンダリングされるよう、同梱済み Noto Sans JP
 // （win2-fonts-assets、assets/font/noto-sans-jp/、可変フォント 1 本）を @font-face で固定する。
 // captions.mjs から見て ../../../ が repo root（packages/render-cut/src/ → render-cut → packages
-// → repo root）。preview（akari-preview-open-handler.ts）にも同一のフォントスタック文字列
-// '"Noto Sans JP", sans-serif' を使うが、両パッケージ間に依存関係が無い（render-cut は
-// CLI パッケージ、akari-preview は Electron 拡張で互いを import しない）ため定数の共有はせず、
-// 文字列を意図的に重複させている（判断は report に記録）。
+// → repo root）。resolved caption は OS の同名フォントへ fall back しない固有 family alias を使う。
+// legacy caption は既存スナップショットのバイト互換性を保つため従来 family 名を維持する。
 const CAPTION_FONT_STACK = '"Noto Sans JP", sans-serif';
-const CAPTION_FONT_PATH = resolve(
+const RESOLVED_CAPTION_FONT_STACK = '"AKARI Noto Sans JP", sans-serif';
+const CAPTION_FONT_DIR = resolve(
   dirname(fileURLToPath(import.meta.url)),
-  "../../../assets/font/noto-sans-jp/NotoSansJP-Variable.ttf",
+  "../../../assets/font",
 );
-// font-weight を 100 900 の範囲指定にすることで、可変フォントの wght 軸を
-// font-weight:700 等の指定に応じて実際に補間させる（範囲を省略すると単一ウェイトのみ
-// マッチし、キャプションの font-weight:700 が無視される）。
-const CAPTION_FONT_FACE_CSS = `@font-face {
+// 同梱フォント全家族を @font-face 宣言する（2026-08-03 textstyle v0: font_family ツマミ対応）。
+// ブラウザは実際に使われる family しかフェッチしないため、全宣言を常に埋めてもコストは
+// 参照分だけ。可変フォントは font-weight を範囲指定にして wght 軸を補間させる
+// （範囲を省略すると単一ウェイトのみマッチし、font-weight:700 等が無視される）。
+const BUNDLED_CAPTION_FONTS = [
+  { family: "Noto Sans JP", file: "noto-sans-jp/NotoSansJP-Variable.ttf", weight: "100 900", variable: true },
+  { family: "Noto Serif JP", file: "noto-serif-jp/NotoSerifJP-Variable.ttf", weight: "100 900", variable: true },
+  { family: "M PLUS Rounded 1c", file: "mplus-rounded-1c/MPLUSRounded1c-Medium.ttf", weight: "500" },
+  { family: "M PLUS Rounded 1c", file: "mplus-rounded-1c/MPLUSRounded1c-ExtraBold.ttf", weight: "800" },
+  { family: "M PLUS Rounded 1c", file: "mplus-rounded-1c/MPLUSRounded1c-Black.ttf", weight: "900" },
+  { family: "BIZ UDGothic", file: "biz-udgothic/BIZUDGothic-Regular.ttf", weight: "400" },
+  { family: "BIZ UDGothic", file: "biz-udgothic/BIZUDGothic-Bold.ttf", weight: "700" },
+  { family: "Dela Gothic One", file: "dela-gothic-one/DelaGothicOne-Regular.ttf", weight: "400" },
+  { family: "Zen Maru Gothic", file: "zen-maru-gothic/ZenMaruGothic-Regular.ttf", weight: "400" },
+  { family: "Zen Maru Gothic", file: "zen-maru-gothic/ZenMaruGothic-Bold.ttf", weight: "700" },
+  { family: "Shippori Mincho", file: "shippori-mincho/ShipporiMincho-Regular.ttf", weight: "400" },
+  { family: "DotGothic16", file: "dotgothic16/DotGothic16-Regular.ttf", weight: "400" },
+  { family: "Klee One", file: "klee-one/KleeOne-Regular.ttf", weight: "400" },
+];
+// 既定出力（text_style なし）のバイト等価を守るため、従来どおりの単一 Noto 宣言を残す
+const CAPTION_DEFAULT_FONT_FACE_CSS = `@font-face {
       font-family: "Noto Sans JP";
-      src: url("${pathToFileURL(CAPTION_FONT_PATH).href}") format("truetype-variations");
+      src: url("${pathToFileURL(resolve(CAPTION_FONT_DIR, "noto-sans-jp/NotoSansJP-Variable.ttf")).href}") format("truetype-variations");
+      font-weight: 100 900;
+      font-style: normal;
+    }`;
+const CAPTION_FONT_FACE_CSS = BUNDLED_CAPTION_FONTS
+  .map((font) => `@font-face {
+      font-family: "${font.family}";
+      src: url("${pathToFileURL(resolve(CAPTION_FONT_DIR, font.file)).href}") format("${font.variable ? "truetype-variations" : "truetype"}");
+      font-weight: ${font.weight};
+      font-style: normal;
+    }`)
+  .join("\n    ");
+// resolved caption は OS の同名フォントへ fall back しない固有 family alias で単一 Noto に固定する。
+// font-weight の 100 900 範囲指定は可変フォントの wght 軸を font-weight:700 等に補間させるため
+// （範囲を省略すると単一ウェイトのみマッチする）。
+const RESOLVED_CAPTION_FONT_FACE_CSS = `@font-face {
+      font-family: "AKARI Noto Sans JP";
+      src: url("${CAPTION_FONT_FILE_URL}") format("truetype-variations");
       font-weight: 100 900;
       font-style: normal;
     }`;
@@ -41,8 +75,15 @@ const CAPTION_FONT_FACE_CSS = `@font-face {
 const KARAOKE_STYLE = "karaoke";
 const POP_STYLE = "pop";
 const REVEAL_STYLE = "reveal";
-const SUPPORTED_WORD_STYLES = new Set([KARAOKE_STYLE, POP_STYLE, REVEAL_STYLE]);
+const REVEAL_WORD_STYLE = "reveal-word";
+const SUPPORTED_WORD_STYLES = new Set([
+  KARAOKE_STYLE,
+  POP_STYLE,
+  REVEAL_STYLE,
+  REVEAL_WORD_STYLE,
+]);
 const EMPHASIS_STYLE_ONE_CHAR_BANG = "one-char-bang";
+const EMPHASIS_STYLE_ONE_CHAR_JUMBLE = "one-char-jumble";
 const EMPHASIS_STYLE_SIZE_PULSE = "size-pulse";
 const EMPHASIS_STYLE_COLOR_ACCENT = "color-accent";
 const EMPHASIS_STYLE_COLOR_ONLY = "color-only";
@@ -52,6 +93,7 @@ const EMPHASIS_STYLE_POSITIVE = "positive";
 const EMPHASIS_STYLE_HIGHLIGHT = "highlight";
 const SUPPORTED_EMPHASIS_STYLES = new Set([
   EMPHASIS_STYLE_ONE_CHAR_BANG,
+  EMPHASIS_STYLE_ONE_CHAR_JUMBLE,
   EMPHASIS_STYLE_SIZE_PULSE,
   EMPHASIS_STYLE_COLOR_ACCENT,
   EMPHASIS_STYLE_COLOR_ONLY,
@@ -60,6 +102,11 @@ const SUPPORTED_EMPHASIS_STYLES = new Set([
   EMPHASIS_STYLE_POSITIVE,
   EMPHASIS_STYLE_HIGHLIGHT,
 ]);
+// one-char-jumble の静的ジッター上限（オーナー目安「角度 ±8° から出発」に準拠）。
+// --akari-jumble-amp（既定 1・0 でジッター無し）はこの上限に掛かる全体強度ツマミ。
+const JUMBLE_MAX_ROTATE_DEG = 8;
+const JUMBLE_MAX_OFFSET_EM = 0.1;
+const JUMBLE_MAX_SCALE_AMP = 0.12;
 
 export function generateCaptionOverlays(captions, cuts, options = {}) {
   // output（edit.output の {width,height}）が縦長なら、行を短く・文字を大きくする既定へ切り替える。
@@ -75,7 +122,6 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
     : DEFAULT_FONT_SIZE_PX;
   const emphasisWords = normalizeEmphasisWords(options.emphasisWords);
   const sourceCount = options.sourceCount ?? 1;
-  const linearTimeline = options.linearTimeline === true;
   const overlays = [];
 
   for (const caption of captions) {
@@ -94,7 +140,6 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
       caption.end,
       cuts,
       captionSource,
-      linearTimeline,
     );
     let style = normalizeCaptionStyle(caption.style);
     const textStyle = mergeCaptionTextStyles(options.defaultTextStyle, caption.text_style);
@@ -138,6 +183,12 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
         `captions.json item ${caption.id ?? "(unknown)"} requests reveal without words[]; rendered as plain text`,
       );
     }
+    if (style === REVEAL_WORD_STYLE && allWords.length === 0) {
+      warn(
+        "reveal-word-without-words",
+        `captions.json item ${caption.id ?? "(unknown)"} requests reveal-word without words[]; rendered as plain text`,
+      );
+    }
     for (const [index, range] of ranges.entries()) {
       const words = style || emphasisWords.length > 0
         ? clipWordsToRange(caption.words, range.sourceStart, range.sourceEnd)
@@ -145,6 +196,10 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
       const hasEmphasis = words.some((word) => findMatchingEmphasis(word, emphasisWords));
       const rangeTokens = displayTokens
         ? clipDisplayTokensToRange(displayTokens, range.sourceStart, range.sourceEnd)
+        : null;
+      const captionAnimation = textStyle?.animation
+        ? buildCaptionAnimation(textStyle.animation, range.duration, (message) =>
+            warn("textanim", `captions.json item ${caption.id ?? "(unknown)"} ${message}`))
         : null;
       const html =
         words.length > 0 && (style || hasEmphasis)
@@ -158,12 +213,16 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
               displayTokens: rangeTokens,
               textStyleActive: textStyle !== null,
               backgroundMode: textStyle?.background?.mode,
+              extendedBackground: usesExtendedPerLineBackground(textStyle?.background),
+              captionAnimation,
             })
           : renderCaptionFragment(displayText, {
               maximum,
               baseFontSize,
               textStyleActive: textStyle !== null,
               backgroundMode: textStyle?.background?.mode,
+              extendedBackground: usesExtendedPerLineBackground(textStyle?.background),
+              captionAnimation,
             });
       overlays.push({
         id: `${caption.id}-${String(index + 1).padStart(2, "0")}`,
@@ -180,6 +239,70 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
   return overlays;
 }
 
+/**
+ * Opt-in single-line policy renderer. Cues are already projected and split by
+ * edit-store's Node kernel; this consumer never segments text again.
+ */
+export function generateResolvedCaptionOverlays(displayResult) {
+  return displayResult.display_cues.map((cue) => ({
+    id: cue.id,
+    html: renderResolvedSingleLineCaption(cue.text),
+    start: cue.start,
+    duration: cue.end - cue.start,
+    transform: { x: 0, y: 0, scale: 1, rotate: 0 },
+    vars: cue.style_vars ?? {},
+    generatedFrom: cue.source_cue_id,
+    sourceCueId: cue.source_cue_id,
+    displayCue: cue,
+  }));
+}
+
+export function renderResolvedSingleLineCaption(text) {
+  return `<div class="akari-caption akari-caption--single-line">
+  <style>
+    ${RESOLVED_CAPTION_FONT_FACE_CSS}
+    .akari-caption--single-line {
+      position:absolute;
+      inset:0;
+      pointer-events:none;
+      color:var(--caption-color,#fff);
+      text-shadow:var(--caption-text-shadow,-1.5px -1.5px 0 rgba(0,0,0,.85),1.5px -1.5px 0 rgba(0,0,0,.85),-1.5px 1.5px 0 rgba(0,0,0,.85),1.5px 1.5px 0 rgba(0,0,0,.85),0 0 8px rgba(0,0,0,.6));
+      -webkit-text-stroke:var(--caption-webkit-text-stroke,0 transparent);
+      paint-order:var(--caption-paint-order,normal);
+      font-family:${RESOLVED_CAPTION_FONT_STACK};
+      font-size:var(--caption-font-size,38px);
+      font-weight:var(--caption-font-weight,700);
+      line-height:var(--caption-line-height,1.42);
+      text-align:center;
+    }
+    .akari-caption--single-line .akari-caption__plate {
+      position:absolute;
+      left:var(--caption-left,0);
+      right:var(--caption-right,0);
+      bottom:var(--caption-bottom,7%);
+      width:var(--caption-width,auto);
+      max-width:100%;
+      display:flex;
+      flex-direction:column;
+      gap:0;
+      padding:0;
+      background:transparent;
+    }
+    .akari-caption--single-line .akari-caption__line {
+      width:100%;
+      max-width:100%;
+      margin:0;
+      padding:0;
+      border-radius:0;
+      background:transparent;
+      text-align:center;
+      white-space:nowrap;
+    }
+  </style>
+  <div class="akari-caption__plate"><p class="akari-caption__line">${escapeHtml(text)}</p></div>
+</div>`;
+}
+
 function normalizeCaptionStyle(style) {
   return SUPPORTED_WORD_STYLES.has(style) ? style : null;
 }
@@ -190,19 +313,21 @@ export function mergeCaptionTextStyles(defaultStyle, captionStyle) {
   const merged = {
     ...base,
     ...override,
-    ...((base.stroke || override.stroke)
-      ? { stroke: { ...base.stroke, ...override.stroke } } : {}),
-    ...((base.background || override.background)
-      ? { background: { ...base.background, ...override.background } } : {}),
   };
-  if (merged.stroke && Object.keys(merged.stroke).length === 0) delete merged.stroke;
-  if (merged.background && Object.keys(merged.background).length === 0) delete merged.background;
+  for (const key of ["stroke", "background", "shadow", "glow", "position", "animation"]) {
+    if (base[key] || override[key]) {
+      merged[key] = { ...base[key], ...override[key] };
+      if (Object.keys(merged[key]).length === 0) delete merged[key];
+    }
+  }
   return Object.keys(merged).length > 0 ? merged : null;
 }
 
 export function captionTextStyleVars(style) {
   if (!style || typeof style !== "object") return {};
   const vars = {};
+  const extendedBackground = usesExtendedPerLineBackground(style.background);
+  const percentageBackground = usesPercentageBackground(style.background);
   if (typeof style.color === "string") {
     vars["--caption-color"] = style.color;
   }
@@ -223,7 +348,7 @@ export function captionTextStyleVars(style) {
   if (style.background && (typeof style.background.color === "string"
     || (typeof style.background.opacity === "number" && Number.isFinite(style.background.opacity)))) {
     const backgroundVariable = style.background.mode === "block"
-      ? "--plate-block-bg" : "--plate-bg";
+      ? "--plate-block-bg" : extendedBackground ? "--plate-ext-bg" : "--plate-bg";
     vars[backgroundVariable] = colorWithOpacity(
       typeof style.background.color === "string" ? style.background.color : "#000000",
       typeof style.background.opacity === "number" && Number.isFinite(style.background.opacity)
@@ -233,42 +358,263 @@ export function captionTextStyleVars(style) {
   if (typeof style.background?.radius_px === "number"
     && Number.isFinite(style.background.radius_px)) {
     const radiusVariable = style.background.mode === "block"
-      ? "--plate-block-radius" : "--plate-radius";
+      ? "--plate-block-radius" : extendedBackground ? "--plate-ext-radius" : "--plate-radius";
     vars[radiusVariable] = `${style.background.radius_px}px`;
   }
+  // --- 2026-08-03 textstyle v0 拡張 ---
+  if (typeof style.font_family === "string") {
+    vars["--caption-font-family"] = style.font_family;
+  }
+  if (typeof style.weight === "number") {
+    vars["--caption-font-weight"] = String(style.weight);
+  }
+  if (style.italic) vars["--caption-font-style"] = "italic";
+  if (style.underline) vars["--caption-text-decoration"] = "underline";
+  if (typeof style.letter_spacing_em === "number") {
+    vars["--caption-letter-spacing"] = `${style.letter_spacing_em}em`;
+  }
+  if (typeof style.line_height === "number") {
+    vars["--caption-line-height"] = String(style.line_height);
+  }
+  if (typeof style.text_transform === "string") {
+    vars["--caption-text-transform"] = style.text_transform;
+  }
+  if (typeof style.max_width_pct === "number") {
+    vars["--caption-line-max-width"] = `${style.max_width_pct}%`;
+  }
+  if (style.vertical) vars["--caption-writing-mode"] = "vertical-rl";
+  if (extendedBackground) {
+    const horizontalExpansion = percentageBackground
+      ? `${style.background.width_pct ?? 0}%`
+      : `${style.background.padding_px ?? 0}px`;
+    const verticalExpansion = percentageBackground
+      ? `${style.background.height_pct ?? 0}%`
+      : `${style.background.padding_px ?? 0}px`;
+    vars["--plate-ext-width"] = horizontalExpansion;
+    vars["--plate-ext-height"] = verticalExpansion;
+    if (typeof style.background.offset_x === "number") {
+      vars["--plate-offset-x"] = `${style.background.offset_x}px`;
+    }
+    if (typeof style.background.offset_y === "number") {
+      vars["--plate-offset-y"] = `${style.background.offset_y}px`;
+    }
+  } else if (typeof style.background?.padding_px === "number") {
+    vars["--plate-pad-y"] = `${style.background.padding_px}px`;
+    vars["--plate-pad-x"] = `${style.background.padding_px}px`;
+  }
+  const textShadow = captionTextShadowValue(style.shadow, style.glow);
+  if (textShadow !== null) {
+    vars["--caption-text-shadow"] = textShadow;
+  }
   Object.assign(vars, zoneVars(style.zone));
+  Object.assign(vars, anchorPositionVars(style.text_anchor, style.position, style.vertical_align));
+  if (style.align) {
+    // 明示 align は zone / anchor の水平配置より優先する
+    vars["--caption-text-align"] = style.align;
+    vars["--caption-align-items"] = style.align === "left"
+      ? "flex-start" : style.align === "right" ? "flex-end" : "center";
+  }
   return vars;
+}
+
+// shadow（角度 + 距離 → オフセット）と glow（発光 = ぼかしのみの多重影）を
+// 1 本の text-shadow 値へ合成する。どちらも無ければ null（既定の薄影を維持）。
+function captionTextShadowValue(shadow, glow) {
+  const parts = [];
+  if (shadow && typeof shadow.color === "string") {
+    const angle = ((shadow.angle_deg ?? 90) * Math.PI) / 180;
+    const distance = shadow.distance_px ?? 0;
+    const dx = Math.round(Math.cos(angle) * distance * 100) / 100;
+    const dy = Math.round(Math.sin(angle) * distance * 100) / 100;
+    parts.push(`${dx}px ${dy}px ${shadow.blur_px ?? 0}px ${colorWithOpacity(shadow.color, shadow.opacity)}`);
+  }
+  if (glow && typeof glow.color === "string") {
+    const spread = glow.spread ?? 40;
+    const alpha = Math.min(1, (glow.density ?? 50) / 60);
+    const offsetX = glow.offset_x ?? 0;
+    const offsetY = glow.offset_y ?? 0;
+    parts.push(
+      `${offsetX}px ${offsetY}px ${spread}px ${colorWithOpacity(glow.color, alpha)}`,
+      `${offsetX}px ${offsetY}px ${spread * 2}px ${colorWithOpacity(glow.color, Number((alpha * 0.7).toFixed(4)))}`,
+    );
+  }
+  return parts.length > 0 ? parts.join(", ") : null;
+}
+
+// text_anchor（9 点）+ position（0..1 相対）→ プレート配置の CSS 変数。
+// position 未指定なら anchor は zone 相当の縁寄せとして効く。position 指定時は
+// その座標へ anchor の縦成分（t/m/b）を合わせる（m は 100% を超えないよう近似で top 配置）。
+function anchorPositionVars(anchor, position, verticalAlign) {
+  if (!anchor && !position && !verticalAlign) return {};
+  const vars = {};
+  const vertical = anchor
+    ? anchor[0]
+    : verticalAlign === "top" ? "t" : verticalAlign === "middle" ? "m" : "b";
+  const horizontal = anchor ? anchor[1] : "c";
+  if (typeof position?.y === "number") {
+    const clamped = Math.min(1, Math.max(0, position.y));
+    vars["--caption-top"] = `${Math.round(clamped * 10000) / 100}%`;
+    vars["--caption-bottom"] = "auto";
+  } else if (anchor || verticalAlign) {
+    vars["--caption-top"] = vertical === "t" ? "7%" : vertical === "m" ? "0" : "auto";
+    vars["--caption-bottom"] = vertical === "b" ? "7%" : vertical === "m" ? "0" : "auto";
+    if (vertical === "m") vars["--caption-justify-content"] = "center";
+  }
+  if (typeof position?.x === "number") {
+    const clamped = Math.min(1, Math.max(0, position.x));
+    vars["--caption-left"] = `${Math.round(clamped * 10000) / 100}%`;
+    vars["--caption-right"] = "4%";
+    vars["--caption-align-items"] = "flex-start";
+    vars["--caption-line-margin"] = "0";
+  } else if (anchor) {
+    vars["--caption-left"] = "4%";
+    vars["--caption-right"] = "4%";
+    vars["--caption-align-items"] = horizontal === "l"
+      ? "flex-start" : horizontal === "r" ? "flex-end" : "center";
+    vars["--caption-text-align"] = horizontal === "l" ? "left" : horizontal === "r" ? "right" : "center";
+    vars["--caption-line-margin"] = "0";
+    vars["--caption-line-max-width"] = "100%";
+  }
+  return vars;
+}
+
+const TEXT_TRANSFORM_MAP = {
+  upper: "uppercase",
+  uppercase: "uppercase",
+  lower: "lowercase",
+  lowercase: "lowercase",
+  title: "capitalize",
+  capitalize: "capitalize",
+  none: "none",
+};
+const TEXT_ANCHOR_VALUES = new Set(["tl", "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br"]);
+const VERTICAL_ALIGN_VALUES = new Set(["top", "middle", "bottom"]);
+
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizeAnimationSlot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (typeof value.id !== "string" || value.id === "") return undefined;
+  return {
+    id: value.id,
+    ...(finiteNumber(value.duration_sec) && value.duration_sec > 0
+      ? { duration_sec: value.duration_sec } : {}),
+    ...(typeof value.ease === "string" && value.ease !== "" ? { ease: value.ease } : {}),
+    ...(finiteNumber(value.amp) && value.amp > 0 ? { amp: value.amp } : {}),
+  };
 }
 
 function normalizeTextStyle(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const animationIn = normalizeAnimationSlot(value.animation?.in);
+  const animationLoop = normalizeAnimationSlot(value.animation?.loop);
+  const animationOut = normalizeAnimationSlot(value.animation?.out);
   return {
     ...(typeof value.color === "string" ? { color: value.color } : {}),
-    ...(typeof value.size_px === "number" && Number.isFinite(value.size_px)
-      ? { size_px: value.size_px } : {}),
+    ...(finiteNumber(value.size_px) ? { size_px: value.size_px } : {}),
+    // --- 2026-08-03 textstyle v0 拡張（presets/textstyle と同語彙） ---
+    ...(typeof value.font_family === "string" && value.font_family !== ""
+      ? { font_family: value.font_family } : {}),
+    // weight（textstyle v0 の正式名・100..900）と font_weight（display_policy 経路からの
+    // 既存名・1..1000）は同じ CSS font-weight を指す。legacy レールは weight しか読んで
+    // いなかったため、contract 上は有効な font_weight が無言で捨てられていた。両方あるときは
+    // weight を優先する（captions.schema.json $defs/textStyle の $comment と同じ順序）。
+    ...(finiteNumber(value.weight) && value.weight >= 100 && value.weight <= 900
+      ? { weight: value.weight }
+      : Number.isInteger(value.font_weight) && value.font_weight >= 1 && value.font_weight <= 1000
+        ? { weight: value.font_weight } : {}),
+    ...(value.italic === true ? { italic: true } : {}),
+    ...(value.underline === true ? { underline: true } : {}),
+    ...(finiteNumber(value.letter_spacing_em) ? { letter_spacing_em: value.letter_spacing_em } : {}),
+    ...(finiteNumber(value.line_height) && value.line_height > 0
+      ? { line_height: value.line_height } : {}),
+    ...(value.align === "left" || value.align === "center" || value.align === "right"
+      ? { align: value.align } : {}),
+    ...(VERTICAL_ALIGN_VALUES.has(value.vertical_align)
+      ? { vertical_align: value.vertical_align } : {}),
+    ...(value.vertical === true ? { vertical: true } : {}),
+    ...(TEXT_TRANSFORM_MAP[value.text_transform]
+      ? { text_transform: TEXT_TRANSFORM_MAP[value.text_transform] } : {}),
+    ...(finiteNumber(value.max_width_pct) && value.max_width_pct > 0 && value.max_width_pct < 100
+      ? { max_width_pct: value.max_width_pct } : {}),
+    ...(typeof value.text_anchor === "string" && TEXT_ANCHOR_VALUES.has(value.text_anchor)
+      ? { text_anchor: value.text_anchor } : {}),
+    ...(value.position && typeof value.position === "object" && !Array.isArray(value.position)
+      && (finiteNumber(value.position.x) || finiteNumber(value.position.y))
+      ? {
+          position: {
+            ...(finiteNumber(value.position.x) ? { x: value.position.x } : {}),
+            ...(finiteNumber(value.position.y) ? { y: value.position.y } : {}),
+          },
+        } : {}),
+    ...(value.shadow && typeof value.shadow === "object" && !Array.isArray(value.shadow)
+      && typeof value.shadow.color === "string"
+      ? {
+          shadow: {
+            color: value.shadow.color,
+            ...(finiteNumber(value.shadow.opacity) ? { opacity: value.shadow.opacity } : {}),
+            ...(finiteNumber(value.shadow.blur_px) ? { blur_px: value.shadow.blur_px } : {}),
+            ...(finiteNumber(value.shadow.distance_px) ? { distance_px: value.shadow.distance_px } : {}),
+            ...(finiteNumber(value.shadow.angle_deg) ? { angle_deg: value.shadow.angle_deg } : {}),
+          },
+        } : {}),
+    ...(value.glow && typeof value.glow === "object" && !Array.isArray(value.glow)
+      && typeof value.glow.color === "string"
+      ? {
+          glow: {
+            color: value.glow.color,
+            ...(finiteNumber(value.glow.density) ? { density: value.glow.density } : {}),
+            ...(finiteNumber(value.glow.spread) ? { spread: value.glow.spread } : {}),
+            ...(finiteNumber(value.glow.offset_x) ? { offset_x: value.glow.offset_x } : {}),
+            ...(finiteNumber(value.glow.offset_y) ? { offset_y: value.glow.offset_y } : {}),
+          },
+        } : {}),
+    ...(animationIn || animationLoop || animationOut
+      ? {
+          animation: {
+            ...(animationIn ? { in: animationIn } : {}),
+            ...(animationLoop ? { loop: animationLoop } : {}),
+            ...(animationOut ? { out: animationOut } : {}),
+          },
+        } : {}),
     ...(value.stroke && typeof value.stroke === "object" && !Array.isArray(value.stroke)
       ? {
           stroke: {
             ...(typeof value.stroke.color === "string" ? { color: value.stroke.color } : {}),
-            ...(typeof value.stroke.width_px === "number" && Number.isFinite(value.stroke.width_px)
-              ? { width_px: value.stroke.width_px } : {}),
+            ...(finiteNumber(value.stroke.width_px) ? { width_px: value.stroke.width_px } : {}),
           },
         } : {}),
     ...(value.background && typeof value.background === "object" && !Array.isArray(value.background)
       ? {
           background: {
             ...(typeof value.background.color === "string" ? { color: value.background.color } : {}),
-            ...(typeof value.background.opacity === "number" && Number.isFinite(value.background.opacity)
-              ? { opacity: value.background.opacity } : {}),
-            ...(typeof value.background.radius_px === "number"
-              && Number.isFinite(value.background.radius_px)
-              ? { radius_px: value.background.radius_px } : {}),
+            ...(finiteNumber(value.background.opacity) ? { opacity: value.background.opacity } : {}),
+            ...(finiteNumber(value.background.radius_px) ? { radius_px: value.background.radius_px } : {}),
+            ...(finiteNumber(value.background.padding_px) ? { padding_px: value.background.padding_px } : {}),
+            ...(finiteNumber(value.background.height_pct) ? { height_pct: value.background.height_pct } : {}),
+            ...(finiteNumber(value.background.width_pct) ? { width_pct: value.background.width_pct } : {}),
+            ...(finiteNumber(value.background.offset_x) ? { offset_x: value.background.offset_x } : {}),
+            ...(finiteNumber(value.background.offset_y) ? { offset_y: value.background.offset_y } : {}),
             ...(value.background.mode === "per-line" || value.background.mode === "block"
               ? { mode: value.background.mode } : {}),
           },
         } : {}),
     ...(typeof value.zone === "string" ? { zone: value.zone } : {}),
   };
+}
+
+function usesPercentageBackground(background) {
+  return (finiteNumber(background?.width_pct) && background.width_pct > 0)
+    || (finiteNumber(background?.height_pct) && background.height_pct > 0);
+}
+
+function usesExtendedPerLineBackground(background) {
+  if (!background || background.mode === "block") return false;
+  return usesPercentageBackground(background)
+    || (finiteNumber(background.offset_x) && background.offset_x !== 0)
+    || (finiteNumber(background.offset_y) && background.offset_y !== 0);
 }
 
 function colorWithOpacity(color, explicitOpacity) {
@@ -304,24 +650,151 @@ function zoneVars(zone) {
   };
 }
 
+// --- テキストアニメーション語彙（presets/textanim・2026-08-03 textstyle v0） ---
+// in / out / loop の 3 スロット（旧 video-on-os textAnimationAtf と同型）。
+// out は in レシピの animation-direction: reverse（時間反転）で表現する。
+// すべて paused + both で宣言し、rasterize の __akariSeek（getAnimations subtree）が
+// currentTime を与える既存レール（karaoke / reveal と同一）に乗せる。
+// 振幅ツマミ amp は距離・スケール系レシピ内の calc(var(--akari-anim-amp, 1) * …) に効く。
+const DEFAULT_ANIMATION_DURATION_SEC = 0.6;
+const DEFAULT_LOOP_PERIOD_SEC = 1.6;
+const A = "var(--akari-anim-amp, 1)";
+export const CAPTION_ANIMATION_RECIPES = {
+  // フェード
+  "fade-in-out": `from { opacity: 0; } to { opacity: 1; }`,
+  "soft-fade": `from { opacity: 0; transform: scale(calc(1 + 0.04 * ${A})); } to { opacity: 1; transform: scale(1); }`,
+  "fade-up": `from { opacity: 0; transform: translateY(calc(0.6em * ${A})); } to { opacity: 1; transform: translateY(0); }`,
+  "fade-down": `from { opacity: 0; transform: translateY(calc(-0.6em * ${A})); } to { opacity: 1; transform: translateY(0); }`,
+  "cinematic-fade": `from { opacity: 0; transform: scale(calc(1 - 0.06 * ${A})); } to { opacity: 1; transform: scale(1); }`,
+  // スライド
+  "slide-left": `from { opacity: 0; transform: translateX(calc(1.2em * ${A})); } to { opacity: 1; transform: translateX(0); }`,
+  "slide-right": `from { opacity: 0; transform: translateX(calc(-1.2em * ${A})); } to { opacity: 1; transform: translateX(0); }`,
+  "slide-up": `from { opacity: 0; transform: translateY(calc(1.2em * ${A})); } to { opacity: 1; transform: translateY(0); }`,
+  "slide-down": `from { opacity: 0; transform: translateY(calc(-1.2em * ${A})); } to { opacity: 1; transform: translateY(0); }`,
+  "push-left": `from { transform: translateX(calc(2em * ${A})); clip-path: inset(0 0 0 100%); } to { transform: translateX(0); clip-path: inset(0); }`,
+  "push-right": `from { transform: translateX(calc(-2em * ${A})); clip-path: inset(0 100% 0 0); } to { transform: translateX(0); clip-path: inset(0); }`,
+  "push-up": `from { transform: translateY(calc(1.4em * ${A})); clip-path: inset(100% 0 0 0); } to { transform: translateY(0); clip-path: inset(0); }`,
+  "push-down": `from { transform: translateY(calc(-1.4em * ${A})); clip-path: inset(0 0 100% 0); } to { transform: translateY(0); clip-path: inset(0); }`,
+  "rise-soft": `from { opacity: 0; transform: translateY(calc(0.35em * ${A})) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); }`,
+  "drop-in": `0% { opacity: 0; transform: translateY(calc(-1.6em * ${A})); } 70% { opacity: 1; transform: translateY(calc(0.12em * ${A})); } 100% { opacity: 1; transform: translateY(0); }`,
+  // ズーム
+  "zoom-in-out": `from { opacity: 0; transform: scale(calc(1 - 0.4 * ${A})); } to { opacity: 1; transform: scale(1); }`,
+  "zoom-pop": `0% { opacity: 0; transform: scale(0.4); } 70% { opacity: 1; transform: scale(calc(1 + 0.12 * ${A})); } 100% { opacity: 1; transform: scale(1); }`,
+  "zoom-pulse": `0% { opacity: 0; transform: scale(0.7); } 55% { opacity: 1; transform: scale(calc(1 + 0.06 * ${A})); } 100% { opacity: 1; transform: scale(1); }`,
+  // 弾性
+  "pop": `0% { opacity: 0; transform: scale(0.5); } 65% { opacity: 1; transform: scale(calc(1 + 0.18 * ${A})); } 100% { opacity: 1; transform: scale(1); }`,
+  "bounce": `0% { opacity: 0; transform: translateY(calc(-1.2em * ${A})); } 55% { opacity: 1; transform: translateY(calc(0.22em * ${A})); } 75% { transform: translateY(calc(-0.1em * ${A})); } 100% { opacity: 1; transform: translateY(0); }`,
+  "squash-pop": `0% { opacity: 0; transform: scale(1.4, 0.4); } 60% { opacity: 1; transform: scale(0.92, 1.1); } 100% { opacity: 1; transform: scale(1); }`,
+  "stretch-in": `0% { opacity: 0; transform: scaleX(0.2); } 70% { opacity: 1; transform: scaleX(calc(1 + 0.08 * ${A})); } 100% { opacity: 1; transform: scaleX(1); }`,
+  "stomp": `0% { opacity: 0; transform: scale(calc(1 + 0.9 * ${A})); } 60% { opacity: 1; transform: scale(0.96); } 100% { opacity: 1; transform: scale(1); }`,
+  "snap": `0% { opacity: 0; transform: rotate(calc(-6deg * ${A})) scale(0.8); } 70% { opacity: 1; transform: rotate(calc(2deg * ${A})) scale(1.04); } 100% { opacity: 1; transform: rotate(0) scale(1); }`,
+  // 回転
+  "rotate-in": `from { opacity: 0; transform: rotate(calc(-12deg * ${A})) scale(0.9); } to { opacity: 1; transform: rotate(0) scale(1); }`,
+  "spin-in": `from { opacity: 0; transform: rotate(calc(-180deg * ${A})) scale(0.5); } to { opacity: 1; transform: rotate(0) scale(1); }`,
+  "roll-in": `from { opacity: 0; transform: translateX(calc(-2em * ${A})) rotate(calc(-120deg * ${A})); } to { opacity: 1; transform: translateX(0) rotate(0); }`,
+  "spiral-in": `from { opacity: 0; transform: rotate(calc(240deg * ${A})) scale(0.2); } to { opacity: 1; transform: rotate(0) scale(1); }`,
+  "swing": `0% { opacity: 0; transform: rotate(calc(14deg * ${A})); transform-origin: top center; } 60% { opacity: 1; transform: rotate(calc(-6deg * ${A})); transform-origin: top center; } 100% { opacity: 1; transform: rotate(0); transform-origin: top center; }`,
+  // 強調
+  "shake": `0%, 100% { transform: translateX(0); } 20% { transform: translateX(calc(-0.16em * ${A})); } 40% { transform: translateX(calc(0.14em * ${A})); } 60% { transform: translateX(calc(-0.1em * ${A})); } 80% { transform: translateX(calc(0.06em * ${A})); }`,
+  "jitter": `0%, 100% { transform: translate(0, 0); } 25% { transform: translate(calc(0.05em * ${A}), calc(-0.04em * ${A})); } 50% { transform: translate(calc(-0.05em * ${A}), calc(0.04em * ${A})); } 75% { transform: translate(calc(0.03em * ${A}), calc(0.05em * ${A})); }`,
+  "glitch": `0% { opacity: 0; transform: translate(calc(-0.2em * ${A}), 0); clip-path: inset(0 0 60% 0); } 30% { opacity: 1; transform: translate(calc(0.12em * ${A}), 0); clip-path: inset(30% 0 20% 0); } 60% { transform: translate(calc(-0.06em * ${A}), 0); clip-path: inset(10% 0 45% 0); } 100% { opacity: 1; transform: translate(0, 0); clip-path: inset(0); }`,
+  "flash": `0% { opacity: 0; } 30% { opacity: 1; } 45% { opacity: 0.2; } 60% { opacity: 1; } 75% { opacity: 0.5; } 100% { opacity: 1; }`,
+  "heartbeat": `0% { transform: scale(1); } 25% { transform: scale(calc(1 + 0.12 * ${A})); } 45% { transform: scale(1); } 65% { transform: scale(calc(1 + 0.08 * ${A})); } 100% { transform: scale(1); }`,
+  // 文字表示（ブロック近似 — 文字単位ではなく塗り出し）
+  "typewriter": `from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); }`,
+  "wipe-left": `from { clip-path: inset(0 0 0 100%); } to { clip-path: inset(0); }`,
+  "wipe-right": `from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0); }`,
+  // ループ
+  "wobble": `0%, 100% { transform: rotate(calc(-1.6deg * ${A})); } 50% { transform: rotate(calc(1.6deg * ${A})); }`,
+  "float": `0%, 100% { transform: translateY(0); } 50% { transform: translateY(calc(-0.22em * ${A})); }`,
+  "breath": `0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(calc(1 + 0.03 * ${A})); opacity: 0.92; }`,
+  "neon-flicker": `0%, 100% { opacity: 1; } 8% { opacity: 0.6; } 12% { opacity: 1; } 40% { opacity: 0.85; } 44% { opacity: 1; } 70% { opacity: 0.4; } 74% { opacity: 1; }`,
+  "hologram": `0%, 100% { opacity: 1; transform: translateX(0); } 30% { opacity: 0.75; transform: translateX(calc(0.03em * ${A})); } 60% { opacity: 0.9; transform: translateX(calc(-0.03em * ${A})); }`,
+  "retro-flicker": `0%, 100% { opacity: 1; } 25% { opacity: 0.7; } 50% { opacity: 1; } 75% { opacity: 0.8; }`,
+  // テロップ
+  "caption-rise": `from { opacity: 0; transform: translateY(calc(0.5em * ${A})); } to { opacity: 1; transform: translateY(0); }`,
+  "news-ticker": `from { transform: translateX(100%); } to { transform: translateX(-100%); }`,
+  "marquee-left": `from { transform: translateX(100%); } to { transform: translateX(-100%); }`,
+  "crawl-up": `from { transform: translateY(100%); } to { transform: translateY(-100%); }`,
+};
+const LOOP_ANIMATION_IDS = new Set([
+  "wobble", "float", "breath", "neon-flicker", "hologram", "retro-flicker",
+  "news-ticker", "marquee-left", "crawl-up",
+]);
+
+// textStyle.animation → プレートに載せる animation プロパティ + 使用キーフレーム CSS。
+// overlayDuration はこのオーバーレイ自身の表示秒（out の開始遅延に使う）。
+export function buildCaptionAnimation(animation, overlayDuration, onWarning) {
+  if (!animation || typeof animation !== "object") return null;
+  const parts = [];
+  const keyframes = new Map();
+  const ampValues = [];
+
+  const resolveSlot = (slot, kind) => {
+    if (!slot) return;
+    const recipe = CAPTION_ANIMATION_RECIPES[slot.id];
+    if (!recipe) {
+      onWarning?.(`unknown textanim id "${slot.id}" (${kind} slot); slot ignored`);
+      return;
+    }
+    keyframes.set(slot.id, recipe);
+    if (slot.amp !== undefined) ampValues.push(slot.amp);
+    if (kind === "loop") {
+      const period = slot.duration_sec ?? DEFAULT_LOOP_PERIOD_SEC;
+      parts.push(`akari-anim-${slot.id} ${formatSeconds(period)}s linear 0s infinite both paused`);
+      return;
+    }
+    const duration = Math.min(
+      slot.duration_sec ?? DEFAULT_ANIMATION_DURATION_SEC,
+      Math.max(0.05, overlayDuration),
+    );
+    const ease = slot.ease ?? "ease-out";
+    if (kind === "in") {
+      parts.push(`akari-anim-${slot.id} ${formatSeconds(duration)}s ${ease} 0s 1 normal both paused`);
+    } else {
+      const delay = Math.max(0, overlayDuration - duration);
+      parts.push(`akari-anim-${slot.id} ${formatSeconds(duration)}s ${ease} ${formatSeconds(delay)}s 1 reverse forwards paused`);
+    }
+  };
+
+  resolveSlot(animation.in, "in");
+  resolveSlot(animation.loop, "loop");
+  resolveSlot(animation.out, "out");
+  if (parts.length === 0) return null;
+
+  const keyframesCss = [...keyframes.entries()]
+    .map(([id, recipe]) => `    @keyframes akari-anim-${id} { ${recipe} }`)
+    .join("\n");
+  return {
+    animationCss: parts.join(", "),
+    keyframesCss,
+    // amp は全スロット共通の 1 変数（スロット別に分けたくなったら変数を分割する）
+    ampCss: ampValues.length > 0 ? `--akari-anim-amp: ${ampValues[0]};` : "",
+  };
+}
+
 // cuts 交差後の (timeline 秒) に加えて、当該レンジがカバーする (source 秒) の範囲も返す。
 // words[] のクリップ・トークン遅延の基準点計算に使う内部形。公開 API
 // (sourceRangeToTimeline) は既存の { start, duration } 形のみを返し続ける。
-function computeCaptionRanges(start, end, cuts, sourceId = null, linearTimeline = false) {
+//
+// task 2026-08-07-captions-linear-timeline: このカット境界オフセット計算はかつて
+// v1（multi-source, generateCaptionOverlays が linearTimeline: true を渡す）向けに
+// cuts.reduce() の素の累積和を自前で持っていたが、これは buildCutCommand /
+// buildMultiSourceCutCommand が xfade 用に使う computeCutTimelineOffsets（cut-timeline.mjs）
+// と同じ「順送りの区間積算」でありながら、cuts[].transition_out の重なり（オーバーラップ）を
+// 一切減算しない別実装だった。v1 の transition_out 自体が render-cut 側で長らく no-op
+// だったため無害だったが（task 2026-08-07-v1-transition-out で xfade を実装するまで）、
+// 実装後は「動画は正しく縮むのに字幕だけ旧タイムラインに残る」という食い違いを生む
+// （実測: 5 箇所の transition_out で計 0.9s 短縮されたのに captionsEnd は旧タイムライン
+// のまま → computeContentDurationSeconds が captionsEnd を採用し、末尾に黒フレームが
+// 追加された）。両実装は cuts と同じ index で参照されるだけの並列配列を返す点で同形なので、
+// 常に computeCutTimelineOffsets(cuts) を使うよう統合する。
+function computeCaptionRanges(start, end, cuts, sourceId = null) {
   if (!Array.isArray(cuts) || cuts.length === 0) {
     return [{ start, duration: end - start, sourceStart: start, sourceEnd: end }];
   }
 
-  const offsets = linearTimeline
-    ? cuts.reduce((result, cut) => {
-        const previous = result[result.length - 1];
-        result.push({
-          start: previous ? previous.start + previous.duration : 0,
-          duration: segmentDuration(cut),
-        });
-        return result;
-      }, [])
-    : computeCutTimelineOffsets(cuts);
+  const offsets = computeCutTimelineOffsets(cuts);
   const ranges = [];
   for (const [index, cut] of cuts.entries()) {
     if (sourceId !== null && cut.src !== sourceId) continue;
@@ -398,6 +871,29 @@ export function renderCaptionFragment(text, options = {}) {
   const lineTextAlignCss = options.textStyleActive
     ? "      text-align: var(--caption-text-align, center);\n"
     : "";
+  const fontFaceCss = options.textStyleActive ? CAPTION_FONT_FACE_CSS : CAPTION_DEFAULT_FONT_FACE_CSS;
+  const typographyCss = options.textStyleActive
+    ? `      font-family: var(--caption-font-family, ${CAPTION_FONT_STACK});
+      font-size: var(--caption-font-size, ${baseFontSize}px);
+      font-weight: var(--caption-font-weight, 700);
+      font-style: var(--caption-font-style, normal);
+      text-decoration: var(--caption-text-decoration, none);
+      letter-spacing: var(--caption-letter-spacing, normal);
+      text-transform: var(--caption-text-transform, none);
+      line-height: var(--caption-line-height, 1.42);`
+    : `      font-family: ${CAPTION_FONT_STACK};
+      font-size: var(--caption-font-size, ${baseFontSize}px);
+      font-weight: 700;
+      line-height: 1.42;`;
+  const writingModeCss = options.textStyleActive
+    ? "      writing-mode: var(--caption-writing-mode, horizontal-tb);\n"
+    : "";
+  const plateAnimationCss = options.captionAnimation
+    ? `${options.captionAnimation.ampCss ? `      ${options.captionAnimation.ampCss}\n` : ""}      animation: ${options.captionAnimation.animationCss};`
+    : "      animation: akari-caption-fade 180ms ease-out both;";
+  const animationKeyframesCss = options.captionAnimation
+    ? `\n${options.captionAnimation.keyframesCss}`
+    : "";
   const lines = splitCaptionLines(text, maximum);
   const markup = lines
     .map((line) => `<p class="akari-caption__line">${escapeHtml(line)}</p>`)
@@ -428,10 +924,28 @@ export function renderCaptionFragment(text, options = {}) {
       background: transparent;
     }`
     : "";
+  const extendedPlateCss = options.extendedBackground
+    ? `
+    .akari-caption__line {
+      position: relative;
+      isolation: isolate;
+      padding: 0;
+      border-radius: 0;
+    }
+    .akari-caption__line::before {
+      content: "";
+      position: absolute;
+      inset: calc(0px - var(--plate-ext-height, 0px)) calc(0px - var(--plate-ext-width, 0px));
+      z-index: -1;
+      border-radius: var(--plate-ext-radius, 10px);
+      background: var(--plate-ext-bg, transparent);
+      transform: translate(var(--plate-offset-x, 0px), var(--plate-offset-y, 0px));
+    }`
+    : "";
 
   return `<div class="akari-caption">
   <style>
-    ${CAPTION_FONT_FACE_CSS}
+    ${fontFaceCss}
     .akari-caption {
       position: absolute;
       inset: 0;
@@ -440,10 +954,7 @@ export function renderCaptionFragment(text, options = {}) {
       -webkit-text-stroke: var(--caption-stroke, 0.14em rgba(0,0,0,.9));
       paint-order: stroke fill;
       text-shadow: var(--caption-text-shadow, 0 2px 8px rgba(0,0,0,.35));
-      font-family: ${CAPTION_FONT_STACK};
-      font-size: var(--caption-font-size, ${baseFontSize}px);
-      font-weight: 700;
-      line-height: 1.42;
+${typographyCss}
       text-align: center;
     }
     .akari-caption__plate {
@@ -454,7 +965,7 @@ ${platePlacementCss}
       flex-direction: column;
 ${plateAlignmentCss}      gap: var(--plate-gap, 4px);
       opacity: 1;
-      animation: akari-caption-fade 180ms ease-out both;
+${plateAnimationCss}
     }
     .akari-caption__line {
       width: max-content;
@@ -463,11 +974,11 @@ ${linePlacementCss}
       border-radius: var(--plate-radius, 10px);
       background: var(--plate-bg, transparent);
 ${lineTextAlignCss}      white-space: pre;
-    }${blockPlateCss}
+${writingModeCss}    }${blockPlateCss}${extendedPlateCss}
     @keyframes akari-caption-fade {
       from { opacity: 0; transform: translateY(0.18em); }
       to { opacity: 1; transform: translateY(0); }
-    }
+    }${animationKeyframesCss}
   </style>
   <div class="akari-caption__plate">${plateMarkup}</div>
 </div>`;
@@ -503,6 +1014,29 @@ export function renderStyledCaptionFragment(words, style, options = {}) {
       margin: 0 auto;`;
   const lineTextAlignCss = options.textStyleActive
     ? "      text-align: var(--caption-text-align, center);\n"
+    : "";
+  const fontFaceCss = options.textStyleActive ? CAPTION_FONT_FACE_CSS : CAPTION_DEFAULT_FONT_FACE_CSS;
+  const typographyCss = options.textStyleActive
+    ? `      font-family: var(--caption-font-family, ${CAPTION_FONT_STACK});
+      font-size: var(--caption-font-size, ${baseFontSize}px);
+      font-weight: var(--caption-font-weight, 700);
+      font-style: var(--caption-font-style, normal);
+      text-decoration: var(--caption-text-decoration, none);
+      letter-spacing: var(--caption-letter-spacing, normal);
+      text-transform: var(--caption-text-transform, none);
+      line-height: var(--caption-line-height, 1.42);`
+    : `      font-family: ${CAPTION_FONT_STACK};
+      font-size: var(--caption-font-size, ${baseFontSize}px);
+      font-weight: 700;
+      line-height: 1.42;`;
+  const writingModeCss = options.textStyleActive
+    ? "      writing-mode: var(--caption-writing-mode, horizontal-tb);\n"
+    : "";
+  const plateAnimationCss = options.captionAnimation
+    ? `${options.captionAnimation.ampCss ? `      ${options.captionAnimation.ampCss}\n` : ""}      animation: ${options.captionAnimation.animationCss};`
+    : "      animation: akari-caption-fade 180ms ease-out both;";
+  const animationKeyframesCss = options.captionAnimation
+    ? `\n${options.captionAnimation.keyframesCss}`
     : "";
   const rangeStart = options.rangeStart ?? 0;
   const rangeEnd = options.rangeEnd ?? Math.max(rangeStart, ...words.map((word) => word.end));
@@ -561,13 +1095,32 @@ export function renderStyledCaptionFragment(words, style, options = {}) {
       background: transparent;
     }`
     : "";
+  const extendedPlateCss = options.extendedBackground
+    ? `
+    .akari-caption__line {
+      position: relative;
+      isolation: isolate;
+      padding: 0;
+      border-radius: 0;
+    }
+    .akari-caption__line::before {
+      content: "";
+      position: absolute;
+      inset: calc(0px - var(--plate-ext-height, 0px)) calc(0px - var(--plate-ext-width, 0px));
+      z-index: -1;
+      border-radius: var(--plate-ext-radius, 10px);
+      background: var(--plate-ext-bg, transparent);
+      transform: translate(var(--plate-offset-x, 0px), var(--plate-offset-y, 0px));
+    }`
+    : "";
 
   const emphasisCss = hasEmphasis ? renderEmphasisCss() : "";
+  const revealWordCss = effectiveStyle === REVEAL_WORD_STYLE ? renderRevealWordCss() : "";
   const revealCss = effectiveStyle === REVEAL_STYLE ? renderRevealCss() : "";
 
   return `<div class="akari-caption akari-caption--${rootStyle}">
   <style>
-    ${CAPTION_FONT_FACE_CSS}
+    ${fontFaceCss}
     .akari-caption {
       position: absolute;
       inset: 0;
@@ -576,10 +1129,7 @@ export function renderStyledCaptionFragment(words, style, options = {}) {
       -webkit-text-stroke: var(--caption-stroke, 0.14em rgba(0,0,0,.9));
       paint-order: stroke fill;
       text-shadow: var(--caption-text-shadow, 0 2px 8px rgba(0,0,0,.35));
-      font-family: ${CAPTION_FONT_STACK};
-      font-size: var(--caption-font-size, ${baseFontSize}px);
-      font-weight: 700;
-      line-height: 1.42;
+${typographyCss}
       text-align: center;
     }
     .akari-caption__plate {
@@ -590,7 +1140,7 @@ ${platePlacementCss}
       flex-direction: column;
 ${plateAlignmentCss}      gap: var(--plate-gap, 4px);
       opacity: 1;
-      animation: akari-caption-fade 180ms ease-out both;
+${plateAnimationCss}
     }
     .akari-caption__line {
       width: max-content;
@@ -599,7 +1149,7 @@ ${linePlacementCss}
       border-radius: var(--plate-radius, 10px);
       background: var(--plate-bg, transparent);
 ${lineTextAlignCss}      white-space: pre;
-    }${blockPlateCss}
+${writingModeCss}    }${blockPlateCss}${extendedPlateCss}
     .akari-caption__tok {
       display: inline-block;
       will-change: transform, color;
@@ -607,7 +1157,7 @@ ${lineTextAlignCss}      white-space: pre;
     @keyframes akari-caption-fade {
       from { opacity: 0; transform: translateY(0.18em); }
       to { opacity: 1; transform: translateY(0); }
-    }
+    }${animationKeyframesCss}
     @keyframes akari-caption-karaoke-lit {
       from { color: var(--caption-color, #fff); }
       to { color: var(--caption-highlight-color, #ffd94a); }
@@ -622,7 +1172,7 @@ ${lineTextAlignCss}      white-space: pre;
     }
     .akari-caption__tok--pop {
       animation: akari-caption-pop 0.2s var(--akari-tok-delay, 0s) ease-out both paused;
-    }${revealCss}${emphasisCss}
+    }${revealWordCss}${revealCss}${emphasisCss}
   </style>
   <div class="akari-caption__plate">${plateMarkup}</div>
 </div>`;
@@ -912,9 +1462,24 @@ function renderRevealCss() {
     }`;
 }
 
+function renderRevealWordCss() {
+  return `
+    @keyframes akari-caption-reveal-word {
+      0% { opacity: 0; }
+      100% { opacity: 1; }
+    }
+    .akari-caption__tok--reveal-word {
+      animation: akari-caption-reveal-word 0.01s var(--akari-tok-delay, 0s) linear both paused;
+    }`;
+}
+
 function renderCaptionToken(word, rangeStart, style, emphasisWords = [], emphasisTimeScale = 1) {
   if (word.untimed) {
     return `<span class="akari-caption__tok akari-caption__tok--unlit">${escapeHtml(word.text)}</span>`;
+  }
+  if (style === REVEAL_WORD_STYLE) {
+    const delay = formatSeconds(Math.max(0, word.start - rangeStart));
+    return `<span class="akari-caption__tok akari-caption__tok--reveal-word" style="--akari-tok-delay: ${delay}s">${escapeHtml(word.text)}</span>`;
   }
   const emphasis = findMatchingEmphasis(word, emphasisWords);
   // 語レベル演出は caption の karaoke/pop より該当 token だけ優先する。
@@ -942,12 +1507,18 @@ function renderEmphasisCaptionToken(word, rangeStart, emphasis, timeScale) {
   const duration = Math.max(0.01, (overlapEnd - overlapStart) * timeScale);
   const baseClass = `akari-caption__tok akari-caption__tok--emphasis akari-caption__tok--${style}`;
 
-  if (style === EMPHASIS_STYLE_ONE_CHAR_BANG) {
+  if (style === EMPHASIS_STYLE_ONE_CHAR_BANG || style === EMPHASIS_STYLE_ONE_CHAR_JUMBLE) {
+    // one-char-jumble は one-char-bang の per-char 順次登場をそのまま再利用し（同一クラス・
+    // 同一キーフレーム）、各文字に静的ジッター（rotate/translate/scale の個別プロパティ）を
+    // 追加で乗せるだけ。--akari-jumble-amp が 0 のとき jitterSuffix の 3 プロパティは恒等値へ
+    // 潰れるため、amp=0 の出力は one-char-bang と画素等価になる。
+    const jumble = style === EMPHASIS_STYLE_ONE_CHAR_JUMBLE;
     const characters = Array.from(word.text);
     const characterDuration = duration / characters.length;
     const markup = characters.map((character, index) => {
       const characterDelay = formatSeconds(delay + characterDuration * index);
-      return `<span class="akari-caption__emphasis-char" style="--akari-emphasis-delay: ${characterDelay}s; --akari-emphasis-dur: ${formatSeconds(Math.max(0.01, characterDuration))}s">${escapeHtml(character)}</span>`;
+      const jitterSuffix = jumble ? `; ${renderJumbleCharJitter(emphasis.id, index)}` : "";
+      return `<span class="akari-caption__emphasis-char" style="--akari-emphasis-delay: ${characterDelay}s; --akari-emphasis-dur: ${formatSeconds(Math.max(0.01, characterDuration))}s${jitterSuffix}">${escapeHtml(character)}</span>`;
     }).join("");
     return `<span class="${baseClass}" data-emphasis-id="${emphasis.id}">${markup}</span>`;
   }
@@ -971,6 +1542,39 @@ function renderEmphasisCaptionToken(word, rangeStart, emphasis, timeScale) {
   }
 
   return `<span class="${baseClass}" data-emphasis-id="${emphasis.id}" style="color: var(--akari-emphasis-${emphasisColorName(emphasis.emotion)})">${escapeHtml(word.text)}</span>`;
+}
+
+// FNV-1a 32bit — 暗号用途ではなく one-char-jumble の決定論シード生成専用。
+// 同一文字列は常に同一ハッシュを返すため Math.random 抜きで再現可能な擬似乱数が作れる。
+function fnv1a32(text) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+// ハッシュ値を [-1, 1) の決定論的な擬似乱数へ正規化する。
+function jumbleSignedUnit(seed) {
+  return (fnv1a32(seed) / 0x100000000) * 2 - 1;
+}
+
+function jumbleRound(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+// emphasis.id + 文字 index をシードに、文字ごとの静的ジッター（角度・縦位置・拡大率）を
+// 個別プロパティ（rotate/translate/scale）として生成する。transform を書き換える
+// one-char-bang の登場キーフレームとは別プロパティなので、seek-safe な WAAPI 変換
+// （rasterize.mjs の getAnimations({subtree:true}) 経由）と衝突しない。
+function renderJumbleCharJitter(emphasisId, index) {
+  const rotateDeg = jumbleRound(jumbleSignedUnit(`${emphasisId}:${index}:rotate`) * JUMBLE_MAX_ROTATE_DEG);
+  const offsetEm = jumbleRound(jumbleSignedUnit(`${emphasisId}:${index}:offset`) * JUMBLE_MAX_OFFSET_EM);
+  const scaleAmp = jumbleRound(jumbleSignedUnit(`${emphasisId}:${index}:scale`) * JUMBLE_MAX_SCALE_AMP);
+  return `rotate: calc(${rotateDeg}deg * var(--akari-jumble-amp, 1)); `
+    + `translate: 0 calc(${offsetEm}em * var(--akari-jumble-amp, 1)); `
+    + `scale: calc(1 + ${scaleAmp} * var(--akari-jumble-amp, 1))`;
 }
 
 function renderEmphasisCss() {
@@ -1063,6 +1667,8 @@ function resolveEmphasisStyle(emphasis) {
   if (SUPPORTED_EMPHASIS_STYLES.has(emphasis.style_hint)) return emphasis.style_hint;
   if (emphasis.style_hint !== undefined) return EMPHASIS_STYLE_COLOR_ACCENT;
   if (["pain", "surprise", "anger"].includes(emphasis.emotion)) return EMPHASIS_STYLE_ONE_CHAR_BANG;
+  // disgust（生理的に無理・きつい系）は one-char-jumble を既定にする（2026-08-05 方針メモ §1）。
+  if (emphasis.emotion === "disgust") return EMPHASIS_STYLE_ONE_CHAR_JUMBLE;
   if (["joy", "emphasis"].includes(emphasis.emotion)) return EMPHASIS_STYLE_SIZE_PULSE;
   return EMPHASIS_STYLE_COLOR_ACCENT;
 }

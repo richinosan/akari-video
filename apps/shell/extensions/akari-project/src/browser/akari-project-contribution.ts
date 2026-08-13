@@ -28,14 +28,25 @@ import {
 } from '@theia/core/lib/browser/shell/tab-bar-toolbar';
 import { DiffUris } from '@theia/core/lib/browser/diff-uris';
 import { FileDialogService } from '@theia/filesystem/lib/browser';
+import { FileService } from '@theia/filesystem/lib/browser/file-service';
 import { WorkspaceService } from '@theia/workspace/lib/browser/workspace-service';
 import { AkariProjectService, DroppedVideo } from '../common/akari-project-protocol';
+import { ElectronAkariProjectApi } from '../electron-common/electron-api';
 import { AkariProjectModeService } from './akari-project-mode-service';
 import { AkariWorkflowService } from './akari-workflow-service';
+import { AkariRoleBucketsWidget } from './akari-role-buckets-widget';
+import { AKARI_REVEAL_IN_FILE_MANAGER, AKARI_REVEAL_PROJECT_ROOT, AKARI_SHOW_ASSET_INFO } from './akari-reveal-commands';
+import { AkariAssetInspector } from './akari-asset-inspector';
 
+/**
+ * 「場所を選んで新規作成…」。File メニュー先頭の「新規プロジェクト作成」は
+ * 2026-08-07 のオーナー裁定でホームと同じ経路（akari.home.newProject）に移した。
+ * こちらは**保存先を自分で決めたい**とき用の副導線として残す
+ * （選べるのは空フォルダだけ、という既存契約は不変 — 既存ファイルには触らない）。
+ */
 export const NEW_AKARI_PROJECT: Command = {
     id: 'akari.project.new',
-    label: '新規プロジェクト作成'
+    label: '場所を選んで新規作成…'
 };
 export const SHOW_AKARI_CHANGES: Command = {
     id: 'akari.project.showChanges',
@@ -44,6 +55,10 @@ export const SHOW_AKARI_CHANGES: Command = {
 export const TOGGLE_AKARI_DEVELOPER_MODE: Command = {
     id: 'akari.project.toggleDeveloperMode',
     label: '開発者モードを切り替える'
+};
+export const DISCONNECT_AKARI_STORE_ACCOUNT: Command = {
+    id: 'akari.project.disconnectStoreAccount',
+    label: 'AKARI アカウントの接続を解除'
 };
 const PROJECT_CONSENT_MESSAGE =
     'このフォルダを AKARI Video プロジェクトとして使いますか？' +
@@ -63,6 +78,8 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
     protected readonly stateService!: FrontendApplicationStateService;
     @inject(FileDialogService)
     protected readonly dialogs!: FileDialogService;
+    @inject(FileService)
+    protected readonly files!: FileService;
     @inject(WorkspaceService)
     protected readonly workspace!: WorkspaceService;
     @inject(MessageService)
@@ -91,6 +108,18 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
             execute: () => this.toggleDeveloperMode(),
             isToggled: () => this.mode.developerMode
         });
+        commands.registerCommand(DISCONNECT_AKARI_STORE_ACCOUNT, {
+            execute: () => this.disconnectStoreAccount()
+        });
+        commands.registerCommand(AKARI_REVEAL_IN_FILE_MANAGER, {
+            execute: (target: unknown) => this.revealInFileManager(this.toRevealUri(target))
+        });
+        commands.registerCommand(AKARI_REVEAL_PROJECT_ROOT, {
+            execute: () => this.revealProjectRoot()
+        });
+        commands.registerCommand(AKARI_SHOW_ASSET_INFO, {
+            execute: (target: unknown) => this.showAssetInfo(this.toRevealUri(target))
+        });
     }
 
     registerMenus(menus: MenuModelRegistry): void {
@@ -103,6 +132,11 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
             commandId: SHOW_AKARI_CHANGES.id,
             label: SHOW_AKARI_CHANGES.label,
             order: 'z10'
+        });
+        menus.registerMenuAction(CommonMenus.FILE, {
+            commandId: AKARI_REVEAL_PROJECT_ROOT.id,
+            label: AKARI_REVEAL_PROJECT_ROOT.label,
+            order: 'z11'
         });
     }
 
@@ -148,8 +182,28 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
             void this.watchOpenRoots();
         });
         document.addEventListener('dragover', event => {
-            if (event.dataTransfer?.types.includes('Files') || this.getDroppedVideos(event.dataTransfer).length) {
-                event.preventDefault();
+            if (this.isDelegatedDropzone(event.target) || this.isSelfHandledDropTarget(event.target)) {
+                // data-akari-dropzone を持つ場所、および Theia 本体のメインドックパネル
+                // （エディタ領域 — ファイルをタブとして開く自前の 3 点セットを既に持つ、
+                // application-shell.js の dockPanel.node 'dragover'/'drop'）は自前で完結する。
+                // ここで stopPropagation すると capture 段階の時点でそこまで event が
+                // 届かなくなるため、触らない。
+                return;
+            }
+            if (!(event.dataTransfer?.types.includes('Files') || this.getDroppedVideos(event.dataTransfer).length)) {
+                return;
+            }
+            // dropzone-audit 2026-08-09: この capture 段階の preventDefault だけでは
+            // 足りない。Theia 本体（frontend-application.js registerEventListeners）が
+            // document の**バブル段階**で dataTransfer.dropEffect = 'none' を無条件に
+            // 設定しており、stopPropagation で止めない限り最終的にそちらが勝って
+            // drop イベントが一度も発火しない（素材パネルで実測済みの同型バグ、4fdf3f6）。
+            // ここは委譲先を持たない「どこにドロップしても動画を取り込む」フォールバック
+            // 経路なので、素材パネル/ホームと同じ 3 点セットを capture 段階で確定させる。
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.dataTransfer) {
+                event.dataTransfer.dropEffect = 'copy';
             }
         }, true);
         document.addEventListener('drop', event => {
@@ -170,6 +224,17 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
     /** `data-akari-dropzone` を持つ要素（の子孫）へのドロップは、その場所の実装に委ねる。 */
     protected isDelegatedDropzone(target: EventTarget | null): boolean {
         return target instanceof Element && !!target.closest('[data-akari-dropzone]');
+    }
+
+    /**
+     * Theia 本体のメインドックパネル（`#theia-main-content-panel` — エディタのタブ領域）
+     * は `application-shell.js` の `createMainPanel` が独自に dragover/drop の 3 点セットを
+     * 持ち、ファイルをタブとして開く。ここで割り込むと（ファイル種別を判定できる drop
+     * イベント自体は奪わないにせよ）dragover の dropEffect を独自に 'copy' へ書き換えて
+     * しまい、本体側の 'link' カーソルを上書きする副作用が出るため、対象から除外する。
+     */
+    protected isSelfHandledDropTarget(target: EventTarget | null): boolean {
+        return target instanceof Element && !!target.closest('#theia-main-content-panel');
     }
 
     protected async createProject(): Promise<void> {
@@ -340,12 +405,90 @@ export class AkariProjectContribution implements CommandContribution, MenuContri
         }
     }
 
+    /**
+     * 3 箇所（ホームのプロジェクトカード / できたもの各項目 / File メニュー）が共有する
+     * 実体（task 2026-08-09-reveal-in-finder）。存在確認は FileService で先に行い、
+     * 「黙って何も起きない」を避けてエラーメッセージを必ず出す。実際に開く処理は
+     * electron-main の `shell.showItemInFolder`（`electron-api-main.ts`）に委ねる。
+     */
+    protected async revealInFileManager(uri: URI): Promise<void> {
+        const exists = await this.files.exists(uri);
+        if (!exists) {
+            this.messages.error(`見つかりませんでした: ${uri.path.fsPath()}`);
+            return;
+        }
+        const api = (window as Window & { electronAkariProject?: ElectronAkariProjectApi }).electronAkariProject;
+        if (!api) {
+            this.messages.error('この機能は AKARI Video アプリでのみ使えます。');
+            return;
+        }
+        const result = await api.revealInFileManager(uri.path.fsPath());
+        if (!result.ok) {
+            this.messages.error(result.message ?? `開けませんでした: ${uri.path.fsPath()}`);
+        }
+    }
+
+    protected toRevealUri(target: unknown): URI {
+        return target instanceof URI ? target : new URI(String(target));
+    }
+
+    protected async revealProjectRoot(): Promise<void> {
+        const roots = await this.workspace.roots;
+        const root = roots[0]?.resource;
+        if (!root) {
+            this.messages.warn('プロジェクトを開いてください。');
+            return;
+        }
+        await this.revealInFileManager(root);
+    }
+
+    /**
+     * 素材カード「素材の情報を表示」（`akari.project.showAssetInfo`、task
+     * 2026-08-10-material-menu-r2 指示3）。素材の情報パネル（`akari-asset-inspector-widget`、
+     * Explorer view container の常設パート）を reveal/activate してから showAsset を呼ぶ
+     * （司令塔裁定5・指示3）。パネルが見つからない/reveal に失敗する場合は深追いせず
+     * 例外を握って messages.warn に落とす（実機挙動は司令塔検収）。
+     */
+    protected async showAssetInfo(uri: URI): Promise<void> {
+        try {
+            const inspector = await this.widgets.getOrCreateWidget<AkariAssetInspector>(AkariAssetInspector.ID);
+            await this.shell.revealWidget(inspector.id);
+            await this.shell.activateWidget(inspector.id);
+            await inspector.showAsset(uri);
+        } catch (error) {
+            this.messages.warn(`素材の情報を表示できませんでした: ${this.errorMessage(error)}`);
+        }
+    }
+
     protected async toggleDeveloperMode(): Promise<void> {
         await this.preferences.set('akari.developerMode', !this.mode.developerMode, PreferenceScope.User);
         await this.workflow.load();
         const navigator = await this.widgets.getOrCreateWidget('files') as any;
         await navigator.model?.refresh?.();
         this.app?.shell.update();
+    }
+
+    protected async disconnectStoreAccount(): Promise<void> {
+        try {
+            const connection = await this.projectService.getStoreConnectionStatus();
+            if (!connection.connected) {
+                this.messages.info('AKARI アカウントは未接続です。');
+                return;
+            }
+            const action = await this.messages.warn(
+                `${connection.identifier} として接続中です。この端末の接続情報を削除しますか？`,
+                '切断する'
+            );
+            if (action !== '切断する') {
+                return;
+            }
+            await this.projectService.disconnectStoreAccount();
+            const widget = await this.widgets.getOrCreateWidget(AkariRoleBucketsWidget.ID) as AkariRoleBucketsWidget;
+            await widget.refreshStoreConnectionStatus();
+            this.messages.info('AKARI アカウントの接続を解除しました。');
+        } catch (error) {
+            this.messages.error(`接続を解除できませんでした: ${this.errorMessage(error)}`);
+        }
     }
 
     protected errorMessage(error: unknown): string {

@@ -9,6 +9,15 @@ import { promisify } from 'util';
 // in the internal repo's win portability audit §HEVC プレビュー 4節. Kept
 // in its own cache/media-proxy/ directory (not cache/timeline/ where media-cache writes) because
 // proxy output is orders of magnitude larger and slower to produce than thumbnails/waveforms.
+//
+// task/2026-08-09-drop-hevc-proxy: getH264Proxy() is NOT on the default preview-open path
+// anymore. Measurement showed <video> hardware-decodes HEVC fine on the platforms tested, so
+// probing/transcoding proactively was pure added latency (it's what caused the 10s open timeout,
+// not a safeguard against it). The only caller left is
+// AkariPreviewOpenHandler.handleHevcFallbackRequest in the browser extension, which invokes this
+// only after a <video> element has already actually failed to decode a source
+// (MEDIA_ERR_DECODE / MEDIA_ERR_SRC_NOT_SUPPORTED) — i.e. this module is a fallback, exercised
+// only on the exceptional path, never on ordinary open.
 
 const execFileAsync = promisify(execFile);
 
@@ -103,6 +112,35 @@ export async function probeVideoCodecName(videoPath: string): Promise<string | u
     ]);
     const parsed = JSON.parse(stdout) as FfprobeStreamsResult;
     return parsed.streams?.[0]?.codec_name;
+}
+
+// task/2026-08-10-preview-bug-sweep (B1): <video>.webkitAudioDecodedByteCount stays 0 for the
+// entire playback of a real, audible source on the Electron/Chromium build this app ships
+// (measured: Electron 39.8.7 / Chromium 142 — the counter is a stubbed no-op in current
+// Chromium, not a signal of actual silence). Ground truth instead comes from ffprobe: does the
+// source file itself declare an audio stream at all. This can't catch "file has an audio stream
+// but the browser's decoder rejects that specific codec" (a narrower case than the byte-count
+// heuristic aimed for), but it fixes the false positive that fires on every audible source and
+// still correctly flags genuinely silent sources.
+export async function probeHasAudioStream(videoPath: string): Promise<boolean | undefined> {
+    const ffprobePath = await resolveFfprobePath();
+    if (!ffprobePath) {
+        return undefined;
+    }
+    try {
+        const { stdout } = await execFileAsync(ffprobePath, [
+            '-v', 'error',
+            '-select_streams', 'a',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'json',
+            videoPath
+        ]);
+        const parsed = JSON.parse(stdout) as FfprobeStreamsResult;
+        return (parsed.streams?.length ?? 0) > 0;
+    } catch (error) {
+        console.warn('[akari-preview] probeHasAudioStream failed', videoPath, error);
+        return undefined;
+    }
 }
 
 export type GetH264ProxyResult =
