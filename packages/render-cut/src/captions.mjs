@@ -115,8 +115,6 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
   const portrait = typeof output?.width === "number"
     && typeof output?.height === "number"
     && output.height > output.width;
-  const maximum = options.maxCharacters
-    ?? (portrait ? PORTRAIT_MAX_CHARACTERS : DEFAULT_MAX_CHARACTERS);
   const baseFontSize = portrait
     ? Math.round(output.width * PORTRAIT_FONT_SIZE_RATIO)
     : DEFAULT_FONT_SIZE_PX;
@@ -143,6 +141,9 @@ export function generateCaptionOverlays(captions, cuts, options = {}) {
     );
     let style = normalizeCaptionStyle(caption.style);
     const textStyle = mergeCaptionTextStyles(options.defaultTextStyle, caption.text_style);
+    const maximum = textStyle?.max_characters
+      ?? options.maxCharacters
+      ?? (portrait ? PORTRAIT_MAX_CHARACTERS : DEFAULT_MAX_CHARACTERS);
     const textStyleVars = captionTextStyleVars(textStyle);
     const allWords = clipWordsToRange(caption.words, caption.start, caption.end);
     // 縦長の既定: 複数行へ折り返す長さの字幕は全行を一度に出さず、既存 reveal 機構で
@@ -539,6 +540,8 @@ function normalizeTextStyle(value) {
       ? { text_transform: TEXT_TRANSFORM_MAP[value.text_transform] } : {}),
     ...(finiteNumber(value.max_width_pct) && value.max_width_pct > 0 && value.max_width_pct < 100
       ? { max_width_pct: value.max_width_pct } : {}),
+    ...(Number.isInteger(value.max_characters) && value.max_characters > 0
+      ? { max_characters: value.max_characters } : {}),
     ...(typeof value.text_anchor === "string" && TEXT_ANCHOR_VALUES.has(value.text_anchor)
       ? { text_anchor: value.text_anchor } : {}),
     ...(value.position && typeof value.position === "object" && !Array.isArray(value.position)
@@ -1444,6 +1447,14 @@ function renderRevealCss() {
   return `
     .akari-caption--reveal .akari-caption__plate {
       display: grid;
+      /* プレートは通常 flex-column で、水平の寄せは align-items（cross 軸）が担う。
+         reveal は複数行グループを同一セルへ重ねるため grid へ切り替えるが、grid の
+         align-items は block 軸にしか効かないので、そのままだと水平の寄せが失われて
+         左端に張り付く（暗黙トラックが内容幅へシュリンクするため）。トラック自体の
+         配置は justify-content の管轄なので、同じ変数をここへも渡して寄せを維持する
+         （--caption-align-items の値 flex-start/center/flex-end はいずれも
+         justify-content の正当な値）。 */
+      justify-content: var(--caption-align-items, stretch);
       animation: none;
     }
     .akari-caption__reveal-group {

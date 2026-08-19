@@ -6,8 +6,10 @@ import {
     assetStateBadgeTitle,
     catalogCardUiEventTarget,
     catalogItemPackIds,
+    catalogPurchaseActionText,
     deriveAssetDistribution,
     deriveCatalogEmptyStateKind,
+    deriveCatalogResolverNotice,
     deriveStoreLabBaseUrl,
     formatCatalogPackBreakdown,
     groupCatalogItemsByPack,
@@ -183,6 +185,24 @@ test('storeProductUrl: 商品ページ URL（asset.html?id=<id>）を組み立�
         storeProductUrl(undefined, 'app-icon-squircle'),
         'https://akari-oss.app/lab/asset.html?id=app-icon-squircle'
     );
+});
+
+test('catalogPurchaseActionText: カードは額面のみ、リストは「で購入」まで表示する', () => {
+    const url = 'https://akari-oss.app/lab/asset.html?id=paid-asset';
+    assert.deepEqual(catalogPurchaseActionText(2980, 'grid', url), {
+        label: '¥2,980',
+        title: `¥2,980 で購入 — ストアを開く（${url}）`
+    });
+    assert.deepEqual(catalogPurchaseActionText(2980, 'list', url), {
+        label: '¥2,980 で購入',
+        title: `¥2,980 で購入 — ストアを開く（${url}）`
+    });
+});
+
+test('catalogPurchaseActionText: price 未指定は ¥0 として一貫して表示する', () => {
+    const url = 'https://example.com/asset';
+    assert.equal(catalogPurchaseActionText(undefined, 'grid', url).label, '¥0');
+    assert.match(catalogPurchaseActionText(undefined, 'list', url).title, /^¥0 で購入 — ストアを開く/);
 });
 
 test('selectResolverAudioFileRef: audio カテゴリで url 型の音声ファイルを選ぶ', () => {
@@ -412,4 +432,33 @@ test('deriveCatalogEmptyStateKind: 0 件 + resolver 失敗 → resolver-failed�
 
 test('deriveCatalogEmptyStateKind: 0 件 + resolver 成功 → empty（通常起きない素直な空状態）', () => {
     assert.equal(deriveCatalogEmptyStateKind(0, 'ok'), 'empty');
+});
+
+test('deriveCatalogResolverNotice: unauthorized は再接続案内で再試行ボタン無し', () => {
+    assert.deepEqual(deriveCatalogResolverNotice('ok', 'unauthorized'), {
+        kind: 'unauthorized',
+        message: 'ストア接続が解除されています — ホームから再接続してください',
+        retry: false
+    });
+});
+
+test('deriveCatalogResolverNotice: entitlements error は従来の取得失敗 + 再試行', () => {
+    assert.deepEqual(deriveCatalogResolverNotice('ok', 'error'), {
+        kind: 'error',
+        message: 'アカウント素材の取得に失敗',
+        retry: true
+    });
+});
+
+test('deriveCatalogResolverNotice: ok / no_credentials は案内行を出さない', () => {
+    assert.equal(deriveCatalogResolverNotice('ok', 'ok'), undefined);
+    assert.equal(deriveCatalogResolverNotice('ok', 'no_credentials'), undefined);
+});
+
+test('deriveCatalogResolverNotice: resolver 全体の失敗は従来の取得失敗 + 再試行', () => {
+    assert.deepEqual(deriveCatalogResolverNotice('failed', 'error'), {
+        kind: 'error',
+        message: 'アカウント素材の取得に失敗',
+        retry: true
+    });
 });

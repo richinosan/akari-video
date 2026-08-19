@@ -57,6 +57,23 @@
 ### 2.4 レイヤー（B-roll）
 - `t` 〜 `t + duration` の窓外では非表示。**初期状態も非表示**（窓に入るまで描画しない）
 - 表示中は `currentTime` を出力時刻に同期する
+- **素材内オフセット（in トリム）は無い。素材の先頭が常に `t` に対応する**。`duration` は
+  素材の先頭から何秒使うかであって、素材のどこを使うかは選べない（`cuts[].in/out` に相当する
+  ものが `layers[]` には存在しない）。素材の途中区間を重ねたいときは**素材そのものを切り出す**
+  必要がある。
+  - 切り出した素材は「何を・どこから・どの速度で切り出したか」が失われるため、
+    **由来（元素材 / in / out / speed / fps）を素材の隣に必ず残す**こと。残っていないと、
+    次に触る人（人間・AI とも）が「素材の頭が何の時刻なのか」を推測することになり、
+    十数フレーム単位でズレたまま気づけない。
+  - 実害例（2026-08-14・リール制作）: カット単位に切り出した人物マットを「先行表示分の
+    プリロールを持っているはず」と**推測**して頭をトリムしたところ、実際は切り出し済みで
+    プリロールが無く、11〜23 フレームずれた。さらに `duration` を詰めた結果、区間の末尾で
+    マットが尽きて「人物が消えて背景だけ」になった。
+  - 素材とカットの時間対応を後から実測する場合、**フレーム差分の絶対値（`blend=difference`）は
+    使わない**。色調整（`output.look` は本編にしか掛からない = §2.4 冒頭の別項）で素材と本編の
+    色が違うと、その色差が支配して指標が平坦になり誤った結論を導く。**フレーム間差分エネルギーの
+    時系列（`tblend=all_mode=difference` → `signalstats` の YAVG）を正規化して相互相関**させると、
+    色に不変で lag を特定できる。
 
 #### 2.4.1 空間クロップ（`layers[].crop`。2026-08-06 導入）
 - `crop = { x, y, w, h }`（**0..1 正規化・ソースフレーム相対・静的**）。省略時は既定
@@ -539,7 +556,7 @@ ffmpeg の `perspective` フィルタの制約（式に時刻変数を持たな�
 | `layers[].perspective`（2026-08-06 実装） | ✅（§2.4.4。実ブラウザ実測済み） | ✅（§2.4.4。tsc -b + ユニット + Web 同一計算式で担保） |
 | `cuts[].fx`（2026-08-07 実装・近似あり） | 🟡（§2.4.5。5 種対応、3 種は近似バッジ付き） | ❌（未実装） |
 | `layers[].keyframes`（2026-08-09 実装） | ✅（§2.4.7。transform/crop は連続補間。perspective は blend:"normal" のみ・書き出しの段階保持とサンプル点で一致） | ✅（§2.4.7。同左） |
-| `cuts[].static-image-source`（2026-08-12 実装。正本: `contract-2026-08-12-still-image-cut-source-v0.md`） | 🟡（`<img>`/`<video>` 出し分け + preview-engine ClipSession/Timeline の image 対応を実装。framing/freeze/transform は流用。実ブラウザでの対話的スクラブ・複数区間切替の実機検証は未実施） | ❌（スコープ外・未対応） |
+| `cuts[].static-image-source`（2026-08-12 実装。正本: `contract-2026-08-12-still-image-cut-source-v0.md`） | 🟡（`<img>`/`<video>` 出し分け + preview-engine ClipSession/Timeline の image 対応を実装。framing/freeze/transform は流用。実ブラウザでの対話的スクラブ・複数区間切替の実機検証は未実施。2026-08-17: 静止画が stylesheet の display:none に隠れたまま永久に出ない実機バグ（`img.style.display=''`）を是正） | 🟡（2026-08-17 実装 — task/2026-08-17-shell-still-image-cut-preview。#preview-still + gap と同じ壁時計クロックで表示。cut transform/framing/freeze/選択ドラッグは video のスタイル鏡写しで流用。タイムラインの静止画フィルムストリップ/サムネも同時是正（probeForFilmstrip の duration 必須ガードが静止画分岐を dead code 化していた）。Electron 実機での対話検証は未実施） |
 
 - `cuts[].framing`（静的クロップ / ズームキーフレーム）・`cuts[].freeze`（フリーズ）は
   `contract-2026-07-22-render-basics.md` #6/#7 としてレンダ（render-cut）に加え、

@@ -24,7 +24,8 @@ import {
     bgmLoopOffsetSeconds,
     resolveBgmSourceOffset,
     resolveSfxTrimWindow,
-    resolveTimedScheduleWindow
+    resolveTimedScheduleWindow,
+    sfxFadeGainSchedule
 } from '../common/audio-schedule';
 import { classifyEditAssetPath, uncToFileUriString, windowsDriveToFileUriString } from '../common/edit-asset-path';
 import {
@@ -60,6 +61,7 @@ import {
 } from '../common/review-preview-state';
 import { ReviewToolMode } from '../common/review-tool-mode';
 import { locatePreviewCaptions, parsePreviewCaptions, parseResolvedPreviewCaptions, PreviewCaption } from './akari-preview-captions';
+import { resolveOutputOpenFocusMode } from './open-focus-mode';
 import {
     ReviewSessionRecorder,
     ReviewSessionUiState,
@@ -163,6 +165,12 @@ interface EditSummaryTimedAudio extends EditSummaryAudioSource {
     // buffer's real duration in the injected preview script (createPreviewAudio's decodeOne).
     in?: number;
     out?: number;
+    // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum (audio-clip-fades,
+    // 2026-08-18; sfx only). edit.json spells these audio.sfx[].fade_in/fade_out (snake_case,
+    // distinct from bgm's camelCase fadeIn/fadeOut) -- normalized to camelCase here to match this
+    // file's own TS field-naming convention for every other JSON-sourced audio field.
+    fadeIn?: number;
+    fadeOut?: number;
 }
 
 interface EditSummaryAudio {
@@ -1263,16 +1271,29 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         }
     }
 
+    // task 2026-08-17-shell-right-panel-order-and-focus 指示3: edit.json は「開く」を全て
+    // AkariOutputPreviewOpenHandler.canHandle(1200) が横取りするため、既にプレビューが出ている
+    // 状態で再 open（別経路からの open を含む）しても表示中タブの焦点を奪わないことが必要。
+    // 新規作成時（プレビューがまだ無い状態からの open）だけ activate し、既存 widget への
+    // 再 open は revealWidget に留める。options.mode（Theia の WidgetOpenMode 相当）の明示指定が
+    // あれば常にそれを優先する（resolveOutputOpenFocusMode 参照）。
     async openOutput(uri: URI, options?: any): Promise<WebviewWidget> {
         const editUri = uri.normalizePath();
         try {
+            const existing = this.openOutputPreviews.get(editUri.toString());
+            const wasAlreadyOpen = Boolean(existing?.akariPreviewConfigured && !existing.isDisposed);
             const widget = await this.getOrOpenPreview(
                 editUri,
                 options?.widgetOptions ?? { area: 'main' },
                 'output'
             );
             this.attachTimelinePassively();
-            await this.shell.activateWidget(widget.id);
+            const mode = resolveOutputOpenFocusMode(options?.mode, wasAlreadyOpen);
+            if (mode === 'activate') {
+                await this.shell.activateWidget(widget.id);
+            } else if (mode === 'reveal') {
+                this.shell.revealWidget(widget.id);
+            }
             return widget;
         } catch (error) {
             this.reportOpenFailure(editUri, error);
@@ -2009,7 +2030,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         }
         const extension = videoUri.path.ext.toLowerCase();
         const mimeType = PLAYABLE_VIDEO_MIME_TYPES.get(extension);
-        if (!mimeType) {
+        // 静止画 cut ソース（docs/contract-2026-08-12-still-image-cut-source-v0.md のシェル対応）:
+        // 代表ソースが画像でもプレビューできる。<video> ではなく webview の
+        // #preview-still + 壁時計クロック（gap セグメントと同じ機構）で表示する。
+        // 判定は layers[] と同じ拡張子のみ（isImageLayerSrc）。raw プレビューは対象外。
+        const primaryIsStillImage = kind === 'output' && isImageLayerSrc(videoUri.path.base);
+        if (!mimeType && !primaryIsStillImage) {
             await this.disposeAssetStreams(model.assetStreamIds);
             this.showMessageCard(widget, videoUri, UNSUPPORTED_FORMAT_MESSAGE, identityUri, kind);
             return;
@@ -2027,38 +2053,66 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         // audit §HEVC プレビュー in the internal repo). streamVideoUri is
         // what actually gets streamed to <video>; videoUri itself (source identity: captions
         // lookup, file watch, seek commands, title) stays untouched below.
-        const streamVideoUri = await this.resolveStreamVideoUri(videoUri, model);
+        // 静止画は HEVC 検出（resolveStreamVideoUri）の対象外。ストリームも <video> 用では
+        // なく画像レイヤーと同じ asset ストリームで配信する（同一ローカルサーバ由来なので
+        // CSP は据え置きでよい）。
+        const streamVideoUri = primaryIsStillImage ? videoUri : await this.resolveStreamVideoUri(videoUri, model);
         // task/2026-08-10-preview-bug-sweep (B1): ffprobe ground truth for the audio-detected
         // notice, run alongside createVideoStream so it adds no extra latency to open. Never
         // allowed to fail the whole open — an unknown result just suppresses the notice below.
+        // 静止画に音声ストリームが無いのは仕様（契約 §2.2）であって異常ではないため、
+        // probe せず「未確定」を渡して無音検知の通知を出させない。
         const [videoStream, hasSourceAudio] = await Promise.all([
-            this.previewService.createVideoStream({
-                videoUri: streamVideoUri.toString()
-            }).catch(async error => {
+            (primaryIsStillImage
+                ? this.previewService.createAssetStream({ assetUri: streamVideoUri.toString() })
+                : this.previewService.createVideoStream({ videoUri: streamVideoUri.toString() })
+            ).catch(async (error: unknown) => {
                 await this.disposeAssetStreams(model.assetStreamIds);
                 throw error;
             }),
-            this.previewService.probeAudioPresence({ videoUri: videoUri.toString() })
-                .then(result => result.hasAudio)
-                .catch(() => undefined)
+            primaryIsStillImage
+                ? Promise.resolve<boolean | undefined>(undefined)
+                : this.previewService.probeAudioPresence({ videoUri: videoUri.toString() })
+                    .then(result => result.hasAudio)
+                    .catch(() => undefined)
         ]);
         // v1 マルチソース: 代表ソース以外の cuts[].src 先も webview から再生できるよう
         // それぞれストリームを開く（代表ソースは上の videoStream を再利用）。
         // 全ストリームは同一のローカルサーバ由来なので CSP の media-src は据え置きでよい。
+        // 静止画ソースは <video> に流せないため別表（imageSourceUrlById）に分け、webview は
+        // この表にあるセグメントを #preview-still で表示する。
         const extraVideoStreams = new Map<string, { id: string; url: string }>();
+        const imageAssetStreams = new Map<string, { id: string; url: string }>();
         const sourceUrlById: Record<string, string> = {};
+        const imageSourceUrlById: Record<string, string> = {};
         if (kind === 'output' && model.sourcesById) {
             for (const [sourceId, entry] of model.sourcesById) {
                 if (model.sourceUri && entry.uri.toString() === model.sourceUri.toString()) {
-                    sourceUrlById[sourceId] = videoStream.url;
+                    if (primaryIsStillImage) {
+                        imageSourceUrlById[sourceId] = videoStream.url;
+                    } else {
+                        sourceUrlById[sourceId] = videoStream.url;
+                    }
                     continue;
                 }
-                if (!PLAYABLE_VIDEO_MIME_TYPES.has(entry.uri.path.ext.toLowerCase())
+                const entryIsStillImage = isImageLayerSrc(entry.uri.path.base);
+                if ((!entryIsStillImage && !PLAYABLE_VIDEO_MIME_TYPES.has(entry.uri.path.ext.toLowerCase()))
                     || !(await this.isInsideWorkspace(entry.uri))) {
                     console.warn('[akari-preview] sources[] の素材を再生できません（形式か配置）', entry.uri.toString());
                     continue;
                 }
                 try {
+                    if (entryIsStillImage) {
+                        // 同じ画像を複数の source id が指すことがあるため URI 単位で使い回す
+                        const key = entry.uri.toString();
+                        let stream = imageAssetStreams.get(key);
+                        if (!stream) {
+                            stream = await this.previewService.createAssetStream({ assetUri: key });
+                            imageAssetStreams.set(key, stream);
+                        }
+                        imageSourceUrlById[sourceId] = stream.url;
+                        continue;
+                    }
                     const streamUri = await this.resolveStreamVideoUri(entry.uri, model);
                     const stream = await this.previewService.createVideoStream({ videoUri: streamUri.toString() });
                     extraVideoStreams.set(sourceId, stream);
@@ -2068,24 +2122,34 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                 }
             }
         }
-        if (widget.isDisposed) {
+        // このリフレッシュで開いた全ストリームの後始末（widget が先に破棄された場合用）。
+        // 代表ストリームは静止画なら asset ストリームなので disposer を選び分ける。
+        const disposeAcquiredStreams = async () => {
             await Promise.all([
-                this.disposeVideoStreamId(videoStream.id),
+                primaryIsStillImage
+                    ? this.disposeAssetStreams([videoStream.id])
+                    : this.disposeVideoStreamId(videoStream.id),
+                ...[...extraVideoStreams.values()].map(stream => this.disposeVideoStreamId(stream.id)),
+                this.disposeAssetStreams([...imageAssetStreams.values()].map(stream => stream.id)),
                 this.disposeAssetStreams(model.assetStreamIds)
             ]);
+        };
+        if (widget.isDisposed) {
+            await disposeAcquiredStreams();
             return;
         }
         await this.disposePreviewStreams(widget);
         if (widget.isDisposed) {
-            await Promise.all([
-                this.disposeVideoStreamId(videoStream.id),
-                this.disposeAssetStreams(model.assetStreamIds)
-            ]);
+            await disposeAcquiredStreams();
             return;
         }
-        widget.akariPreviewStreamId = videoStream.id;
+        widget.akariPreviewStreamId = primaryIsStillImage ? undefined : videoStream.id;
         widget.akariPreviewExtraStreamIds = [...extraVideoStreams.values()].map(stream => stream.id);
-        widget.akariPreviewAssetStreamIds = model.assetStreamIds;
+        widget.akariPreviewAssetStreamIds = [
+            ...model.assetStreamIds,
+            ...(primaryIsStillImage ? [videoStream.id] : []),
+            ...[...imageAssetStreams.values()].map(stream => stream.id)
+        ];
         widget.akariPreviewEditUri = model.editUri;
         widget.akariPreviewRelatedEditUri = model.relatedEditUri;
         widget.akariPreviewVideoUri = videoUri;
@@ -2183,7 +2247,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             assets,
             initialSeekTime,
             sourceUrlById,
-            hasSourceAudio
+            hasSourceAudio,
+            imageSourceUrlById,
+            primaryIsStillImage
         ));
     }
 
@@ -2609,6 +2675,8 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                     track?: unknown;
                     in?: unknown;
                     out?: unknown;
+                    fade_in?: unknown;
+                    fade_out?: unknown;
                 } | undefined;
                 const label = kind === 'narration' && typeof item?.id === 'string' && item.id
                     ? `audio.narration ${item.id}`
@@ -2656,6 +2724,28 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                         }
                     }
                 }
+                // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum
+                // (audio-clip-fades, 2026-08-18; sfx only): fade_in/fade_out. Same
+                // warned-and-ignored tolerance as bgm's fadeIn/fadeOut parsing above (this
+                // function's own `fades` block further down).
+                let fadeIn: number | undefined;
+                let fadeOut: number | undefined;
+                if (kind === 'sfx') {
+                    if (item.fade_in !== undefined) {
+                        if (typeof item.fade_in === 'number' && Number.isFinite(item.fade_in) && item.fade_in >= 0) {
+                            fadeIn = item.fade_in;
+                        } else {
+                            console.warn(`[akari-preview] ${label}.fade_in を無視しました（0以上の有限 number ではありません）`, item.fade_in);
+                        }
+                    }
+                    if (item.fade_out !== undefined) {
+                        if (typeof item.fade_out === 'number' && Number.isFinite(item.fade_out) && item.fade_out >= 0) {
+                            fadeOut = item.fade_out;
+                        } else {
+                            console.warn(`[akari-preview] ${label}.fade_out を無視しました（0以上の有限 number ではありません）`, item.fade_out);
+                        }
+                    }
+                }
                 resolved.push({
                     id: kind === 'narration' ? String(item.id) : `sfx-${index + 1}`,
                     src,
@@ -2665,7 +2755,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
                         ? {
                             track: Number.isInteger(item.track) && (item.track as number) >= 0 ? item.track as number : 0,
                             ...(trimIn !== undefined ? { in: trimIn } : {}),
-                            ...(trimOut !== undefined ? { out: trimOut } : {})
+                            ...(trimOut !== undefined ? { out: trimOut } : {}),
+                            ...(fadeIn !== undefined ? { fadeIn } : {}),
+                            ...(fadeOut !== undefined ? { fadeOut } : {})
                         }
                         : {})
                 });
@@ -3425,7 +3517,9 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
         assets: OverlayRuntimeAssets,
         initialSeekTime?: number,
         sourceUrlById: Record<string, string> = {},
-        hasSourceAudio?: boolean
+        hasSourceAudio?: boolean,
+        imageSourceUrlById: Record<string, string> = {},
+        primaryIsStillImage = false
     ): string {
         const { width, height } = model.summary.output;
         // render-cut captions.mjs の既定とパリティ（stage は出力 px 論理空間）:
@@ -3441,6 +3535,12 @@ export class AkariPreviewOpenHandler implements OpenHandler, FrontendApplication
             // v1 マルチソース: ソース id → ストリーム URL。webview は cuts[].src が
             // 変わる継ぎ目で <video> をこの表から差し替える（v0 は 1 件のみの表）
             videoSources: sourceUrlById,
+            // 静止画 cut ソース表（id → asset ストリーム URL）。この表にあるセグメントは
+            // <video> ではなく #preview-still + 壁時計クロックで表示する
+            // （docs/contract-2026-08-12-still-image-cut-source-v0.md のシェル対応）
+            imageSources: imageSourceUrlById,
+            // 代表ソース（先頭カット）が静止画のとき true。<video> に初期 src が無い
+            primaryIsStillImage,
             // task/2026-08-10-preview-bug-sweep (B1): ffprobe ground truth, undefined when
             // unknown (ffprobe unavailable or probe failed) — never treated as "silent" client-side.
             hasSourceAudio: hasSourceAudio ?? null,
@@ -3473,6 +3573,9 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
 #preview-wrapper.is-dragging { cursor: grabbing; }
 #zoom-layer { position: absolute; inset: 0; overflow: hidden; will-change: transform; }
 #preview-video { position: absolute; top: 0; left: 0; object-fit: contain; }
+/* 静止画 cut ソース: #preview-video と同じ位置・サイズに重ね、静止画セグメントの間だけ表示する
+   （配置・transform は毎フレーム video のインラインスタイルを鏡写し — syncStillImageVisual）。 */
+#preview-still { position: absolute; top: 0; left: 0; object-fit: contain; display: none; user-select: none; }
 #preview-layers { position: absolute; top: 0; left: 0; width: ${width}px; height: ${height}px; transform-origin: 0 0; overflow: hidden; pointer-events: none; }
 #preview-layers > video, #preview-layers > img { position: absolute; display: none; max-width: none; max-height: none; transform-origin: 50% 50%; pointer-events: auto; cursor: pointer; }
 #layer-select-box { position: absolute; z-index: 1900; box-sizing: border-box; border: 1.5px solid #4da3ff; box-shadow: 0 0 0 1px rgba(0,0,0,0.35); pointer-events: none; display: none; }
@@ -3589,7 +3692,8 @@ body { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
   <section class="preview-pane" aria-label="動画プレビュー">
     <div id="preview-wrapper">
       <div id="zoom-layer">
-        <video id="preview-video" src="${this.escapeHtml(videoSource)}" preload="auto"></video>
+        <video id="preview-video"${primaryIsStillImage ? '' : ` src="${this.escapeHtml(videoSource)}"`} preload="auto"></video>
+        <img id="preview-still" alt="" draggable="false">
         <div id="preview-layers"></div>
         <div id="overlay-stage"><div id="transition-plate"></div><div id="caption-plate"></div></div>
         <div id="layer-select-box"><div class="akari-layer-rotate-stem"></div><div class="akari-layer-handle akari-layer-handle-nw" data-akari-handle="nw"></div><div class="akari-layer-handle akari-layer-handle-ne" data-akari-handle="ne"></div><div class="akari-layer-handle akari-layer-handle-sw" data-akari-handle="sw"></div><div class="akari-layer-handle akari-layer-handle-se" data-akari-handle="se"></div><div class="akari-layer-handle akari-layer-handle-rotate" data-akari-handle="rotate"></div></div>
@@ -3791,6 +3895,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 const resolveBgmSourceOffsetFn = (${resolveBgmSourceOffset.toString()});
                 const bgmLoopOffsetSecondsFn = (${bgmLoopOffsetSeconds.toString()});
                 const resolveTimedScheduleWindowFn = (${resolveTimedScheduleWindow.toString()});
+                const sfxFadeGainScheduleFn = (${sfxFadeGainSchedule.toString()});
                 const decoded = { bgm: null, sfx: [], narration: [] };
                 let timelineDuration = 0;
                 let loadPromise = null;
@@ -3900,8 +4005,8 @@ body { display: grid; place-items: center; padding: 32px; }
                         try { item.gain.disconnect(); } catch (_error) { /* already detached */ }
                     }
                 };
-                const registerSource = (source, gain, kind, id, track, baseGainLinear) => {
-                    const item = { source, gain, kind, id, track, baseGainLinear };
+                const registerSource = (source, gain, kind, id, track, baseGainLinear, hasFade = false) => {
+                    const item = { source, gain, kind, id, track, baseGainLinear, hasFade };
                     active.push(item);
                     source.onended = () => detachActive(item);
                     return item;
@@ -4000,7 +4105,30 @@ body { display: grid; place-items: center; padding: 32px; }
                             gain.gain.value = baseGainLinear;
                             source.connect(gain);
                             gain.connect(masterGain);
-                            registerSource(source, gain, kind, item.id, item.track, baseGainLinear);
+                            // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum
+                            // (audio-clip-fades, 2026-08-18; sfx only): fade_in/fade_out, applied as
+                            // AudioParam automation over the clip's own scheduled window (not a
+                            // per-tick poll like bgm's fadeMultiplierAt -- this source is a one-shot
+                            // BufferSourceNode, not a continuously re-evaluated loop). hasFade tells
+                            // tick()'s mute-sync loop to leave gain.value alone so it doesn't clobber
+                            // the in-flight ramp on its next 30Hz pass.
+                            let hasFade = false;
+                            if (kind === 'sfx' && (item.fadeIn !== undefined || item.fadeOut !== undefined)) {
+                                const fadeSchedule = sfxFadeGainScheduleFn(item.fadeIn, item.fadeOut, item.durationSec, scheduleWindow.elapsedIntoItemSec, available);
+                                if (fadeSchedule.length > 0) {
+                                    hasFade = true;
+                                    const startTime = contextStart + delay;
+                                    gain.gain.cancelScheduledValues(startTime);
+                                    gain.gain.setValueAtTime(baseGainLinear * fadeSchedule[0].gainMultiplier, startTime);
+                                    for (let i = 1; i < fadeSchedule.length; i += 1) {
+                                        gain.gain.linearRampToValueAtTime(
+                                            baseGainLinear * fadeSchedule[i].gainMultiplier,
+                                            startTime + fadeSchedule[i].offsetSec
+                                        );
+                                    }
+                                }
+                            }
+                            registerSource(source, gain, kind, item.id, item.track, baseGainLinear, hasFade);
                             source.start(contextStart + delay, offset, available);
                             return true;
                         } catch (error) {
@@ -4038,8 +4166,16 @@ body { display: grid; place-items: center; padding: 32px; }
                     tick: (timelineTime, playing) => {
                         syncMasterGain();
                         for (const item of active.filter(candidate => candidate.kind === 'sfx')) {
-                            item.gain.gain.value = allSfxMuted || mutedSfxTracks.has(item.track)
-                                ? 0 : item.baseGainLinear;
+                            const muted = allSfxMuted || mutedSfxTracks.has(item.track);
+                            if (muted) {
+                                item.gain.gain.value = 0;
+                            } else if (!item.hasFade) {
+                                item.gain.gain.value = item.baseGainLinear;
+                            }
+                            // else: fade_in/fade_out already drives gain.gain via the scheduled
+                            // AudioParam ramp (audio-clip-fades) -- writing item.gain.gain.value here
+                            // (even to its own current value) would insert a new automation event
+                            // and cut the ramp short, so this 30Hz poll leaves it alone while unmuted.
                         }
                         if (playing) applyBgmDuck(timelineTime);
                     },
@@ -4324,6 +4460,7 @@ body { display: grid; place-items: center; padding: 32px; }
             const initial = window.__akariPreview;
             const summary = initial.summary;
             const video = document.getElementById('preview-video');
+            const stillImage = document.getElementById('preview-still');
             const playToggle = document.getElementById('play-toggle');
             const frameBack = document.getElementById('frame-back');
             const frameForward = document.getElementById('frame-forward');
@@ -5712,6 +5849,8 @@ body { display: grid; place-items: center; padding: 32px; }
                 const hit = document.elementsFromPoint(event.clientX, event.clientY)
                     .find(candidate => {
                         if (candidate === video) return true;
+                        // 静止画セグメント中は #preview-still が本編（cut）の当たり判定を担う
+                        if (candidate === stillImage) return true;
                         if (!((candidate.tagName === 'VIDEO' || candidate.tagName === 'IMG') && candidate.dataset
                             && candidate.dataset.akariLayerId && candidate.style.display !== 'none')) return false;
                         // 全面サイズの透明動画（ベイクテロップ）は箱で当てると画面全部が当たりになる。
@@ -5720,7 +5859,7 @@ body { display: grid; place-items: center; padding: 32px; }
                         return !candidateEntry || layerAlphaAtPoint(candidateEntry, event.clientX, event.clientY) > 16;
                     });
                 if (!hit) return;
-                if (hit === video) {
+                if (hit === video || hit === stillImage) {
                     if (video.dataset.akariCutIndex === '' || video.dataset.akariCutIndex === undefined) return;
                     selectCut();
                     const startPoint = window.akari.interaction?.stageLocalPoint?.(event.clientX, event.clientY);
@@ -5963,6 +6102,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 const hitSelectable = document.elementsFromPoint(event.clientX, event.clientY)
                     .some(candidate => {
                         if (candidate === video) return true;
+                        if (candidate === stillImage) return true;
                         if (!((candidate.tagName === 'VIDEO' || candidate.tagName === 'IMG') && candidate.dataset
                             && candidate.dataset.akariLayerId && candidate.style.display !== 'none')) return false;
                         const candidateEntry = findLayerEntry(candidate.dataset.akariLayerId);
@@ -6005,7 +6145,11 @@ body { display: grid; place-items: center; padding: 32px; }
             };
             const updateCutSelectBox = () => {
                 const hasCut = video.dataset.akariCutIndex !== '' && video.dataset.akariCutIndex !== undefined;
-                if (!cutSelected || !hasCut || video.style.visibility === 'hidden') {
+                // 静止画セグメント中は video が hidden のまま #preview-still が本編の見た目を
+                // 担っているため、「本編が見えているか」は両方で判定する。
+                const cutVisualHidden = video.style.visibility === 'hidden'
+                    && stillImage.style.display === 'none';
+                if (!cutSelected || !hasCut || cutVisualHidden) {
                     cutSelectBox.classList.remove('is-active');
                     return;
                 }
@@ -6415,6 +6559,36 @@ body { display: grid; place-items: center; padding: 32px; }
                 video.load();
                 return true;
             };
+            // 静止画 cut ソース（docs/contract-2026-08-12-still-image-cut-source-v0.md のシェル
+            // 対応）。id → asset ストリーム URL の表にあるセグメントは <video> ではなく
+            // #preview-still で表示し、クロックは gap セグメントと同じ壁時計
+            // （gapWallClockOriginMs / gapOutputOrigin をそのまま共用）で進める。
+            const imageSources = initial.imageSources || {};
+            const stillUrlForSegment = segment => (segment && segment.kind === 'src'
+                && segment.src !== undefined && imageSources[String(segment.src)]) || null;
+            const isStillSegment = segment => Boolean(stillUrlForSegment(segment));
+            const hideStillImage = () => { stillImage.style.display = 'none'; };
+            const syncStillImageVisual = () => {
+                if (stillImage.style.display === 'none') return;
+                // #preview-video のインラインスタイルを鏡写しにする。updateStageScale /
+                // applyCutVisual / applyCutFramingVisual は video が hidden の間も video の
+                // style を書き続けるので、静止画はそれを写すだけで配置・cut transform・
+                // framing の既存レールに乗る。visibility だけは写さない（video 側は静止画
+                // セグメント中つねに hidden のため）。
+                stillImage.style.left = video.style.left;
+                stillImage.style.top = video.style.top;
+                stillImage.style.width = video.style.width;
+                stillImage.style.height = video.style.height;
+                stillImage.style.transform = video.style.transform;
+                stillImage.style.transformOrigin = video.style.transformOrigin;
+                stillImage.style.opacity = video.style.opacity;
+                stillImage.style.zIndex = video.style.zIndex;
+            };
+            const showStillImage = url => {
+                if (stillImage.getAttribute('src') !== url) stillImage.setAttribute('src', url);
+                stillImage.style.display = 'block';
+                syncStillImageVisual();
+            };
             const clampSourceTime = (sourceTime, preferredIndex) => {
                 const preferred = segments[preferredIndex];
                 if (preferred && preferred.kind === 'src'
@@ -6454,6 +6628,9 @@ body { display: grid; place-items: center; padding: 32px; }
             // が無いことを先にガードするが、defensive に安全な既定値を返しておく）。
             const playedCutLocalSeconds = segment => {
                 if (!segment || segment.kind !== 'src') return 0;
+                // 静止画セグメントは video.currentTime が動かないため、マスタークロック
+                // outputTime から直接算出する（preview-server public/app.js の同名処理と同じ裁定）。
+                if (isStillSegment(segment)) return Math.max(0, outputTime - segment.outStart);
                 const speed = Number.isFinite(segment.speed) && segment.speed > 0 ? segment.speed : 1;
                 return ((video.currentTime || 0) - segment.in) / speed;
             };
@@ -6473,6 +6650,9 @@ body { display: grid; place-items: center; padding: 32px; }
                     video.style.transformOrigin = '';
                     video.style.transform = baseTransform;
                 }
+                // 静止画セグメント表示中は、ここで確定した video の最終スタイルを鏡写しにする
+                //（updateStageScale 経由のリサイズと tick() の毎フレームの両方がここを通る）。
+                syncStillImageVisual();
             };
             window.akari.applyCutFramingVisual = applyCutFramingVisual;
             const enterSegment = index => {
@@ -6495,11 +6675,28 @@ body { display: grid; place-items: center; padding: 32px; }
                         video.pause();
                     }
                     video.style.visibility = 'hidden';
+                    hideStillImage();
+                    gapWallClockOriginMs = performance.now();
+                    gapOutputOrigin = outputTime;
+                    return;
+                }
+                const stillUrl = stillUrlForSegment(segment);
+                if (stillUrl) {
+                    // 静止画セグメント: gap と同じ壁時計駆動。video は止めて隠し、
+                    // #preview-still を出す（pausedForGapEntry の使い方も gap と同一）。
+                    applyCutVisual(segment);
+                    if (!video.paused) {
+                        pausedForGapEntry = true;
+                        video.pause();
+                    }
+                    video.style.visibility = 'hidden';
+                    showStillImage(stillUrl);
                     gapWallClockOriginMs = performance.now();
                     gapOutputOrigin = outputTime;
                     return;
                 }
                 applyCutVisual(segment);
+                hideStillImage();
                 video.style.visibility = '';
                 syncSegmentPlaybackRate();
                 const segmentDuration = segment.outEnd - segment.outStart;
@@ -6597,9 +6794,10 @@ body { display: grid; place-items: center; padding: 32px; }
                 window.akari.reviewTransport({ type: 'seek', from: previousOutputTime, to: outputTime });
                 const mapped = timelineToSource(outputTime);
                 enterSegment(mapped.index);
-                if (mapped.kind === 'src') {
+                if (mapped.kind === 'src' && !isStillSegment(segments[mapped.index])) {
                     video.currentTime = mapped.time;
                 } else if (isPlaying && window.akari.previewAudio) {
+                    // gap と静止画: video のシークは発生しないため音声はここで追従させる
                     void window.akari.previewAudio.playFrom(outputTime);
                 }
             };
@@ -6773,6 +6971,9 @@ body { display: grid; place-items: center; padding: 32px; }
                 }
             };
             const waitForWaveformMetadata = () => {
+                // 代表ソースが静止画のときは <video> に src が無く loadedmetadata が永遠に
+                // 来ない。即座に進めて decode 失敗 → 通常のエラー描画（波形なし）に落とす。
+                if (initial.primaryIsStillImage) return Promise.resolve();
                 if (video.readyState >= 1) return Promise.resolve();
                 return new Promise((resolve, reject) => {
                     const cleanup = () => {
@@ -7308,7 +7509,15 @@ body { display: grid; place-items: center; padding: 32px; }
                     && (allTracksHiddenByScope.cuts || hiddenTracksByScope.cuts.has(segment.track)));
                 video.dataset.akariGlobalMuted = String(globalMuted);
                 video.muted = globalMuted || cutsTrackMuted;
-                video.style.visibility = !segment || segment.kind === 'gap' || cutsTrackHidden ? 'hidden' : '';
+                const segmentIsStill = isStillSegment(segment);
+                video.style.visibility = !segment || segment.kind === 'gap' || segmentIsStill
+                    || cutsTrackHidden ? 'hidden' : '';
+                // 静止画の表示可否もここで一元管理する（トラック非表示・再生エラー時は隠す）。
+                if (segmentIsStill && !cutsTrackHidden && !playbackErrored) {
+                    showStillImage(stillUrlForSegment(segment));
+                } else {
+                    hideStillImage();
+                }
             };
             const tick = (immediatePlaybackTick = false) => {
                 // ㉕ cuts[].freeze の一時停止ホールド中（contract-2026-08-02-preview-parity.md
@@ -7321,12 +7530,21 @@ body { display: grid; place-items: center; padding: 32px; }
                     }
                     freezeHoldUntilMs = 0;
                     if (isPlaying) {
-                        if (video.paused) void video.play().catch(error => console.error('[akari-preview] freeze hold の再開に失敗しました', error));
+                        const resumedSegment = segments[activeSegmentIndex];
+                        if (resumedSegment && isStillSegment(resumedSegment)) {
+                            // 静止画セグメントは壁時計駆動のため、ホールドで止まっていた分だけ
+                            // 原点を引き直す（video.play() は呼ばない — src が無いこともある）。
+                            gapWallClockOriginMs = performance.now();
+                            gapOutputOrigin = outputTime;
+                        } else if (video.paused) {
+                            void video.play().catch(error => console.error('[akari-preview] freeze hold の再開に失敗しました', error));
+                        }
                         if (window.akari.previewAudio) void window.akari.previewAudio.resume();
                     }
                 }
                 const segment = segments[activeSegmentIndex];
-                if (segment && segment.kind === 'gap') {
+                const segmentIsStill = isStillSegment(segment);
+                if (segment && (segment.kind === 'gap' || segmentIsStill)) {
                     if (isPlaying) {
                         outputTime = clamp(
                             gapOutputOrigin + (performance.now() - gapWallClockOriginMs) / 1000,
@@ -7340,6 +7558,16 @@ body { display: grid; place-items: center; padding: 32px; }
                                 enterSegment(nextIndex);
                             } else {
                                 stopAtNaturalEnd();
+                            }
+                        } else if (segmentIsStill
+                            && freezeHoldConsumedForSegmentIndex !== activeSegmentIndex) {
+                            // ㉕ cuts[].freeze: 静止画では視覚的 no-op（契約 §3.2）だが、動画と同じ
+                            // 「境界通過で一時停止ホールド」の近似は踏襲する（尺は伸ばさない）。
+                            const freezeCheck = checkCutFreezeCrossingFn(segment.freeze, playedCutLocalSeconds(segment));
+                            if (freezeCheck.shouldHold) {
+                                freezeHoldConsumedForSegmentIndex = activeSegmentIndex;
+                                freezeHoldUntilMs = performance.now() + freezeCheck.holdSeconds * 1000;
+                                if (window.akari.previewAudio) window.akari.previewAudio.pause();
                             }
                         }
                     }
@@ -7435,6 +7663,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 stopAnimation();
                 video.pause();
                 video.hidden = true;
+                hideStillImage();
                 layersStage.hidden = true;
                 stage.hidden = true;
                 captionPlate.textContent = '';
@@ -7507,7 +7736,8 @@ body { display: grid; place-items: center; padding: 32px; }
                     window.akari.reviewTransport({ type: 'play', timelineT: outputTime });
                     if (window.akari.previewAudio) void window.akari.previewAudio.resume();
                     const segment = segments[activeSegmentIndex];
-                    if (segment && segment.kind === 'gap') {
+                    if (segment && (segment.kind === 'gap' || isStillSegment(segment))) {
+                        // gap / 静止画セグメントからの再生開始は壁時計の原点を引き直すだけ
                         gapWallClockOriginMs = performance.now();
                         gapOutputOrigin = outputTime;
                         if (window.akari.previewAudio) void window.akari.previewAudio.playFrom(outputTime);
@@ -7817,7 +8047,7 @@ body { display: grid; place-items: center; padding: 32px; }
                 // schedule - the "video/seekbar stuck, audio still going" freeze.
                 // Resume instead; if that also fails, fall back to a real stop.
                 const segment = segments[activeSegmentIndex];
-                if (isPlaying && segment && segment.kind === 'src' && !video.ended) {
+                if (isPlaying && segment && segment.kind === 'src' && !isStillSegment(segment) && !video.ended) {
                     void video.play().catch(error => {
                         console.error('[akari-preview] unexpected pause auto-resume failed', error);
                         window.akari.reviewTransport({ type: 'pause', timelineT: outputTime });
@@ -7848,7 +8078,7 @@ body { display: grid; place-items: center; padding: 32px; }
             video.addEventListener('seeked', () => {
                 tick(true);
                 const segment = segments[activeSegmentIndex];
-                if (isPlaying && segment && segment.kind === 'src') {
+                if (isPlaying && segment && segment.kind === 'src' && !isStillSegment(segment)) {
                     if (window.akari.previewAudio) void window.akari.previewAudio.playFrom(outputTime);
                     if (video.paused) void video.play().catch(error => console.error('[akari-preview] playback failed', error));
                 }

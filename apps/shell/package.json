@@ -1,7 +1,7 @@
 {
   "private": true,
   "name": "@akari-video/shell",
-  "version": "0.1.9",
+  "version": "0.1.11",
   "description": "AKARI Video shell — Theia Electron app, S-A shell foundation (tabshell v0 contract).",
   "dependencies": {
     "@theia/core": "1.73.1",
@@ -72,9 +72,11 @@
     "prebuild": "node resources/scripts/ensure-file-deps-linked.mjs",
     "build:ext": "tsc -b extensions/akari-shell-strip extensions/akari-project extensions/akari-surfaces extensions/akari-partner extensions/akari-tabs extensions/akari-preview extensions/akari-annotations extensions/akari-transcript extensions/akari-theme",
     "build": "npm run build:ext && theia build --mode production",
+    "postbuild": "node scripts/resign-electron.mjs",
+    "postinstall": "node scripts/resign-electron.mjs",
     "lint": "eslint \"extensions/*/src/**/*.{ts,tsx}\"",
     "start": "theia start --plugins=local-dir:plugins",
-    "prepackage": "node resources/scripts/copy-native-helpers.mjs && node resources/scripts/patch-ripgrep-asar-path.mjs && node resources/scripts/bundle-ffmpeg-binaries.mjs && node resources/scripts/generate-third-party-notices.mjs",
+    "prepackage": "node resources/scripts/copy-native-helpers.mjs && node resources/scripts/patch-ripgrep-asar-path.mjs && node resources/scripts/bundle-media-binaries.mjs && node resources/scripts/generate-third-party-notices.mjs",
     "package": "electron-builder --dir",
     "postpackage": "node resources/scripts/verify-asar-contents.mjs",
     "watch": "theia build --watch --mode development"
@@ -167,6 +169,20 @@
       {
         "from": "../../presets/textanim",
         "to": "presets/textanim",
+        "filter": [
+          "index.jsonl"
+        ]
+      },
+      {
+        "from": "../../presets/telop",
+        "to": "presets/telop",
+        "filter": [
+          "index.jsonl"
+        ]
+      },
+      {
+        "from": "../../presets/luts",
+        "to": "presets/luts",
         "filter": [
           "index.jsonl"
         ]

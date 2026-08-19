@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCatalogItemMeta, filterCatalogItems } from '../lib/common/catalog-reader.js';
+import {
+    CATALOG_AUDIO_BGM_CATEGORY,
+    CATALOG_AUDIO_SFX_CATEGORY,
+    classifyCatalogAudioItem,
+    deriveCatalogCategoryChips,
+    deriveCatalogFilteredEmptyKind,
+    filterCatalogItems,
+    normalizeCatalogViewMode,
+    parseCatalogItemMeta
+} from '../lib/common/catalog-reader.js';
 
 // meta.json 寛容リーダー単体テスト（task.md L0: 必須3フィールドのみ / 欠落 / 壊れJSON の3様態）
 // + 検索・カテゴリフィルタの純関数。
@@ -126,17 +135,36 @@ test('parseCatalogItemMeta: source.acquisition は url/preview_url が無くて�
 const CATEGORY_ITEMS = [
     { id: 'vintage-camera', category: '3d', title: 'ヴィンテージカメラ 3D モデル', tags: ['vintage', 'camera'], description: 'レトロなカメラ' },
     { id: 'modern-smartphone', category: '3d', title: 'モダンスマートフォン', tags: ['product-demo'] },
-    { id: 'corporate-upbeat-bgm', category: 'audio', title: 'コーポレート BGM', description: 'upbeat corporate track' }
+    { id: 'corporate-upbeat-bgm', category: 'audio', title: 'コーポレート BGM', tags: ['bgm'], description: 'upbeat corporate track' },
+    { id: 'camera-shutter', category: 'audio', title: 'カメラシャッター', tags: ['sfx', 'camera'] }
 ];
 
 test('filterCatalogItems: category=all は全件を通す', () => {
-    assert.equal(filterCatalogItems(CATEGORY_ITEMS, '', 'all').length, 3);
+    assert.equal(filterCatalogItems(CATEGORY_ITEMS, '', 'all').length, 4);
 });
 
 test('filterCatalogItems: カテゴリチップで絞る', () => {
     const result = filterCatalogItems(CATEGORY_ITEMS, '', '3d');
     assert.equal(result.length, 2);
     assert.ok(result.every(item => item.category === '3d'));
+});
+
+test('classifyCatalogAudioItem: sfx だけを音声クリップ、bgm / jingle / タグ無しを BGM に分ける', () => {
+    assert.equal(classifyCatalogAudioItem({ tags: ['sfx', 'camera'] }), 'sfx');
+    assert.equal(classifyCatalogAudioItem({ tags: ['bgm', 'upbeat'] }), 'bgm');
+    assert.equal(classifyCatalogAudioItem({ tags: ['jingle'] }), 'bgm');
+    assert.equal(classifyCatalogAudioItem({}), 'bgm');
+});
+
+test('filterCatalogItems: BGM / 音声クリップチップは audio を tags で分ける', () => {
+    assert.deepEqual(
+        filterCatalogItems(CATEGORY_ITEMS, '', CATALOG_AUDIO_BGM_CATEGORY).map(item => item.id),
+        ['corporate-upbeat-bgm']
+    );
+    assert.deepEqual(
+        filterCatalogItems(CATEGORY_ITEMS, '', CATALOG_AUDIO_SFX_CATEGORY).map(item => item.id),
+        ['camera-shutter']
+    );
 });
 
 test('filterCatalogItems: 検索語はタイトルを対象にする', () => {
@@ -165,4 +193,49 @@ test('filterCatalogItems: 検索語 + カテゴリの両方で絞る', () => {
 
 test('filterCatalogItems: 一致なしは 0 件（例外なし）', () => {
     assert.equal(filterCatalogItems(CATEGORY_ITEMS, 'no-such-term', 'all').length, 0);
+});
+
+test('deriveCatalogCategoryChips: 音声の位置を BGM → 音声クリップに分け、0件も常時表示する', () => {
+    const chips = deriveCatalogCategoryChips([
+        { category: 'audio', tags: ['bgm'] },
+        { category: 'audio', tags: ['sfx'] },
+        { category: 'audio', tags: ['jingle'] },
+        { category: 'audio' },
+        { category: 'scene3d' }
+    ]);
+    assert.deepEqual(chips.map(chip => chip.category), [
+        'overlay', 'still', 'scene3d', CATALOG_AUDIO_BGM_CATEGORY, CATALOG_AUDIO_SFX_CATEGORY, 'broll', 'font'
+    ]);
+    assert.deepEqual(chips.map(chip => chip.label), ['オーバーレイ', '静止画', '3D', 'BGM', '音声クリップ', 'Bロール', 'フォント']);
+    assert.deepEqual(chips.map(chip => chip.count), [0, 0, 1, 3, 1, 0, 0]);
+});
+
+test('deriveCatalogCategoryChips: 未知カテゴリは既存項目を消さず末尾へ追加する', () => {
+    const chips = deriveCatalogCategoryChips([
+        { category: 'zeta' },
+        { category: 'audio' },
+        { category: 'avatars' },
+        { category: 'zeta' }
+    ]);
+    assert.deepEqual(chips.slice(0, 7).map(chip => chip.category), [
+        'overlay', 'still', 'scene3d', CATALOG_AUDIO_BGM_CATEGORY, CATALOG_AUDIO_SFX_CATEGORY, 'broll', 'font'
+    ]);
+    assert.deepEqual(chips.slice(7), [
+        { category: 'avatars', label: 'avatars', count: 1 },
+        { category: 'zeta', label: 'zeta', count: 2 }
+    ]);
+});
+
+test('deriveCatalogFilteredEmptyKind: 0件カテゴリと検索0件を区別する', () => {
+    assert.equal(deriveCatalogFilteredEmptyKind(CATEGORY_ITEMS, 'font'), 'category-empty');
+    assert.equal(deriveCatalogFilteredEmptyKind(CATEGORY_ITEMS, CATALOG_AUDIO_BGM_CATEGORY), 'no-match');
+    assert.equal(deriveCatalogFilteredEmptyKind(CATEGORY_ITEMS, CATALOG_AUDIO_SFX_CATEGORY), 'no-match');
+    assert.equal(deriveCatalogFilteredEmptyKind(CATEGORY_ITEMS, 'all'), 'no-match');
+});
+
+test('normalizeCatalogViewMode: list だけを復元し、欠損・未知値は grid に戻す', () => {
+    assert.equal(normalizeCatalogViewMode('list'), 'list');
+    assert.equal(normalizeCatalogViewMode('grid'), 'grid');
+    assert.equal(normalizeCatalogViewMode('tiles'), 'grid');
+    assert.equal(normalizeCatalogViewMode(undefined), 'grid');
 });

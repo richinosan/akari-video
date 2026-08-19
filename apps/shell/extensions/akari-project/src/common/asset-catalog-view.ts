@@ -5,7 +5,7 @@
  * ここに置かない — resolveResolverPreviewUrl は src/node/resolver-preview-url.ts 側）。
  */
 
-import { AssetCatalogResolverStatus, AssetCatalogViewItem } from './akari-project-protocol';
+import { AssetCatalogResolverStatus, AssetCatalogViewItem, AssetEntitlementsStatus } from './akari-project-protocol';
 import { CatalogPack } from './catalog-packs';
 
 /** resolver カタログの files[] 1 件（akari-assets-catalog/v0 契約: url か key のどちらかを持つ）。 */
@@ -108,6 +108,29 @@ export function deriveCatalogEmptyStateKind(
     return resolverStatus === 'failed' ? 'resolver-failed' : 'empty';
 }
 
+export type CatalogResolverNoticeKind = 'unauthorized' | 'error';
+
+export const CATALOG_ENTITLEMENTS_UNAUTHORIZED_MESSAGE =
+    'ストア接続が解除されています — ホームから再接続してください';
+export const CATALOG_ENTITLEMENTS_ERROR_MESSAGE = 'アカウント素材の取得に失敗';
+
+/**
+ * カタログ上部の案内行を決める共通分岐。認証失効だけは再試行ではなく再接続案内、
+ * entitlements の一般失敗または resolver 全体の失敗は従来の再試行案内にする。
+ */
+export function deriveCatalogResolverNotice(
+    resolverStatus: AssetCatalogResolverStatus['status'],
+    entitlementsStatus: AssetEntitlementsStatus
+): { kind: CatalogResolverNoticeKind; message: string; retry: boolean } | undefined {
+    if (resolverStatus === 'failed' || entitlementsStatus === 'error') {
+        return { kind: 'error', message: CATALOG_ENTITLEMENTS_ERROR_MESSAGE, retry: true };
+    }
+    if (entitlementsStatus === 'unauthorized') {
+        return { kind: 'unauthorized', message: CATALOG_ENTITLEMENTS_UNAUTHORIZED_MESSAGE, retry: false };
+    }
+    return undefined;
+}
+
 // docs/contract-2026-08-11-review-session-ui-events.md #2: asset:<catalog key> opt-in target for renderCatalogCard's card root.
 export function catalogCardUiEventTarget(item: Pick<AssetCatalogViewItem, 'key' | 'title'>): { target: string; label: string } {
     return { target: `asset:${item.key}`, label: item.title };
@@ -168,6 +191,22 @@ export function deriveStoreLabBaseUrl(storeApiUrl: string | undefined): string {
 /** 商品詳細ページの URL（`asset.html?id=<id>`。ストア静的プロトタイプの既存規約）。 */
 export function storeProductUrl(storeApiUrl: string | undefined, id: string): string {
     return `${deriveStoreLabBaseUrl(storeApiUrl)}/asset.html?id=${encodeURIComponent(id)}`;
+}
+
+/**
+ * locked 項目の購入アクション文言。狭いカードでは額面だけ、幅に余裕があるリストでは
+ * 「で購入」まで表示する。どちらも挙動の全文は title に残す。
+ */
+export function catalogPurchaseActionText(
+    price: number | undefined,
+    viewMode: 'grid' | 'list',
+    productUrl: string
+): { label: string; title: string } {
+    const amount = `¥${(price ?? 0).toLocaleString()}`;
+    return {
+        label: viewMode === 'list' ? `${amount} で購入` : amount,
+        title: `${amount} で購入 — ストアを開く（${productUrl}）`
+    };
 }
 
 // --- origin='local' の分類バッジ（同梱 / サブスク / 各自入手 / 無料 DL） ---------------------

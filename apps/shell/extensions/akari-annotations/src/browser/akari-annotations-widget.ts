@@ -40,9 +40,11 @@ import {
 import {
     computeTrackAutoNames as computeTrackKindAutoNames,
     deriveDefaultTimelineTracks,
+    withAudioDisplaySupplement,
     withCaptionsDisplaySupplement
 } from '../common/derive-timeline-tracks';
 import { assignSubRows } from '../common/lane-layout';
+import { clampSfxFadeToEffectiveDuration, slipAudioWindow } from '../common/audio-clip-trimmer';
 import { computeAudioOverlapLayout } from '../common/audio-overlap-layout';
 import { computeCutBoundaries } from '../common/cut-boundaries';
 import { buildTimelineClipMenuItems } from '../common/timeline-context-menu-items';
@@ -51,11 +53,16 @@ import {
     buildLayerElement,
     buildSfxElement,
     computeMaterialGhostRange,
+    CutDropPlan,
+    ensuredAudioTimelineTracks,
+    planCutDrop,
     IMAGE_LAYER_DEFAULT_DURATION_SECONDS,
+    insertCutIntoEdit,
     insertedLayerTimelineTracks,
-    materialDropAcceptance,
+    materialDropDecision,
     materialGhostVisibility,
     MaterialDragKind,
+    MaterialDropZone,
     shiftLayerTracksForInsert
 } from '../common/timeline-material-insert';
 import { OPEN_AKARI_INSPECTOR_ID, OPEN_AKARI_REVIEW_PANEL_ID } from './akari-annotations-commands';
@@ -184,6 +191,18 @@ interface ResolvedEditSource {
     path: string;
     videoUri: string;
 }
+
+/**
+ * EditAudioSfx（正本 packages/edit-store）は audio.sfx[].fade_in/fade_out を運ばない
+ * （task 2026-08-18-audio-clip-fades のファイル境界が packages/edit-store を含まないため、
+ * parseEdit() 側は拡張しない）。reloadEdit() が rawValue（edit.json の生 JSON）から
+ * fade_in/fade_out を直接読み、id の "sfx-N" インデックスで対応する parsed.audioSfx へこの
+ * 拡張フィールドとして足し込む。
+ */
+type EditAudioSfxWithFade = EditAudioSfx & {
+    fadeIn?: number;
+    fadeOut?: number;
+};
 
 type ToolMode = 'select' | 'razor';
 
@@ -329,6 +348,10 @@ type DragDetail =
     | {
         /** ソーストリマー窓の中央ドラッグ（slip）: out−in と t を固定したまま in/out を同量シフトする。 */
         kind: 'cut-slip'; index: number; originalIn: number; originalOut: number; sourceDuration: number;
+    }
+    | {
+        /** 音声クリップ版 cut-slip（task 2026-08-18-audio-clip-trimmer-dblclick）。同じ意味論。 */
+        kind: 'audio-slip'; id: string; originalIn: number; originalOut: number; sourceDuration: number;
     };
 
 type DragState = DragBase & DragDetail;
@@ -350,7 +373,8 @@ type DragPreview =
     | { kind: 'layer'; id: string; t: number; duration: number; track: number; rejected: boolean; insertTrack?: number }
     | { kind: 'audio'; id: string; t: number; track: number; rejected: boolean; insertTrack?: number }
     | { kind: 'audio-trim'; id: string; edge: 'left' | 'right'; t: number; in: number; out: number }
-    | { kind: 'cut-slip'; index: number; in: number; out: number };
+    | { kind: 'cut-slip'; index: number; in: number; out: number }
+    | { kind: 'audio-slip'; id: string; in: number; out: number };
 
 @injectable()
 export class AkariAnnotationsWidget extends BaseWidget {
@@ -430,7 +454,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
     protected overlays: EditOverlay[] = [];
     protected beats: EditBeat[] = [];
     protected layers: EditLayer[] = [];
-    protected audioSfx: EditAudioSfx[] = [];
+    protected audioSfx: EditAudioSfxWithFade[] = [];
     protected audioNarration: EditAudioNarration[] = [];
     protected audioBgm: EditAudioBgm | undefined;
     protected timelineTracks: EditTimelineTrack[] = [];
@@ -498,6 +522,14 @@ export class AkariAnnotationsWidget extends BaseWidget {
      * そのため pointerup ベースで自前のダブルクリック判定を行う。
      */
     protected lastCutClick: { index: number; time: number; x: number; y: number } | undefined;
+    /**
+     * 音声クリップ版ソーストリマー（task 2026-08-18-audio-clip-trimmer-dblclick）: dblclick 中の
+     * 音声クリップ（audio.sfx[].id）。動画クリップの trimmerItemId/lastCutClick と同型
+     * （BGM は audio.sfx を経由しないため対象外・R6 契約どおり）。
+     */
+    protected trimmerAudioId: string | undefined;
+    protected lastAudioClick: { id: string; time: number; x: number; y: number } | undefined;
+    protected audioDurationNoticeShown = false;
     protected suppressNextStripClick = false;
     protected rightPaneSyncRevision = 0;
     protected rightPaneSyncTail: Promise<void> = Promise.resolve();
@@ -1145,10 +1177,11 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 this.cancelDrag(this.dragState);
                 return;
             }
-            if (event.key === 'Escape' && this.trimmerItemId !== undefined
+            if (event.key === 'Escape' && (this.trimmerItemId !== undefined || this.trimmerAudioId !== undefined)
                 && !this.isEditableTarget(event.target) && !this.isEditableTarget(document.activeElement)) {
                 event.preventDefault();
                 this.exitTrimmerMode();
+                this.exitAudioTrimmerMode();
                 return;
             }
             if (event.key === 'Escape' && this.isAttached && (this.selection || this.multiSelection.length > 0)
@@ -1364,7 +1397,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
         if (state.kind === 'layer') {
             return { kind: 'layer', id: state.id };
         }
-        if (state.kind === 'audio' || state.kind === 'audio-trim') {
+        if (state.kind === 'audio' || state.kind === 'audio-trim' || state.kind === 'audio-slip') {
             return { kind: 'audio', id: state.id };
         }
         return { kind: 'overlay', id: state.id };
@@ -1414,16 +1447,24 @@ export class AkariAnnotationsWidget extends BaseWidget {
     /**
      * ソーストリマー（R6c-2）: 選択が「トリマー中のクリップ自身」以外に変わったら解除する
      * （「他クリップ選択」「空クリック」の解除経路を選択の一箇所に集約する）。
+     * 音声クリップ版トリマー（trimmerAudioId）も同じ集約点で解除する
+     * （task 2026-08-18-audio-clip-trimmer-dblclick）。
      */
     protected exitTrimmerModeUnlessSelected(nextSelection: TimelineSelection): void {
-        if (this.trimmerItemId === undefined) {
-            return;
+        let changed = false;
+        if (this.trimmerItemId !== undefined
+            && !(nextSelection?.kind === 'cut' && nextSelection.index === this.trimmerItemId)) {
+            this.trimmerItemId = undefined;
+            changed = true;
         }
-        if (nextSelection?.kind === 'cut' && nextSelection.index === this.trimmerItemId) {
-            return;
+        if (this.trimmerAudioId !== undefined
+            && !(nextSelection?.kind === 'audio' && nextSelection.id === this.trimmerAudioId)) {
+            this.trimmerAudioId = undefined;
+            changed = true;
         }
-        this.trimmerItemId = undefined;
-        this.renderStrip();
+        if (changed) {
+            this.renderStrip();
+        }
     }
 
     /**
@@ -1477,6 +1518,62 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.renderStrip();
     }
 
+    /**
+     * ダブルクリック相当の判定（音声クリップ版・detectCutDoubleClick と同型）。id ベースの
+     * 音声クリップ（audio.sfx[].id）向けに直近クリックを記録する。
+     */
+    protected detectAudioDoubleClick(id: string, clientX: number, clientY: number): boolean {
+        const now = Date.now();
+        const previous = this.lastAudioClick;
+        const isDouble = previous !== undefined && previous.id === id
+            && now - previous.time < 400
+            && Math.abs(clientX - previous.x) <= 6 && Math.abs(clientY - previous.y) <= 6;
+        this.lastAudioClick = { id, time: now, x: clientX, y: clientY };
+        if (isDouble) {
+            this.lastAudioClick = undefined;
+        }
+        return isDouble;
+    }
+
+    /**
+     * 音声クリップ dblclick によるソーストリマーモードの開始/終了トグル（動画クリップの
+     * toggleTrimmerMode と同型。R6 契約 §1 裁定 3 を audio.sfx[] へ適用・BGM は対象外）。
+     */
+    protected toggleAudioTrimmerMode(id: string): void {
+        if (this.dragState) {
+            // ドラッグ中の dblclick は無視（installDragListeners 側の pointerdown 早期 return と対称）。
+            return;
+        }
+        if (this.trimmerAudioId === id) {
+            this.exitAudioTrimmerMode();
+            return;
+        }
+        const sfx = this.audioSfx.find(candidate => candidate.id === id);
+        if (!sfx || !this.location?.editUri) {
+            return;
+        }
+        const audioUri = this.resolveEditMediaUri(sfx.path, this.location.editUri).toString();
+        this.trimmerAudioId = id;
+        this.applySelection({ kind: 'audio', id });
+        void this.ensureAudioDurationFetch(sfx.path, audioUri);
+        this.renderStrip();
+    }
+
+    protected exitAudioTrimmerMode(): void {
+        if (this.trimmerAudioId === undefined) {
+            return;
+        }
+        this.trimmerAudioId = undefined;
+        this.renderStrip();
+    }
+
+    protected showAudioDurationUnavailableNotice(): void {
+        if (!this.audioDurationNoticeShown && !this.notice.textContent) {
+            this.showNotice('音声素材の実尺が取得できないため、ソーストリマーを開けません。');
+            this.audioDurationNoticeShown = true;
+        }
+    }
+
     protected syncRightPane(): void {
         const revision = ++this.rightPaneSyncRevision;
         const showInspector = this.selectionModel.snapshot !== undefined;
@@ -1491,6 +1588,9 @@ export class AkariAnnotationsWidget extends BaseWidget {
             );
             if (action === 'open-inspector') {
                 await this.commands.executeCommand(OPEN_AKARI_INSPECTOR_ID);
+            } else if (action === 'attach-inspector') {
+                // 焦点は奪わずタブとして常駐だけさせる（reveal しない）
+                await this.commands.executeCommand(OPEN_AKARI_INSPECTOR_ID, { attachOnly: true });
             } else if (action === 'show-partner') {
                 await this.shell.activateWidget(PARTNER_WIDGET_ID);
             }
@@ -2010,7 +2110,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     const sfx = this.audioSfx.find(candidate => candidate.id === request.id);
                     const sfxIndex = Number(request.id.slice(4));
                     if (!sfx || !Number.isInteger(sfxIndex)) {
-                        throw new Error('SE が見つかりません。');
+                        throw new Error('音声クリップが見つかりません。');
                     }
                     const original = sfx.gainDb ?? null;
                     await this.annotationsService.setSfxGain({
@@ -2020,7 +2120,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                         gainDb: request.value
                     });
                     this.pushHistory({
-                        label: 'SE の音量を変更',
+                        label: '音声クリップの音量を変更',
                         undo: async () => {
                             await this.annotationsService.setSfxGain({
                                 editUri,
@@ -2042,7 +2142,59 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     });
                     await this.reloadEdit();
                     this.hideNotice();
-                    this.footer.textContent = 'SE の音量を変更しました。';
+                    this.footer.textContent = '音声クリップの音量を変更しました。';
+                    return { ok: true };
+                }
+                case 'sfx-fade-in':
+                case 'sfx-fade-out': {
+                    // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum
+                    // (audio-clip-fades, 2026-08-18) -- same shape as bgm-fade-in/bgm-fade-out
+                    // below, but per-sfx-item via sfxIndex (sfx-gain's id-to-index convention).
+                    if (!location.editUri) {
+                        throw new Error('edit.json がありません。');
+                    }
+                    const editUri = location.editUri.toString();
+                    const projectRootUri = location.root.toString();
+                    const sfx = this.audioSfx.find(candidate => candidate.id === request.id);
+                    const sfxIndex = Number(request.id.slice(4));
+                    if (!sfx || !Number.isInteger(sfxIndex)) {
+                        throw new Error('音声クリップが見つかりません。');
+                    }
+                    const originalFadeIn = sfx.fadeIn ?? null;
+                    const originalFadeOut = sfx.fadeOut ?? null;
+                    const nextFields = {
+                        fadeIn: request.kind === 'sfx-fade-in' ? request.value : undefined,
+                        fadeOut: request.kind === 'sfx-fade-out' ? request.value : undefined
+                    };
+                    const originalFields = {
+                        fadeIn: request.kind === 'sfx-fade-in' ? originalFadeIn : undefined,
+                        fadeOut: request.kind === 'sfx-fade-out' ? originalFadeOut : undefined
+                    };
+                    await this.annotationsService.setSfxFade({ editUri, projectRootUri, sfxIndex, ...nextFields });
+                    this.pushHistory({
+                        label: '音声クリップのフェードを変更',
+                        undo: async () => {
+                            await this.annotationsService.setSfxFade({
+                                editUri,
+                                projectRootUri,
+                                sfxIndex,
+                                ...originalFields
+                            });
+                            await this.reloadEdit();
+                        },
+                        redo: async () => {
+                            await this.annotationsService.setSfxFade({
+                                editUri,
+                                projectRootUri,
+                                sfxIndex,
+                                ...nextFields
+                            });
+                            await this.reloadEdit();
+                        }
+                    });
+                    await this.reloadEdit();
+                    this.hideNotice();
+                    this.footer.textContent = '音声クリップのフェードを変更しました。';
                     return { ok: true };
                 }
                 case 'bgm-gain':
@@ -2314,13 +2466,15 @@ export class AkariAnnotationsWidget extends BaseWidget {
             return {
                 kind: 'audio', id: sfx.id, audioKind: 'sfx', label: this.pathBaseName(sfx.path),
                 outputStart: sfx.t, duration: sfx.duration,
-                ...(sfx.gainDb !== undefined ? { gainDb: sfx.gainDb } : {})
+                ...(sfx.gainDb !== undefined ? { gainDb: sfx.gainDb } : {}),
+                ...(sfx.fadeIn !== undefined ? { fadeIn: sfx.fadeIn } : {}),
+                ...(sfx.fadeOut !== undefined ? { fadeOut: sfx.fadeOut } : {})
             };
         }
         if (selection.id === 'bgm' && this.audioBgm) {
             return {
                 kind: 'audio', id: this.audioBgm.id, audioKind: 'bgm', label: this.pathBaseName(this.audioBgm.path),
-                outputStart: 0, duration: this.totalDuration(),
+                outputStart: 0, duration: this.contentEndDuration(),
                 ...(this.audioBgm.gainDb !== undefined ? { gainDb: this.audioBgm.gainDb } : {}),
                 ...(this.audioBgm.fadeIn !== undefined ? { fadeIn: this.audioBgm.fadeIn } : {}),
                 ...(this.audioBgm.fadeOut !== undefined ? { fadeOut: this.audioBgm.fadeOut } : {}),
@@ -2549,7 +2703,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 const sfx = this.audioSfx.find(candidate => candidate.id === selection.id);
                 const sfxIndex = Number(selection.id.slice(4));
                 if (!sfx || !Number.isInteger(sfxIndex) || !this.validTimelinePosition(sfx.t, sfx.track ?? 0)) {
-                    this.showNotice('SE の時刻またはトラックが不正です。');
+                    this.showNotice('音声クリップの時刻またはトラックが不正です。');
                     return;
                 }
                 const editBefore = (await this.fileService.readFile(location.editUri)).value.toString();
@@ -2561,7 +2715,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 await this.pruneEmptyDeclaredTracks();
                 const editAfter = (await this.fileService.readFile(location.editUri)).value.toString();
                 this.pushHistory({
-                    label: 'SE の削除',
+                    label: '音声クリップの削除',
                     undo: async () => {
                         await this.writeTimelineSnapshots(editBefore);
                         await this.reloadEdit();
@@ -2571,7 +2725,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                         await this.reloadEdit();
                     }
                 });
-                this.footer.textContent = this.writeResultMessage('SE を削除しました。', result);
+                this.footer.textContent = this.writeResultMessage('音声クリップを削除しました。', result);
             }
             this.applySelection(undefined);
             this.hideNotice();
@@ -2670,25 +2824,32 @@ export class AkariAnnotationsWidget extends BaseWidget {
     }
 
     /**
-     * 素材追加の共通実装（task 2026-08-10-material-dnd-timeline 指示6）。再生ヘッド追加
-     * （addMaterialAtPlayhead）と D&D ドロップ（handleMaterialDrop）の両方がここへ委譲する。
-     * video は layers[]、audio は audio.sfx[] へ {t, track} で挿入する。書き込みは全文
-     * スナップショット方式（performDeleteMultiSelected と同型）。widget から未使用の
-     * insertLayer/insertSfx RPC は使わない。引数検証・拒否はここで完結し、例外は投げない。
+     * 素材追加の共通実装（task 2026-08-10-material-dnd-timeline 指示6、
+     * task 2026-08-18-timeline-dnd-p0p1 で本編カット・音源行生成・尺の非クランプへ拡張）。
+     * 再生ヘッド追加（addMaterialAtPlayhead）と D&D ドロップ（handleMaterialDrop）の両方が
+     * ここへ委譲する。書き込みは全文スナップショット方式（performDeleteMultiSelected と同型）。
+     * 引数検証はここで完結し、例外は投げない。
+     *
+     * options.zone が行き先を決める:
+     * - `layers`（既定。video / image）: `layers[]` へ挿入。行間ドロップ（insertTrack）なら
+     *   既存 track の繰り上げ + 宣言トラックの新規挿入を 1 スナップショットに畳む。
+     * - `cuts`（video / image）: `cuts[]` へ挿入（P1-a）。v0 で別ソースを落とした場合は
+     *   v1（マルチソース）へ移行する — insertCutIntoEdit の責務。
+     * - `audio`: `audio.sfx[]` へ挿入。options.createAudioTrack のとき、明示 timeline.tracks に
+     *   audio 行が無ければ 1 本足す（P0-a。宣言していないプロジェクトは派生で自動的に生える）。
+     *
      * options.durationSeconds が渡されていれば実尺プローブ済みとして扱い、video の実尺 RPC を
-     * 再度叩かない（司令塔裁定6「ドロップ時の実挿入も同じ優先順」）。image は常に
-     * IMAGE_LAYER_DEFAULT_DURATION_SECONDS（司令塔裁定3）。
-     * options.insertTrack が渡されていれば行間ドロップ（task 2026-08-10-dnd-ghost-and-insert-fix
-     * 司令塔裁定3）: 既存 layers[].track の繰り上げ + 宣言トラックの繰り上げ・新規挿入を、この
-     * メソッド内の 1 回の全文スナップショット書き込みに畳み込む（undo/redo 1 エントリで
-     * アイテムと新トラックの両方が可逆になる）。audio には insertTrack は来ない（裁定4）。
+     * 再度叩かない。image は常に IMAGE_LAYER_DEFAULT_DURATION_SECONDS。
      */
     async addMaterialAt(
         relativePath: string,
         kind: string,
         t: number,
         track: number,
-        options?: { durationSeconds?: number; insertTrack?: number }
+        options?: {
+            durationSeconds?: number; insertTrack?: number;
+            zone?: MaterialDropZone; createAudioTrack?: boolean;
+        }
     ): Promise<void> {
         if (kind !== 'video' && kind !== 'audio' && kind !== 'image') {
             this.messages.warn('素材を追加できません（種別が不正です）。');
@@ -2703,6 +2864,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
             this.messages.warn('edit.json が見つからないため素材を追加できません。');
             return;
         }
+        const zone: MaterialDropZone = options?.zone ?? (kind === 'audio' ? 'audio' : 'layers');
         let durationSeconds = 0;
         let fallbackNote = '';
         if (kind === 'image') {
@@ -2731,44 +2893,61 @@ export class AkariAnnotationsWidget extends BaseWidget {
         }
         try {
             const editBefore = (await this.fileService.readFile(location.editUri)).value.toString();
-            const value = JSON.parse(editBefore) as Record<string, any>;
-            const contentDuration = this.contentEndDuration();
-            if (kind === 'video' || kind === 'image') {
+            let value = JSON.parse(editBefore) as Record<string, any>;
+            let successNote = 'タイムラインに素材を追加しました。';
+            let warningNote = '';
+            let beyondNote = '';
+            if (zone === 'cuts') {
+                const plan = planCutDrop(
+                    Array.isArray(value.cuts) ? value.cuts : [], track, t, durationSeconds
+                );
+                const inserted = insertCutIntoEdit(value, relativePath, plan, durationSeconds, track);
+                value = inserted.value as Record<string, any>;
+                successNote = inserted.migratedToV1
+                    ? '本編に素材を追加しました（複数ソースを扱えるよう v1 形式へ変換しました）。'
+                    : '本編に素材を追加しました。';
+                warningNote = inserted.warnings.join(' ');
+            } else if (zone === 'layers') {
                 const existingIds: string[] = Array.isArray(value.layers)
                     ? value.layers
                         .map((layer: any) => (layer && typeof layer.id === 'string' ? layer.id : ''))
                         .filter((id: string) => id.length > 0)
                     : [];
-                const built = buildLayerElement(existingIds, relativePath, t, durationSeconds, contentDuration, track);
-                if (!built.ok) {
-                    this.footer.textContent = '指定位置が総尺以上のため素材を追加できません。';
-                    return;
-                }
+                const element = buildLayerElement(existingIds, relativePath, t, durationSeconds, track);
                 if (!Array.isArray(value.layers)) {
                     value.layers = [];
                 }
                 if (options?.insertTrack !== undefined) {
                     value.layers = shiftLayerTracksForInsert(value.layers, options.insertTrack);
-                    const baseTracks = this.pinAudioGroupToBottom(
-                        parseEdit(editBefore).timeline?.tracks
-                            ?? deriveDefaultTimelineTracks(JSON.parse(editBefore), this.captions.length > 0)
-                    );
-                    value.timeline = { tracks: insertedLayerTimelineTracks(baseTracks, options.insertTrack) };
+                    // timeline は丸ごと置換せず spread で保全する（2026-08-10-dnd-ghost-and-insert-fix
+                    // の P3 申し送り: 未知フィールドを落とさない）。
+                    value.timeline = {
+                        ...(value.timeline && typeof value.timeline === 'object' ? value.timeline : {}),
+                        tracks: insertedLayerTimelineTracks(
+                            this.snapshotTimelineTracks(editBefore), options.insertTrack
+                        )
+                    };
                 }
-                value.layers.push(built.element);
+                value.layers.push(element);
+                beyondNote = this.beyondCutsEndNote(t);
             } else {
-                const built = buildSfxElement(relativePath, t, contentDuration, track);
-                if (!built.ok) {
-                    this.footer.textContent = '指定位置が総尺以上のため素材を追加できません。';
-                    return;
-                }
+                const element = buildSfxElement(relativePath, t, track);
                 if (!value.audio || typeof value.audio !== 'object') {
                     value.audio = {};
                 }
                 if (!Array.isArray(value.audio.sfx)) {
                     value.audio.sfx = [];
                 }
-                value.audio.sfx.push(built.element);
+                value.audio.sfx.push(element);
+                beyondNote = this.beyondCutsEndNote(t);
+                // P0-a: 明示 timeline.tracks に audio 行が無いと、sfx を足しても帯が出ない。
+                // 宣言していないプロジェクトは deriveTracks が sfx から自動で生やすので触らない。
+                if (Array.isArray(value.timeline?.tracks)) {
+                    value.timeline = {
+                        ...value.timeline,
+                        tracks: ensuredAudioTimelineTracks(value.timeline.tracks)
+                    };
+                }
             }
             let editAfter = `${JSON.stringify(value, undefined, 2)}\n`;
             await this.writeTimelineSnapshots(editAfter);
@@ -2785,14 +2964,30 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     await this.reloadEdit();
                 }
             });
-            this.hideNotice();
-            this.footer.textContent = fallbackNote || 'タイムラインに素材を追加しました。';
+            if (warningNote) {
+                this.showNotice(warningNote);
+            } else {
+                this.hideNotice();
+            }
+            this.footer.textContent = `${successNote}${beyondNote}${fallbackNote}`;
             this.revealOutputPreview();
         } catch (error) {
             const detail = this.errorMessage(error);
             this.showNotice(`素材を追加できません: ${detail}`);
             this.messages.error(`素材を追加できません: ${detail}`);
         }
+    }
+
+    /**
+     * 行間ドロップで宣言トラックを組み替えるときの基準列。明示 timeline.tracks があればそれ、
+     * 無ければ派生ベースラインを、いずれも pinAudioGroupToBottom（audio 先頭 = 画面最下段）で
+     * 正規化して返す（2026-08-10-dnd-ghost-and-insert-fix の呼び出しをそのまま関数化）。
+     */
+    protected snapshotTimelineTracks(editBefore: string): EditTimelineTrack[] {
+        return this.pinAudioGroupToBottom(
+            parseEdit(editBefore).timeline?.tracks
+                ?? deriveDefaultTimelineTracks(JSON.parse(editBefore), this.captions.length > 0)
+        );
     }
 
     /**
@@ -2850,9 +3045,14 @@ export class AkariAnnotationsWidget extends BaseWidget {
         event.preventDefault();
         event.stopPropagation();
         const payload = this.materialDragPayload;
-        const rejected = !!payload && this.resolveMaterialDropTarget(payload.kind, event.clientY).rejected;
+        const target = payload ? this.resolveMaterialDropTarget(payload.kind, event.clientY) : undefined;
+        const rejected = !!target?.rejected;
         if (event.dataTransfer) {
             event.dataTransfer.dropEffect = rejected ? 'none' : 'copy';
+        }
+        // P0-b: 拒否は無言にしない。なぜ置けないのかをドラッグ中からフッターに出す。
+        if (rejected && target?.reason) {
+            this.footer.textContent = target.reason;
         }
         this.updateMaterialGhost(event.clientX, event.clientY);
     }
@@ -2888,17 +3088,21 @@ export class AkariAnnotationsWidget extends BaseWidget {
         }
         const target = this.resolveMaterialDropTarget(payload.kind, clientY);
         if (target.rejected) {
+            this.footer.textContent = target.reason || '素材をここには置けません。';
             return;
         }
-        const t = Math.min(Math.max(this.timeAtClientX(clientX), 0), this.contentEndDuration());
         const durationSeconds = payload.kind === 'image'
             ? IMAGE_LAYER_DEFAULT_DURATION_SECONDS
             : this.materialDurationCache.get(payload.relativePath) ?? payload.durationSeconds;
+        const resolvedDuration = durationSeconds ?? this.materialGhostDurationSeconds(payload);
+        const t = this.materialDropTime(clientX, target.zone, target.track, resolvedDuration);
         void this.addMaterialAt(
             payload.relativePath, payload.kind, t, target.track,
             {
+                zone: target.zone,
                 ...(typeof durationSeconds === 'number' ? { durationSeconds } : {}),
-                ...(target.insertTrack !== undefined ? { insertTrack: target.insertTrack } : {})
+                ...(target.insertTrack !== undefined ? { insertTrack: target.insertTrack } : {}),
+                ...(target.createAudioTrack ? { createAudioTrack: true } : {})
             }
         );
     }
@@ -2919,33 +3123,94 @@ export class AkariAnnotationsWidget extends BaseWidget {
     }
 
     /**
-     * ドロップ先トラック行の解決（司令塔裁定2）。video/image は layerTracks、audio は
-     * audioTracks を対象にする。既存 trackAtClientY（そのまま使う — 指示3）に、layers が
-     * 1 本も無いプロジェクトでも新トラック扱いで受理する特例を足す。
+     * ドロップ先トラック行の解決（task 2026-08-10-material-dnd-timeline 司令塔裁定2 を
+     * task 2026-08-18-timeline-dnd-p0p1 で拡張）。
+     *
+     * - audio: 音源帯を狙う。**音源トラック行が 1 本も無いときも受理する**（P0-a）。この場合は
+     *   ref 0 の音源トラックを新規に作る（`createAudioTrack`）。従来はここが reject だったため、
+     *   BGM しか持たない通常のプロジェクトでは音源をどこにも落とせなかった。
+     * - video / image: レイヤー帯 → 本編帯の順に当てる。どちらの行にも当たらなければ拒否し、
+     *   **理由**を返す（P0-b。無言 no-op は「壊れている」と区別が付かない）。
+     *   layers / cuts が両方 0 本のプロジェクトは、従来どおり新レイヤー行として受理する。
      */
     protected resolveMaterialDropTarget(
         kind: MaterialDragKind, clientY: number
-    ): { track: number; top: number; height: number; rejected: boolean; insertTrack?: number } {
+    ): {
+        zone: MaterialDropZone; track: number; top: number; height: number; rejected: boolean;
+        insertTrack?: number; createAudioTrack?: boolean; reason?: string;
+    } {
         if (kind === 'audio') {
             const layouts = this.laneLayout.audioTracks;
-            if (materialDropAcceptance('audio', layouts.length ? 'audio' : undefined) === 'reject') {
-                return { track: 0, top: 0, height: SUBROW_STRIDE, rejected: true };
+            if (layouts.length === 0) {
+                // P0-a: 音源帯がまだ無い。落とした位置の行にゴーストを出し、書き込み時に音源行を作る。
+                const localY = clientY - this.strip.getBoundingClientRect().top;
+                return {
+                    zone: 'audio', track: 0, top: Math.max(0, localY - SUBROW_STRIDE / 2),
+                    height: SUBROW_STRIDE, rejected: false, createAudioTrack: true
+                };
             }
             const hit = this.trackAtClientY('audio', layouts, clientY, layouts[0].track);
             const matched = layouts.find(layout => layout.track === hit.track);
-            return { track: hit.track, top: hit.top, height: matched?.height ?? SUBROW_STRIDE, rejected: hit.rejected };
+            return {
+                zone: 'audio', track: hit.track, top: hit.top,
+                height: matched?.height ?? SUBROW_STRIDE, rejected: hit.rejected,
+                ...(hit.rejected ? { reason: this.materialDropRejectReason('audio', 'cuts') } : {})
+            };
         }
-        const layouts = this.laneLayout.layerTracks;
-        if (layouts.length === 0) {
-            // layers 行が 1 本も無いプロジェクトでも挿入できること（司令塔裁定2 の明示要求）。
-            return { track: 0, top: 0, height: SUBROW_STRIDE, rejected: false, insertTrack: 0 };
+        const layerLayouts = this.laneLayout.layerTracks;
+        const cutLayouts = this.laneLayout.cutTracks;
+        const localY = clientY - this.strip.getBoundingClientRect().top;
+        if (layerLayouts.length === 0 && cutLayouts.length === 0) {
+            // レイヤー行も本編行も無いプロジェクトでも挿入できること（2026-08-10 司令塔裁定2）。
+            return {
+                zone: 'layers', track: 0, top: 0, height: SUBROW_STRIDE, rejected: false, insertTrack: 0
+            };
         }
-        const hit = this.trackAtClientY('layer', layouts, clientY, layouts[0].track);
-        const matched = layouts.find(layout => layout.track === hit.track);
+        // 1) レイヤー帯を先に当てる（行間ゾーンの取り合いで既存挙動を変えないため）。
+        if (layerLayouts.length > 0) {
+            const hit = this.trackAtClientY('layer', layerLayouts, clientY, layerLayouts[0].track);
+            if (!hit.rejected) {
+                const matched = layerLayouts.find(layout => layout.track === hit.track);
+                return {
+                    zone: 'layers', track: hit.track, top: hit.top,
+                    height: matched?.height ?? SUBROW_STRIDE, rejected: false,
+                    ...(hit.insertTrack !== undefined ? { insertTrack: hit.insertTrack } : {})
+                };
+            }
+        }
+        // 2) 本編帯は「行の上にカーソルがある」ときだけ。行間・余白は本編に取らせない
+        //    （cuts[].track >= 1 は v1 の描画経路が無視する = 画面に出ないクリップになるため、
+        //    本編には新トラックを作らない。重ねたいならレイヤー帯を使う）。
+        if (cutLayouts.length > 0 && this.laneKindAtLocalY(localY) === 'cut') {
+            const hit = this.trackAtClientY('cut', cutLayouts, clientY, cutLayouts[0].track);
+            const track = hit.insertTrack !== undefined
+                ? (cutLayouts.find(layout => layout.track === hit.track - 1) ?? cutLayouts[0]).track
+                : hit.track;
+            const matched = cutLayouts.find(layout => layout.track === track);
+            return {
+                zone: 'cuts', track, top: matched?.top ?? hit.top,
+                height: matched?.height ?? SUBROW_STRIDE, rejected: false
+            };
+        }
+        // 3) レイヤー行が 1 本も無いプロジェクトの余白は「新しいレイヤー行」として受け付ける
+        //    （2026-08-10 司令塔裁定2 の救済。本編行しか無いプロジェクトでも PinP を D&D で作れる）。
+        if (layerLayouts.length === 0 && this.laneKindAtLocalY(localY) === 'none') {
+            return {
+                zone: 'layers', track: 0, top: Math.max(0, localY - SUBROW_STRIDE / 2),
+                height: SUBROW_STRIDE, rejected: false, insertTrack: 0
+            };
+        }
+        // 4) 字幕 / オーバーレイ / ビート帯。理由を添えて拒否する。
         return {
-            track: hit.track, top: hit.top, height: matched?.height ?? SUBROW_STRIDE,
-            rejected: hit.rejected, insertTrack: hit.insertTrack
+            zone: 'layers', track: 0, top: 0, height: SUBROW_STRIDE, rejected: true,
+            reason: this.materialDropRejectReason(kind, 'overlays')
         };
+    }
+
+    /** 拒否理由の文言（純関数 materialDropDecision の reason をそのまま使う）。 */
+    protected materialDropRejectReason(kind: MaterialDragKind, trackKind: 'cuts' | 'overlays'): string {
+        const decision = materialDropDecision(kind, trackKind);
+        return decision.accept === true ? '' : decision.reason;
     }
 
     protected materialGhostDurationSeconds(payload: MaterialDragPayload): number {
@@ -2980,11 +3245,16 @@ export class AkariAnnotationsWidget extends BaseWidget {
             return;
         }
         const durationSeconds = this.materialGhostDurationSeconds(payload);
-        const contentDuration = this.contentEndDuration();
-        const t = Math.min(Math.max(this.timeAtClientX(clientX), 0), contentDuration);
-        const range = computeMaterialGhostRange(t, durationSeconds, contentDuration);
-        this.setGhostRange(this.materialGhost, range.ok ? range.range.start : t, range.ok ? range.range.end : t);
-        this.setGhostRejected(this.materialGhost, !range.ok);
+        // task 2026-08-18-timeline-dnd-p0p1 / P1-b: 総尺でのクランプをやめる。総尺より後ろに
+        // 置けるし、素材が黙って短く切られることもない（置けば総尺のほうが伸びる）。
+        // 本編帯だけは重なりが許されない（cuts.track-overlap は error）ので、着地位置を
+        // 空きへ寄せた結果をそのままゴーストに出す（見えている場所 = 入る場所）。
+        const range = computeMaterialGhostRange(
+            this.materialDropTime(clientX, target.zone, target.track, durationSeconds),
+            durationSeconds
+        );
+        this.setGhostRange(this.materialGhost, range.start, range.end);
+        this.setGhostRejected(this.materialGhost, false);
         const viewportTop = RULER_BAND_HEIGHT_PX + target.top - this.stripScroll.scrollTop;
         this.materialGhost.style.top = `${viewportTop}px`;
         this.materialGhost.style.height = `${target.height}px`;
@@ -3159,6 +3429,33 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.renderStrip();
     }
 
+    /**
+     * parsed.audioSfx（正本 packages/edit-store の EditAudioSfx）は fade_in/fade_out を運ばない
+     * （EditAudioSfxWithFade の header comment 参照）。rawValue（edit.json の生 JSON）から直接
+     * 読み、各 sfx の id（"sfx-N" -- parseEdit が付ける元インデックス。parsed.audioSfx は不正な
+     * 要素を skip するため配列位置とは一致しないことがあるので、id の N を使う）で
+     * rawValue.audio.sfx[N] と対応付けて拡張フィールドとして足し込む。
+     */
+    protected withSfxFade(items: readonly EditAudioSfx[], rawValue: unknown): EditAudioSfxWithFade[] {
+        const rawSfx = (rawValue as { audio?: { sfx?: unknown } } | null)?.audio?.sfx;
+        const rawSfxArray = Array.isArray(rawSfx) ? rawSfx : [];
+        return items.map(item => {
+            const index = Number(item.id.slice(4));
+            const raw = Number.isInteger(index)
+                ? rawSfxArray[index] as { fade_in?: unknown; fade_out?: unknown } | undefined
+                : undefined;
+            const fadeIn = typeof raw?.fade_in === 'number' && Number.isFinite(raw.fade_in) && raw.fade_in >= 0
+                ? raw.fade_in : undefined;
+            const fadeOut = typeof raw?.fade_out === 'number' && Number.isFinite(raw.fade_out) && raw.fade_out >= 0
+                ? raw.fade_out : undefined;
+            return {
+                ...item,
+                ...(fadeIn !== undefined ? { fadeIn } : {}),
+                ...(fadeOut !== undefined ? { fadeOut } : {})
+            };
+        });
+    }
+
     protected async reloadEdit(): Promise<void> {
         this.cuts = [];
         this.sources = undefined;
@@ -3184,7 +3481,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 this.overlays = parsed.overlays;
                 this.beats = parsed.beats ?? [];
                 this.layers = parsed.layers;
-                this.audioSfx = parsed.audioSfx;
+                this.audioSfx = this.withSfxFade(parsed.audioSfx, rawValue);
                 this.audioNarration = parsed.audioNarration;
                 this.audioBgm = parsed.audioBgm;
                 this.timelineTracks = this.pinAudioGroupToBottom(
@@ -3522,6 +3819,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
      */
     protected calculateLaneLayout(topOffset = 0): number {
         this.computeAudioDisplayTracks();
+        this.computeBgmDisplayTrack();
         this.computeCaptionsDisplayTrack();
         this.captionRows = assignSubRows(this.captions.map(caption => ({ start: caption.start, end: caption.end })));
         const captionRowCount = this.captionRows.length ? Math.max(...this.captionRows) + 1 : 0;
@@ -3567,7 +3865,10 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 // 振り分け済みのため、ここで残る重なりは「bgm（全区間）× sfx」のみ。
                 const intervals = [
                     ...(this.audioBgm && ref === 0
-                        ? [{ start: 0, end: this.totalDuration(), id: this.audioBgm.id, kind: 'bgm' as const }] : []),
+                        // BGM バーの終端はコンテンツ終端（実際に音が使われる範囲）。totalDuration() は
+                        // スクロール余白込みの表示全長（contentEnd の約 2 倍）なので使わない
+                        // （実機報告 2026-08-18: mp3 実尺相当までバーが伸びて見えていた）。
+                        ? [{ start: 0, end: this.contentEndDuration(), id: this.audioBgm.id, kind: 'bgm' as const }] : []),
                     // narration は track を持たないため常に ref 0 帯へ乗せる（Phase 2-5 逆輸入）。
                     ...(ref === 0 ? this.audioNarration.map(narration => ({
                         start: narration.t,
@@ -3672,6 +3973,19 @@ export class AkariAnnotationsWidget extends BaseWidget {
     protected computeCaptionsDisplayTrack(): void {
         this.displayTimelineTracks = withCaptionsDisplaySupplement(
             this.displayTimelineTracks, this.captions.length > 0
+        );
+    }
+
+    /**
+     * 表示専用の音声レーン補完（2026-08-18 実機報告「BGM が鳴るのにタイムラインに出ない」）:
+     * 明示 timeline.tracks に audio 種別が 1 つも無くても、audio.bgm が宣言されていれば
+     * 表示上のみ最下段へ補う（中核は withAudioDisplaySupplement、字幕補完〔裁定 2026-08-12・
+     * 裁定 2〕と同型の純関数として単体テスト済み）。BGM バー自体の描画は calculateLaneLayout の
+     * 既存 bgm 区間処理（ref 0 帯）がそのまま拾う。edit.json への書き戻しは一切行わない。
+     */
+    protected computeBgmDisplayTrack(): void {
+        this.displayTimelineTracks = withAudioDisplaySupplement(
+            this.displayTimelineTracks, Boolean(this.audioBgm)
         );
     }
 
@@ -3878,10 +4192,12 @@ export class AkariAnnotationsWidget extends BaseWidget {
             this.strip.appendChild(element);
         });
         const bgmLayout = this.trackLayout('audio', 0);
-        if (this.audioBgm && bgmLayout && this.isRangeVisible(0, this.totalDuration())) {
+        if (this.audioBgm && bgmLayout && this.isRangeVisible(0, this.contentEndDuration())) {
             const bgm = this.audioBgm;
             const label = this.pathBaseName(bgm.path);
-            const end = this.totalDuration();
+            // バーはコンテンツ終端でトリムして描く（BGM は全編ベッドだが、書き出しで使われるのは
+            // 動画尺ぶんだけ。ソース mp3 の実尺やスクロール余白までバーを伸ばさない）
+            const end = this.contentEndDuration();
             const bgmSubrowCount = this.audioTrackSubrowCounts.get(bgmLayout.id) ?? 1;
             const bgmItemHeight = bgmSubrowCount <= 1 ? bgmLayout.height : SUBROW_HEIGHT;
             const element = this.stripSegment(
@@ -3935,6 +4251,9 @@ export class AkariAnnotationsWidget extends BaseWidget {
             }
             this.strip.appendChild(element);
         });
+        // 音声クリップ版ソーストリマー（task 2026-08-18-audio-clip-trimmer-dblclick）: cuts の
+        // trimmerActiveIndex と同じ「レンダーパス開始時点で固定して使い回す」流儀（下記コメント参照）。
+        const trimmerActiveAudioId = this.trimmerAudioId;
         this.audioSfx.forEach(sfx => {
             const displayTrack = this.sfxDisplayTrack(sfx);
             const layout = this.trackLayout('audio', displayTrack);
@@ -3955,6 +4274,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 }
             }
             const durationSeconds = this.resolveSfxDisplayDuration(sfx, inSeconds, actualDuration);
+            const outSeconds = inSeconds + durationSeconds;
             const end = sfx.t + durationSeconds;
             if (!this.isRangeVisible(sfx.t, end)) {
                 return;
@@ -3970,31 +4290,68 @@ export class AkariAnnotationsWidget extends BaseWidget {
             element.dataset.akariLane = layout.id ?? 'audio';
             element.dataset.akariTrack = String(displayTrack);
             element.style.pointerEvents = 'auto';
-            element.style.opacity = this.audioVisible ? '' : '.28';
+            const dimForAudioTrimmer = trimmerActiveAudioId !== undefined && trimmerActiveAudioId !== sfx.id;
+            element.style.opacity = !this.audioVisible ? '.28' : dimForAudioTrimmer ? '.6' : '';
             element.appendChild(this.segmentLabel(label));
             const barWidthPercent = Math.max(this.percent(end) - this.percent(sfx.t), 0.3);
             const barWidthPx = this.strip.clientWidth * barWidthPercent / 100;
-            this.renderSfxWaveform(element, sfx, barWidthPx, itemHeight, inSeconds, inSeconds + durationSeconds, actualDuration);
-            this.installDragListeners(element, (event, rect) => {
-                const localX = event.clientX - rect.left;
-                const rightDistance = rect.right - event.clientX;
-                if (localX <= EDGE_ZONE_PX && localX <= rightDistance) {
+            // ソーストリマー（R6 契約 §3・動画クリップと同型・R6c2r2 外側延長方式）: dblclick で
+            // この音声クリップが選ばれている間だけ、本体（通常表示と同一スケール）の左右に
+            // in より前 / out より後の素材波形をウィングとして延長表示する。実尺
+            // （audioDurationCache）が解決できない間はここで即座にトリマーモードを取り消す
+            // （'unavailable' のときのみ。'pending' の間はウィング無しでトリマー枠を維持する）。
+            let showAudioTrimmer = trimmerActiveAudioId === sfx.id;
+            if (showAudioTrimmer && (actualDuration === undefined || !(actualDuration > 0))
+                && this.audioDurationCache.get(sfx.path) === 'unavailable') {
+                showAudioTrimmer = false;
+                this.trimmerAudioId = undefined;
+                this.showAudioDurationUnavailableNotice();
+            }
+            if (showAudioTrimmer) {
+                this.renderAudioTrimmerClip(element, sfx, barWidthPx, itemHeight, inSeconds, outSeconds, actualDuration);
+                this.installAudioTrimmerDrag(element, (event, rect) => {
+                    const localX = event.clientX - rect.left;
+                    const rightDistance = rect.right - event.clientX;
+                    if (localX <= EDGE_ZONE_PX && localX <= rightDistance) {
+                        return {
+                            kind: 'audio-trim', id: sfx.id, edge: 'left',
+                            originalT: sfx.t, originalIn: inSeconds, originalOut: outSeconds
+                        };
+                    }
+                    if (rightDistance <= EDGE_ZONE_PX) {
+                        return {
+                            kind: 'audio-trim', id: sfx.id, edge: 'right',
+                            originalT: sfx.t, originalIn: inSeconds, originalOut: outSeconds
+                        };
+                    }
                     return {
-                        kind: 'audio-trim', id: sfx.id, edge: 'left',
-                        originalT: sfx.t, originalIn: inSeconds, originalOut: inSeconds + durationSeconds
+                        kind: 'audio-slip', id: sfx.id, originalIn: inSeconds, originalOut: outSeconds,
+                        sourceDuration: actualDuration ?? outSeconds
                     };
-                }
-                if (rightDistance <= EDGE_ZONE_PX) {
+                });
+            } else {
+                this.renderSfxWaveform(element, sfx, barWidthPx, itemHeight, inSeconds, outSeconds, actualDuration);
+                this.installDragListeners(element, (event, rect) => {
+                    const localX = event.clientX - rect.left;
+                    const rightDistance = rect.right - event.clientX;
+                    if (localX <= EDGE_ZONE_PX && localX <= rightDistance) {
+                        return {
+                            kind: 'audio-trim', id: sfx.id, edge: 'left',
+                            originalT: sfx.t, originalIn: inSeconds, originalOut: outSeconds
+                        };
+                    }
+                    if (rightDistance <= EDGE_ZONE_PX) {
+                        return {
+                            kind: 'audio-trim', id: sfx.id, edge: 'right',
+                            originalT: sfx.t, originalIn: inSeconds, originalOut: outSeconds
+                        };
+                    }
                     return {
-                        kind: 'audio-trim', id: sfx.id, edge: 'right',
-                        originalT: sfx.t, originalIn: inSeconds, originalOut: inSeconds + durationSeconds
+                        kind: 'audio', id: sfx.id, originalT: sfx.t, originalTrack: displayTrack,
+                        originalDuration: durationSeconds
                     };
-                }
-                return {
-                    kind: 'audio', id: sfx.id, originalT: sfx.t, originalTrack: displayTrack,
-                    originalDuration: durationSeconds
-                };
-            });
+                });
+            }
             this.strip.appendChild(element);
         });
         // ソーストリマー（R6c2r2）: レンダーパス開始時点の trimmerItemId を固定で使い回す
@@ -5446,6 +5803,79 @@ export class AkariAnnotationsWidget extends BaseWidget {
         }
     }
 
+    /**
+     * 音声クリップ版 renderTrimmerClip（task 2026-08-18-audio-clip-trimmer-dblclick）。動画クリップの
+     * フィルムストリップ atlas の代わりに、renderSfxWaveform と同じ全域波形キャッシュ
+     * （`sfxwave:${path}`、[0, 実尺) を 1 回だけ取得済み）を in より前 / out より後の区間にも
+     * 適用し、「まだ使っていない部分」を波形の減光表示として描く。ウィングのコンテナ
+     * （createTrimmerWingElement）とスリップ視覚更新（updateTrimmerSlipVisual と同型の
+     * updateAudioTrimmerSlipVisual）は動画クリップ側とそのまま共有する。
+     *
+     * px/秒スケールは動画クリップと異なりクリップ自身の barWidthPx / 尺からではなく、
+     * strip 全体の px/秒（updateDragPreview の delta 計算と同じ基準）を使う — 音声バーは
+     * 横スクロールでクリップ本体の左端が隠れていても percent() が [0,100] にクランプされる
+     * ため、barWidthPx 自身が「見えている分だけ」に縮んでしまう（動画クリップの
+     * clipLocalGeometry のような「隠れている先頭量」の補正が無い）。真の左端/右端が可視の
+     * ときだけウィングを描くガード（下記）と組み合わせることで、ウィングの位置合わせが
+     * ズレない。
+     */
+    protected renderAudioTrimmerClip(
+        element: HTMLDivElement, sfx: EditAudioSfxWithFade, barWidthPx: number, itemHeightPx: number,
+        inSeconds: number, outSeconds: number, sourceDuration: number | undefined
+    ): void {
+        element.classList.add('akari-annotations-strip-clip-trimmer-active');
+        const content = document.createElement('div');
+        content.className = 'akari-annotations-strip-clip-trimmer-content';
+        element.appendChild(content);
+        this.renderSfxWaveform(content, sfx, barWidthPx, itemHeightPx, inSeconds, outSeconds, sourceDuration);
+        if (sourceDuration === undefined || !(sourceDuration > 0)) {
+            return;
+        }
+        const winDuration = outSeconds - inSeconds;
+        const pxPerSourceSecond = this.strip.clientWidth / this.visibleDuration();
+        if (!(pxPerSourceSecond > 0) || !(winDuration > 0)) {
+            return;
+        }
+        // slip ドラッグ中のライブプレビュー（updateAudioTrimmerSlipVisual）が使う px/秒スケール。
+        content.dataset.pxPerSourceSecond = String(pxPerSourceSecond);
+        const fullPeaks = this.waveformCache.get(`sfxwave:${sfx.path}`);
+        const viewEnd = this.viewStart + this.visibleDuration();
+        const trueEnd = sfx.t + winDuration;
+        // 左ウィング（in より前）: バー本体の真の左端（sfx.t）がスクロールで画面外に隠れていない
+        // ときだけ描く（動画クリップの clipLocalOffsetPx ガードと同じ意図・上記コメント参照）。
+        if (sfx.t >= this.viewStart - 1e-6 && inSeconds > 0) {
+            const wingSeconds = Math.min(inSeconds, TRIMMER_WING_MAX_WIDTH_PX / pxPerSourceSecond);
+            const wingWidthPx = wingSeconds * pxPerSourceSecond;
+            if (wingWidthPx > 0.5) {
+                const wing = this.createTrimmerWingElement(wingWidthPx, 'left');
+                wing.style.left = `${-wingWidthPx}px`;
+                if (Array.isArray(fullPeaks)) {
+                    const slice = this.sfxWaveformSlice(fullPeaks, inSeconds - wingSeconds, inSeconds, sourceDuration);
+                    if (slice.length > 0) {
+                        wing.appendChild(this.sfxWaveformCanvas(slice, wingWidthPx, itemHeightPx));
+                    }
+                }
+                content.appendChild(wing);
+            }
+        }
+        // 右ウィング（out より後）: 真の右端が可視のときだけ描く。
+        if (trueEnd <= viewEnd + 1e-6 && sourceDuration - outSeconds > 0) {
+            const wingSeconds = Math.min(sourceDuration - outSeconds, TRIMMER_WING_MAX_WIDTH_PX / pxPerSourceSecond);
+            const wingWidthPx = wingSeconds * pxPerSourceSecond;
+            if (wingWidthPx > 0.5) {
+                const wing = this.createTrimmerWingElement(wingWidthPx, 'right');
+                wing.style.left = `${barWidthPx}px`;
+                if (Array.isArray(fullPeaks)) {
+                    const slice = this.sfxWaveformSlice(fullPeaks, outSeconds, outSeconds + wingSeconds, sourceDuration);
+                    if (slice.length > 0) {
+                        wing.appendChild(this.sfxWaveformCanvas(slice, wingWidthPx, itemHeightPx));
+                    }
+                }
+                content.appendChild(wing);
+            }
+        }
+    }
+
     /** ウィング（延長表示）のコンテナ要素。外側の端をフェードアウトさせるマスクを掛ける。 */
     protected createTrimmerWingElement(widthPx: number, side: 'left' | 'right'): HTMLDivElement {
         const wing = document.createElement('div');
@@ -5581,6 +6011,104 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 if ((state.kind === 'cut-trim' || state.kind === 'cut-slip')
                     && this.detectCutDoubleClick(state.index, event.clientX, event.clientY)) {
                     this.exitTrimmerMode();
+                }
+                return;
+            }
+            const preview = this.updateDragPreview(state, event.clientX, event.clientY, true);
+            this.cancelDrag(state);
+            void this.commitDrag(preview);
+        });
+        element.addEventListener('pointercancel', event => {
+            const state = this.dragState;
+            if (state && state.pointerId === event.pointerId && state.element === element) {
+                this.cancelDrag(state);
+            }
+        });
+    }
+
+    /**
+     * 音声クリップ版 installTrimmerDrag（task 2026-08-18-audio-clip-trimmer-dblclick）。動画クリップと
+     * 同型 — 中央ドラッグが 'audio'（移動）ではなく 'audio-slip'（スリップ）になり、ドラッグなしの
+     * ダブルクリックが「トリマーモードの解除」になる点が installDragListeners との違い。
+     */
+    protected installAudioTrimmerDrag(
+        element: HTMLDivElement,
+        detail: (event: PointerEvent, rect: DOMRect) => DragDetail
+    ): void {
+        element.style.pointerEvents = 'auto';
+        element.style.touchAction = 'none';
+        element.addEventListener('click', event => event.stopPropagation());
+        element.addEventListener('pointermove', event => {
+            const state = this.dragState;
+            if (state && state.pointerId === event.pointerId && state.element === element) {
+                event.preventDefault();
+                if (Math.abs(event.clientX - state.startClientX) > DRAG_THRESHOLD_PX) {
+                    state.dragged = true;
+                }
+                this.updateDragPreview(state, event.clientX, event.clientY, state.dragged);
+                return;
+            }
+            if (this.dragState) {
+                return;
+            }
+            const rect = element.getBoundingClientRect();
+            const hoverDetail = detail(event, rect);
+            element.style.cursor = hoverDetail.kind === 'audio-trim' ? 'ew-resize' : 'grab';
+        });
+        element.addEventListener('pointerdown', event => {
+            if (event.button !== 0) {
+                return;
+            }
+            if (this.dragState) {
+                this.cancelDrag(this.dragState);
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            const ghost = element.cloneNode(true) as HTMLDivElement;
+            ghost.removeAttribute('title');
+            Object.assign(ghost.style, {
+                pointerEvents: 'none', opacity: '.5', borderStyle: 'dashed', zIndex: '8', cursor: 'grabbing'
+            });
+            this.strip.appendChild(ghost);
+            const state = {
+                ...detail(event, element.getBoundingClientRect()),
+                pointerId: event.pointerId,
+                startClientX: event.clientX,
+                startClientY: event.clientY,
+                element,
+                ghost,
+                dragged: false
+            } as DragState;
+            this.dragState = state;
+            element.style.cursor = state.kind === 'audio-slip' ? 'grabbing' : 'ew-resize';
+            element.style.opacity = '.5';
+            if (state.kind === 'audio-trim' && state.edge === 'right') {
+                const sfx = this.audioSfx.find(candidate => candidate.id === state.id);
+                if (sfx && this.location?.editUri) {
+                    const audioUri = this.resolveEditMediaUri(sfx.path, this.location.editUri).toString();
+                    void this.ensureAudioDurationFetch(sfx.path, audioUri);
+                }
+            }
+            try {
+                element.setPointerCapture(event.pointerId);
+            } catch {
+                // Pointer capture can fail if the element is detached during a file refresh.
+            }
+        });
+        element.addEventListener('pointerup', event => {
+            const state = this.dragState;
+            if (!state || state.pointerId !== event.pointerId || state.element !== element) {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            if (!state.dragged) {
+                this.cancelDrag(state);
+                // 再ダブルクリック（エッジ／中央どちらでも）で解除。同じ pointerup ベースの
+                // 自前判定（detectAudioDoubleClick）を、通常音声クリップの入場判定と共有する。
+                if ((state.kind === 'audio-trim' || state.kind === 'audio-slip')
+                    && this.detectAudioDoubleClick(state.id, event.clientX, event.clientY)) {
+                    this.exitAudioTrimmerMode();
                 }
                 return;
             }
@@ -6115,6 +6643,14 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     this.toggleTrimmerMode(state.index);
                     return;
                 }
+                // 音声クリップ版（task 2026-08-18-audio-clip-trimmer-dblclick）: 上記 cut-move と同じ
+                // pointerup ベースの自前ダブルクリック判定。'audio' は本体ドラッグ（エッジ以外）のみ
+                // （audio-trim はエッジドラッグなのでここには来ない）。
+                if (state.kind === 'audio'
+                    && this.detectAudioDoubleClick(state.id, event.clientX, event.clientY)) {
+                    this.toggleAudioTrimmerMode(state.id);
+                    return;
+                }
                 this.applySelection(this.selectionFromDragState(state));
                 this.selectTimeAtClientX(event.clientX);
                 return;
@@ -6434,8 +6970,24 @@ export class AkariAnnotationsWidget extends BaseWidget {
             this.setGhostRejected(state.ghost, false);
             this.updateDragFeedback(state,
                 `${state.edge === 'left' ? 'In' : 'Out'} ${this.formatTimestamp(state.edge === 'left' ? input : output)} `
-                + `/ 尺 ${(output - input).toFixed(2)} 秒${durationWarningSuffix}`);
+                + `/ 尺 ${(output - input).toFixed(2)} 秒${durationWarningSuffix}`
+                + this.sfxFadeFeedbackSuffix(sfx, output - input));
             return { kind: 'audio-trim', id: state.id, edge: state.edge, t, in: input, out: output };
+        }
+        if (state.kind === 'audio-slip') {
+            // 音声クリップ版 cut-slip（task 2026-08-18-audio-clip-trimmer-dblclick）。純関数部分は
+            // common/audio-clip-trimmer.ts の slipAudioWindow に切り出してテストする
+            // （cut-slip はインライン実装のまま・音声側は新規追加のため最初からテスト可能にする）。
+            const { in: nextIn, out: nextOut } = slipAudioWindow(
+                state.originalIn, state.originalOut, delta, state.sourceDuration
+            );
+            this.updateTrimmerSlipVisual(state.element, nextIn - state.originalIn);
+            const sfx = this.audioSfx.find(candidate => candidate.id === state.id);
+            this.updateDragFeedback(
+                state, `slip In ${this.formatTimestamp(nextIn)} / Out ${this.formatTimestamp(nextOut)}`
+                + this.sfxFadeFeedbackSuffix(sfx, nextOut - nextIn)
+            );
+            return { kind: 'audio-slip', id: state.id, in: nextIn, out: nextOut };
         }
         if (state.kind === 'cut-slip') {
             // slip: out−in（尺）と t（タイムライン位置）を固定したまま in/out を同量シフトする。
@@ -6496,6 +7048,25 @@ export class AkariAnnotationsWidget extends BaseWidget {
         this.setGhostSnapped(state.ghost, snap.snapped);
         this.updateDragFeedback(state, `尺 ${(end - state.originalStart).toFixed(2)} 秒`);
         return { kind: 'overlay-resize', id: state.id, duration: end - state.originalStart };
+    }
+
+    /**
+     * トリム/スリップ中のドラッグフィードバックに付ける fade 情報の接尾辞（task
+     * 2026-08-18-audio-clip-trimmer-dblclick、受け入れ条件 §5「トリムで尺が縮んだらフェード表示も
+     * 追随」）。R6 契約 §5 と同じ「fade_in/fade_out をそれぞれ独立に実効尺の半分までクランプ」
+     * 規則（clampSfxFadeToEffectiveDuration）を、ドラッグ中の実効尺（effectiveDurationSeconds =
+     * out−in の途中経過値）へその都度適用する。fade_in/fade_out が未設定・クランプ後 0 の
+     * クリップでは空文字を返す（表示を増やさない）。
+     */
+    protected sfxFadeFeedbackSuffix(sfx: EditAudioSfxWithFade | undefined, effectiveDurationSeconds: number): string {
+        if (!sfx || (sfx.fadeIn === undefined && sfx.fadeOut === undefined)) {
+            return '';
+        }
+        const { fadeIn, fadeOut } = clampSfxFadeToEffectiveDuration(sfx.fadeIn, sfx.fadeOut, effectiveDurationSeconds);
+        if (fadeIn <= 0 && fadeOut <= 0) {
+            return '';
+        }
+        return ` / fade ${fadeIn.toFixed(2)}〜${fadeOut.toFixed(2)}秒`;
     }
 
     protected updateDragFeedback(state: DragState, text: string): void {
@@ -7089,13 +7660,13 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     return;
                 }
                 if (!Number.isFinite(preview.t) || preview.t < 0 || !Number.isInteger(preview.track) || preview.track < 0) {
-                    this.showNotice('SE の移動先が不正です。');
+                    this.showNotice('音声クリップの移動先が不正です。');
                     return;
                 }
                 const original = this.audioSfx.find(sfx => sfx.id === preview.id);
                 const sfxIndex = Number(preview.id.slice(4));
                 if (!original || !Number.isInteger(sfxIndex)) {
-                    throw new Error(`SE ${preview.id} が見つかりません`);
+                    throw new Error(`音声クリップ ${preview.id} が見つかりません`);
                 }
                 const originalTrackState = await this.readIndexedTrackState('sfx');
                 result = await this.annotationsService.moveSfx({
@@ -7107,7 +7678,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 const pruneResult = await this.pruneEmptyDeclaredTracks();
                 const movedTrackState = await this.readIndexedTrackState('sfx');
                 this.pushHistory({
-                    label: 'SE の移動',
+                    label: '音声クリップの移動',
                     undo: async () => {
                         await this.annotationsService.moveSfx({
                             editUri: location.editUri!.toString(), projectRootUri: location.root.toString(),
@@ -7129,7 +7700,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                         }
                     }
                 });
-                this.footer.textContent = this.writeResultMessage('SE を移動しました。', result);
+                this.footer.textContent = this.writeResultMessage('音声クリップを移動しました。', result);
             } else if (preview.kind === 'audio-trim') {
                 if (!location.editUri) {
                     return;
@@ -7137,7 +7708,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 const original = this.audioSfx.find(sfx => sfx.id === preview.id);
                 const sfxIndex = Number(preview.id.slice(4));
                 if (!original || !Number.isInteger(sfxIndex)) {
-                    throw new Error(`SE ${preview.id} が見つかりません`);
+                    throw new Error(`音声クリップ ${preview.id} が見つかりません`);
                 }
                 let maxOutSeconds: number | undefined;
                 if (preview.edge === 'right') {
@@ -7149,7 +7720,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                 }
                 const finalOut = maxOutSeconds !== undefined ? Math.min(preview.out, maxOutSeconds) : preview.out;
                 if (finalOut - preview.in < MINIMUM_SFX_TRIM_DURATION) {
-                    this.showNotice('SE が短すぎます（0.1 秒未満にはできません）');
+                    this.showNotice('音声クリップが短すぎます（0.1 秒未満にはできません）');
                     return;
                 }
                 const originalIn = original.in ?? null;
@@ -7160,7 +7731,7 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     ...(preview.edge === 'left' ? { t: preview.t } : {})
                 });
                 this.pushHistory({
-                    label: 'SE のトリム',
+                    label: '音声クリップのトリム',
                     undo: async () => {
                         await this.annotationsService.trimSfx({
                             editUri: location.editUri!.toString(), projectRootUri: location.root.toString(),
@@ -7179,7 +7750,58 @@ export class AkariAnnotationsWidget extends BaseWidget {
                     }
                 });
                 await this.reloadEdit();
-                this.footer.textContent = this.writeResultMessage('SE をトリムしました。', result);
+                this.footer.textContent = this.writeResultMessage('音声クリップをトリムしました。', result);
+            } else if (preview.kind === 'audio-slip') {
+                // 音声クリップ版 cut-slip の確定書き戻し。既存の audio-trim 経路（trimSfx/trimSfxInSource）
+                // をそのまま再利用する — t を省略すれば trimSfxInSource は in/out だけを書き換え、
+                // t（タイムライン位置）には触れない（slip の「t 不変」要件と合致する。cut 側が
+                // slipCutInSource を別途新設したのは trimCutInSource が in 変更時に at を連動させて
+                // しまうためで、trimSfxInSource にはその副作用がないため新規 RPC は不要）。
+                if (!location.editUri) {
+                    return;
+                }
+                const original = this.audioSfx.find(sfx => sfx.id === preview.id);
+                const sfxIndex = Number(preview.id.slice(4));
+                if (!original || !Number.isInteger(sfxIndex)) {
+                    throw new Error(`音声クリップ ${preview.id} が見つかりません`);
+                }
+                // 素材実尺（audioDurationCache）を上限に再クランプする（ドラッグ中に使った
+                // sourceDuration が未解決値のフォールバックだった場合の最終防波堤。
+                // audio-trim の右端ドラッグ確定と同じ「初回だけ素通し」対策）。
+                const audioUri = this.resolveEditMediaUri(original.path, location.editUri).toString();
+                const resolvedDuration = await this.ensureAudioDurationFetch(original.path, audioUri);
+                const winDuration = preview.out - preview.in;
+                let finalIn = preview.in;
+                let finalOut = preview.out;
+                if (typeof resolvedDuration === 'number' && finalOut > resolvedDuration) {
+                    finalOut = resolvedDuration;
+                    finalIn = Math.max(0, resolvedDuration - winDuration);
+                }
+                const originalIn = original.in ?? null;
+                const originalOut = original.out ?? null;
+                result = await this.annotationsService.trimSfx({
+                    editUri: location.editUri.toString(), projectRootUri: location.root.toString(),
+                    sfxIndex, in: finalIn, out: finalOut
+                });
+                this.pushHistory({
+                    label: '音声クリップのスリップ',
+                    undo: async () => {
+                        await this.annotationsService.trimSfx({
+                            editUri: location.editUri!.toString(), projectRootUri: location.root.toString(),
+                            sfxIndex, in: originalIn, out: originalOut
+                        });
+                        await this.reloadEdit();
+                    },
+                    redo: async () => {
+                        await this.annotationsService.trimSfx({
+                            editUri: location.editUri!.toString(), projectRootUri: location.root.toString(),
+                            sfxIndex, in: finalIn, out: finalOut
+                        });
+                        await this.reloadEdit();
+                    }
+                });
+                await this.reloadEdit();
+                this.footer.textContent = this.writeResultMessage('音声クリップをスリップしました。', result);
             } else if (preview.kind === 'overlay-move') {
                 if (!location.editUri) {
                     return;
@@ -7738,6 +8360,54 @@ export class AkariAnnotationsWidget extends BaseWidget {
         const rect = this.strip.getBoundingClientRect();
         const ratio = rect.width > 0 ? Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)) : 0;
         return this.viewStart + ratio * this.visibleDuration();
+    }
+
+    /**
+     * 素材 D&D のドロップ時刻（task 2026-08-18-timeline-dnd-p0p1 / P1-b）。0 で下限を切るだけで
+     * **総尺で上限を切らない** — タイムラインは総尺の先にも余白を描いており、そこに落として
+     * 尺を伸ばせることが「自由に配置」の要件だから。フレームグリッドへの丸めもしない（v0 と同じ）。
+     */
+    protected materialDropTimeAtClientX(clientX: number): number {
+        return Math.max(0, this.timeAtClientX(clientX));
+    }
+
+    /**
+     * 書き出しの尺を決めるのは `cuts[]` なので、その終端より後ろへ置いたレイヤー / 音源は
+     * タイムライン上には見えても書き出しには入らない（edit-lint の `audio.sfx.timeline` /
+     * `overlays.timeline` と同じ事情。layers には対応する lint がまだ無い）。
+     * P1-b で「総尺より後ろに置ける」ようにした以上、この一言は必ず添える。
+     * cuts が 0 本のプロジェクトは「ソース全体が本編」なので何も言わない。
+     */
+    protected beyondCutsEndNote(t: number): string {
+        if (this.cuts.length === 0) {
+            return '';
+        }
+        const cutsEnd = this.segments.reduce((max, segment) => Math.max(max, segment.tlEnd), 0);
+        if (!(t >= cutsEnd)) {
+            return '';
+        }
+        return '（本編の終わりより後ろです。本編を伸ばさないと書き出しには入りません）';
+    }
+
+    /**
+     * 本編（cuts）へのドロップ計画。`planCutDrop` の入力を widget 状態から組み立てるだけの薄い層。
+     * ゴースト（dragover 毎）と実挿入（drop）が同じ計画を見るので、見えている位置に必ず入る。
+     */
+    protected materialCutDropPlan(clientX: number, track: number, durationSeconds: number): CutDropPlan {
+        return planCutDrop(this.cuts, track, this.materialDropTimeAtClientX(clientX), durationSeconds);
+    }
+
+    /**
+     * 行き先を織り込んだドロップ時刻。レイヤー・音源は重ねてよいので落とした位置のまま
+     * （P1-b: 総尺より後ろも可）。本編だけは planCutDrop が決めた着地時刻を使う。
+     */
+    protected materialDropTime(
+        clientX: number, zone: MaterialDropZone, track: number, durationSeconds: number
+    ): number {
+        if (zone !== 'cuts') {
+            return this.materialDropTimeAtClientX(clientX);
+        }
+        return this.materialCutDropPlan(clientX, track, durationSeconds).at;
     }
 
     protected selectTimeAtClientX(clientX: number): void {

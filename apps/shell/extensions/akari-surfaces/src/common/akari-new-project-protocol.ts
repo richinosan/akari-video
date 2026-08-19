@@ -36,12 +36,44 @@ export interface AkariToolCheckResult {
     available: boolean;
     version?: string;
     executable?: string;
+    /**
+     * whisper 行のみ持つ、認識モデル（`ggml-*.bin`）の取得状態（進捗バー + 同梱化タスク・
+     * 正本 `planning/notes-2026-08-17-install-progress-and-bundled-tools.md` §3）。
+     * モデル未取得のときは `available`（行全体）も false になる — 本体だけあっても
+     * 文字起こしはできないため、UI のチェックボックス選択対象に自然に入る。
+     */
+    model?: { available: boolean; path?: string };
 }
 
 export interface AkariToolCheckResponse {
     platform: NodeJS.Platform;
     checkedAt: string;
     tools: AkariToolCheckResult[];
+}
+
+export type AkariToolInstallOutcome = 'installed' | 'external-installer-opened' | 'failed';
+
+export interface AkariToolInstallResult {
+    id: AkariToolId;
+    outcome: AkariToolInstallOutcome;
+    /** そのまま表示できる平易な日本語 1 行。失敗時も再試行できる次の一手を含める（行き止まり禁止）。 */
+    message?: string;
+}
+
+/**
+ * 進捗バー（裁定 E1）。`installTool` 実行中、フロントが `getToolInstallProgress()` を
+ * 500ms 間隔でポーリングして読む単一カレント状態（同時実行は無い前提）。
+ * `download` はバイト進捗が取れる場合に determinate バー（xxMB / yyMB）、
+ * `command`（brew / winget）は不定形バー + 平易化したフェーズ 1 行になる。
+ */
+export interface AkariToolInstallProgress {
+    toolId: AkariToolId;
+    kind: 'download' | 'command';
+    /** そのまま表示できる平易な日本語 1 行（例「パッケージを取得しています…」）。 */
+    phase: string;
+    downloadedBytes?: number;
+    /** content-length が取れないダウンロードは undefined（= 不定形バー）。 */
+    totalBytes?: number;
 }
 
 export interface AkariNewProjectService {
@@ -80,4 +112,26 @@ export interface AkariNewProjectService {
      * macOS の Command Line Tools は `git` shim を叩かず `xcode-select -p` だけで判定する。
      */
     checkTools(): Promise<AkariToolCheckResponse>;
+
+    /**
+     * 道具を 1 つ自動導入する（初回セットアップ v2・裁定 A）。フロント側で選択した道具 ID
+     * ごとに逐次呼び、進捗表示は呼び出し側（ダイアログ）が組み立てる。取得元は公式配布
+     * チャネルのみ（Homebrew / 各公式サイト / 公式 GitHub releases）。実処理は
+     * `src/node/tool-install.ts` のインストールエンジンをそのまま呼ぶだけで、
+     * ロジックは複製しない。
+     */
+    installTool(id: AkariToolId): Promise<AkariToolInstallResult>;
+
+    /**
+     * 進行中のインストールの進捗を読む（裁定 E1）。`installTool` の呼び出しと同じ
+     * サービスインスタンス内の単一カレント状態を返す。進行中の道具が無い、または
+     * 進捗の出しようが無い区間（brew の起動待ちの最初の一瞬など）は `undefined`。
+     */
+    getToolInstallProgress(): Promise<AkariToolInstallProgress | undefined>;
+
+    /**
+     * 作業場の既定の作成先パスを読み取り専用で返す（作成はしない）。
+     * `packages/creator-root` の `defaultRootPath()` をそのまま呼ぶだけ。
+     */
+    defaultCreatorRootPath(): Promise<string>;
 }

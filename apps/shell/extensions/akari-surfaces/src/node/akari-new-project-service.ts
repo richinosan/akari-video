@@ -3,8 +3,9 @@ import { promises as fs } from 'fs';
 import { dirname, resolve } from 'path';
 import { pathToFileURL } from 'url';
 import URI from '@theia/core/lib/common/uri';
-import { AkariNewProjectService } from '../common/akari-new-project-protocol';
+import { AkariNewProjectService, AkariToolId, AkariToolInstallProgress, AkariToolInstallResult } from '../common/akari-new-project-protocol';
 import { detectTools } from './tool-detection';
+import { installTool } from './tool-install';
 
 /** `packages/project-scaffold/src/index.mjs` が export する部分のうち、このサービスが使う範囲だけの型。 */
 interface ProjectScaffoldModule {
@@ -142,8 +143,46 @@ export class AkariNewProjectServiceImpl implements AkariNewProjectService {
         }
     }
 
+    /**
+     * 進捗バー（裁定 E1）の単一カレント状態。`installTool` の実行中だけ値を持つ
+     * （同時実行は無い前提 — フロントは逐次呼ぶ）。
+     */
+    protected currentInstallProgress: AkariToolInstallProgress | undefined;
+
     async checkTools() {
         return detectTools();
+    }
+
+    /**
+     * 初回セットアップ v2（裁定 A）。1 道具ずつ導入するインストールエンジン
+     * （`tool-install.ts`）をそのまま呼ぶだけ。ロジックは複製しない。進捗（裁定 E1）は
+     * `onProgress` フックで `currentInstallProgress` を更新し、`getToolInstallProgress()`
+     * のポーリングから読めるようにする。実行前後で確実にクリアする（前回の値が次回の
+     * 一瞬だけ古い値として見えないように）。
+     */
+    async installTool(id: AkariToolId): Promise<AkariToolInstallResult> {
+        this.currentInstallProgress = undefined;
+        try {
+            return await installTool(id, {
+                onProgress: progress => { this.currentInstallProgress = progress; }
+            });
+        } finally {
+            this.currentInstallProgress = undefined;
+        }
+    }
+
+    async getToolInstallProgress(): Promise<AkariToolInstallProgress | undefined> {
+        return this.currentInstallProgress;
+    }
+
+    /**
+     * 作業場ステップ v2（裁定 B）。`packages/creator-root` の `defaultRootPath()`
+     * を読み取り専用で呼ぶだけ（作成はしない）。動的 import の流儀は
+     * `loadCreatorRootModule()` と同じ。
+     */
+    async defaultCreatorRootPath(): Promise<string> {
+        const creatorRoot = await this.loadCreatorRootModule();
+        return creatorRoot.defaultRootPath();
     }
 
     /**

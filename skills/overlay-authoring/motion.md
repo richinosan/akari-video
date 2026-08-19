@@ -77,3 +77,39 @@ rAF は、外部タイムラインから既に決めた状態を再描画する�
 - 直し方:
   1. 単発のループ演出（点滅など）は必ず両端を明示する（`0%, 100% { opacity: 1; } 50% { opacity: 0; }`）。片方しか書かない省略はしない
   2. 同一プロパティを複数段でつなぐ場合、後段の `0%` / `from` に**前段の着地値を明示的に複製**する（暗黙合成に任せない）
+
+### 書き出しランタイムは authored の `animation-fill-mode` を尊重する（2026-08-16 実測）
+
+書き出し時、render-cut は CSS animation を paused WAAPI クローンへ変換するが、`fill` は authored の宣言（`none` / `forwards` / `backwards` / `both`）をそのまま引き継ぐ。プレビューと書き出しで fill-mode の意味は一致する。
+
+- 同一要素へ IN と遅延付き OUT を並べる場合は、`animation: intro .3s both, outro .3s 1s forwards` のように OUT へ backward fill を付けない。OUT の `0%` が delay 中の IN を上書きせず、IN → hold → OUT が順に効く
+- 遅延前から `0%` を見せたい演出だけ `backwards` / `both` を宣言する。過渡 FX を発火前に隠す場合は `forwards` / `none` を選ぶか、意図して backward fill を使うなら `0%` 自体を不可視にする
+
+### 入場して留まる要素の base を隠れ状態にすると書き出しで消える（2026-08-14 実測）
+
+WAAPI クローン化の前に、書き出しシートは仮想クロックで free-run するセットアップ期間を持つ。delay 0 の短尺アニメはこの間に完走扱いになり**クローン化を逃す**ことがある。以後その要素は base の CSS に戻るため、base に `opacity: 0` や `transform: scaleX(0)` のような「隠れ状態」を書いていると、**一瞬正しく見えた後（または最初から）完全に消える**。
+
+- 実例1: 見出し（delay 0・0.51s の叩きつけ）の base に `opacity: 0` → t≈0.3s では見えるが t≈0.6s 以降で消滅
+- 実例2: 時間バーの base に `transform: scaleX(0)` → バーが一切伸びない。opacity に限らず transform でも同型
+- 直し方: **base（アニメ無し時のスタイル）は必ずその断片の「最終静止状態」にする**。隠れ状態は `@keyframes` の `0%` / `from` 側だけに書く（delay 中は backwards fill が処理する）。過渡 FX（最終状態も不可視）だけが base opacity: 0 を許される
+
+### `animation` shorthand の暗黙 delay:0 が、ゲート外の `animation-delay` を詳細度で潰す（2026-08-14 実測）
+
+`animation` shorthand は明示しないサブプロパティ（`animation-delay` 含む）を**暗黙に初期値へリセット**する。発火ゲート付きルール `[data-akari-active] .x { animation: ... }`（詳細度 0,2,0）はゲート無しのモディファイア `.x--2 { animation-delay: 2s }`（0,1,0）に**詳細度で勝つ**ため、per-要素の delay が全て捨てられ**全要素が delay 0 で同時発火**する。
+
+- 実例: 3 行見出し（b0/b4/b8 の時間差入場）が書き出しで全行同時に出現。1 文字ずつの落下・回転の時間差も全損。**「速いだけ」に見えるため目視検収をすり抜けやすい**
+- 直し方: `animation-delay` は**必ず shorthand と同じゲート付きルールの中**に書く。per-要素の値は inline `style="--d: 2.043s"` + ゲート内 `animation-delay: var(--d)` が定石。モディファイアクラスで delay を上書きする設計は禁止
+
+### 多段 keyframes はプロパティを全ステップで明示する（密化・2026-08-14 実測）
+
+疎な keyframes（例: `transform` は全 6 ステップにあるが `opacity` は 0%/10%/55% にしか無い）は、**条件次第で WAAPI クローン化が黙って失敗**する（変換部の `catch {}` に握り潰され、元アニメも `animation-name: none` 済みのため**アニメーション丸ごと消滅**）。base が最終状態と一致していると「動かないだけで絵は正しい」ため発見が非常に難しい。
+
+- 実測: base 隠れ状態と組み合わさった断片では完全不可視化（最小再現 6 パターンの A/B で密化により解消）。一方、別の断片では疎のまま正常動作（密化前後でレンダがピクセル同一）— **発火条件は未特定**
+- 直し方: 動作系でも無害なことが実測済みのため、**多段 keyframes では全ステップに全プロパティを明示**する（叩きつけの揺り戻しステップにも `opacity: 1` を毎回書く）。機械監査の考え方: `@keyframes` ごとに「宣言プロパティの和集合」が先頭・最終ステップに揃っているかを走査する
+
+### keyframe の `transform` は base の centering translate を丸ごと上書きする（2026-08-14 実測）
+
+base で `transform: translate(-50%, -50%)` により中央配置した要素に、`scale()` だけの keyframe を当てると、アニメ発火中は **translate が丸ごと消えて要素が飛ぶ**（CSS animation は transform プロパティを合成せず差し替えるため）。
+
+- 実例: 中央チップのポップイン中、接続線との間に隙間が発生（チップだけ右下へずれて拡大）
+- 直し方: keyframe の全ステップに base 分を含める（`translate(-50%,-50%) scale(0.2)` → `translate(-50%,-50%) scale(1)`）。そもそも centering は親ラッパー（grid `place-items: center`）に任せ、アニメ対象要素の base transform を空にしておくのが最安全

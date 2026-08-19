@@ -656,6 +656,13 @@ function validateSfx(value) {
         fail(`${label}.track は 0 以上の整数である必要があります`);
       }
     }
+    for (const field of ["fade_in", "fade_out"]) {
+      if (hasOwn(item, field)) {
+        if (!isFiniteNumber(item[field]) || item[field] < 0) {
+          fail(`${label}.${field} は 0 以上の有限数である必要があります`);
+        }
+      }
+    }
   }
 }
 
@@ -1052,8 +1059,8 @@ function validateTransitionOut(value, label) {
     fail(`${label} は object である必要があります`);
     return;
   }
-  if (!["dissolve", "fade-black", "fade-white"].includes(value.type)) {
-    fail(`${label}.type は dissolve/fade-black/fade-white のいずれかである必要があります`);
+  if (!["dissolve", "fade-black", "fade-white", "reveal-down", "reveal-up"].includes(value.type)) {
+    fail(`${label}.type は dissolve/fade-black/fade-white/reveal-down/reveal-up のいずれかである必要があります`);
   }
   if (!isFiniteNumber(value.duration) || value.duration <= 0) {
     fail(`${label}.duration は 0 より大きい有限数である必要があります`);

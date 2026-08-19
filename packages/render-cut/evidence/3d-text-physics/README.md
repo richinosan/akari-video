@@ -1,8 +1,14 @@
-# 3d-text-physics（task 2026-08-12-3d-text-physics）— `physics` 事前シミュレーション検証ハーネス
+# 3d-text-physics（task 2026-08-12-3d-text-physics、`spawn-*` は task 2026-08-14-3d-physics-spawn 追補、
+`start-hold-*`/`layout-hold-*` は task 2026-08-14-3d-physics-hold 追補）
+— `physics` 事前シミュレーション検証ハーネス
 
 `physics`（matter-js presim → per-char (x, y, angle) Float32Array バッファ → `draw(localSeconds)`
 線形補間 lookup）宣言の決定論・シーク安全・人物シルエット凹み非潰れ・restitution 挙動差・
-ネットワーク到達ゼロ・presim 性能を実測する証跡一式。
+ネットワーク到達ゼロ・presim 性能を実測する証跡一式。`spawn-*.mjs`（2026-08-14 追補）は
+`physics.spawn`（初期配置を狙って宣言する矩形）の後方互換・決定論・狙い精度を実測する。
+`start-hold-*.mjs`/`layout-hold-*.mjs`（2026-08-14 追補）は `physics.start="layout"`
+（texts[] のレイアウトどおりの初期配置）+ `physics.holdSeconds`（presim 開始から指定秒だけ静的に
+保つ）の後方互換・決定論・崩落挙動を実測する。
 
 ## 構成
 
@@ -24,6 +30,27 @@
 - `flat-regression-smoke.mjs`: `texts[]` flat + anim（physics 不使用）の回帰 smoke。既存
   `evidence/3d-text-flat/` ハーネスが実行不能（後述）なため代替として用意した
 - `perf.mjs`: presim 性能実測（契約の指示 6。11 文字 × duration 8s × dt 1/120）
+- `spawn-backward-compat.mjs`（2026-08-14 追補）: `physics.spawn` 未宣言の `basicFallScene` を
+  spawn 対応後の `three-runtime.js` で再実行し、本タスク着手前に記録済みの
+  `determinism-seek-result.json`（`run1Hashes`）と全 24 フレーム SHA-256 が完全一致することを
+  確認する（後方互換）。`determinism-seek-result.json` 自体は上書きしない
+- `spawn-determinism.mjs`（2026-08-14 追補）: `physics.spawn` を宣言したシーン（`spawnAimScene`）
+  を独立に 2 回書き出し、全フレーム SHA-256 が一致することを確認する（spawn 決定論）
+- `spawn-aim-smoke.mjs`（2026-08-14 追補）: 狭い `spawn`（x ±0.5）を細い flat-top platform
+  collider（x∈[-0.7,0.7]）の直上へ宣言し、settle フレームで全文字が collider 上に静止することを
+  実測する（狙い smoke。PNG 証跡付き）
+- `shared/scenes.mjs` の `layoutHoldScene`（task 2026-08-14-3d-physics-hold 追補）: `physics.start:
+  "layout"` + `physics.holdSeconds` を宣言した横並び（わずかに斜め）テロップシーン
+- `start-hold-backward-compat.mjs`（2026-08-14-3d-physics-hold 追補）: `physics.start` /
+  `physics.holdSeconds` 未宣言の `basicFallScene` を layout+hold 対応後の `three-runtime.js` で
+  再実行し、`determinism-seek-result.json`（`run1Hashes`）と全 24 フレーム SHA-256 が完全一致する
+  ことを確認する（後方互換。`spawn-backward-compat.mjs` と同じ様式・同じ記録済み SHA を再利用）
+- `layout-hold-determinism.mjs`（2026-08-14-3d-physics-hold 追補）: `layoutHoldScene` を独立に
+  2 回書き出し、全フレーム SHA-256 が一致することを確認する（layout+hold 決定論）
+- `layout-hold-collapse-smoke.mjs`（2026-08-14-3d-physics-hold 追補）: `layoutHoldScene` で
+  (a) hold 中（t=0.5s）はレイアウトどおりの配置で静止していること（独立計算した期待座標と
+  charStates の突き合わせ）、(b) hold 明け後は落下して settle 時点で床付近に積もっていること
+  を実測する（崩落 smoke。2 時刻ぶんの PNG 証跡付き）
 - `artifacts/`: 各スクリプトが生成した実測結果 JSON と PNG（`-viewable.png` は不透明背景に
   合成した目視用コピー。判定には使っていない）
 
@@ -40,6 +67,12 @@
 | ネットワーク到達ゼロ | polygon collider を含む physics シーンで外部リクエスト 0 件・想定外ページエラー 0 件（観測 16 件はすべて file:/data:） | `artifacts/network-zero-result.json` |
 | flat 回帰 smoke（代替） | texts[] flat + carousel（physics 不使用）が本タスクの three-runtime.js 変更後も 16 フレーム全て 2 回書き出し一致 | `artifacts/flat-regression-smoke-result.json` |
 | presim 性能（契約指示 6: 11 文字 × 8s × dt=1/120） | 5 試行の中央値 13.2ms（範囲 11.1〜20.6ms）。frameCount=961・バッファサイズ 126852 bytes（≈124KiB） | `artifacts/perf-result.json` |
+| spawn 後方互換（2026-08-14 追補） | `physics.spawn` 未宣言の `basicFallScene` を spawn 対応後のコードで再実行 → 24 フレーム全て、本タスク着手前に記録済みの `determinism-seek-result.json` の SHA-256 と完全一致（`allFramesMatch=true`） | `artifacts/spawn-backward-compat-result.json` |
+| spawn 決定論（2026-08-14 追補） | `physics.spawn` 宣言シーン（`spawnAimScene`）を独立 2 回書き出し、30 フレーム全て SHA-256 完全一致 | `artifacts/spawn-determinism-result.json` |
+| spawn 狙い smoke（2026-08-14 追補） | 狭い spawn（x ±0.5）を細い flat-top platform collider（x∈[-0.7,0.7]）の直上へ宣言し、settle フレームで文字 3/3 が collider 上に静止（`onColliderCount=3`・`settledCount=3`）。旧 5 レーン固定グリッドではこの幅の collider に最初から乗せられない | `artifacts/spawn-aim-smoke-result.json` / `artifacts/spawn-aim-smoke-settled-viewable.png` |
+| start/holdSeconds 後方互換（2026-08-14-3d-physics-hold 追補） | `physics.start`/`physics.holdSeconds` 未宣言の `basicFallScene` を layout+hold 対応後のコードで再実行 → 24 フレーム全て、`determinism-seek-result.json` の SHA-256 と完全一致（`allFramesMatch=true`） | `artifacts/start-hold-backward-compat-result.json` |
+| layout+hold 決定論（2026-08-14-3d-physics-hold 追補） | `layoutHoldScene`（`start="layout"`, `holdSeconds=1.0`）を独立 2 回書き出し、25 フレーム全て SHA-256 完全一致 | `artifacts/layout-hold-determinism-result.json` |
+| 崩落 smoke（2026-08-14-3d-physics-hold 追補） | hold 中（t=0.3s/0.5s）は全 6 文字が独立計算した期待座標と一致（位置誤差 <6e-8・角度誤差 <2e-9）かつ変位 0（静止）。hold 明け後（t=2.3s/2.4s）は全 6 文字が床付近（y≈-2.39、floor y=-2.6）に落下・静止（`readablePass=true`・`settledPass=true`） | `artifacts/layout-hold-collapse-smoke-result.json` / `artifacts/layout-hold-collapse-readable-viewable.png` / `artifacts/layout-hold-collapse-settled-viewable.png` |
 
 数値の一次ソースは `artifacts/*.json`。report.md はこれらの実測値を転記したもの。
 
@@ -62,6 +95,34 @@
    call）。physics の `colliders`/`gravity` は「camera/lights と同一の scene 空間」で宣言される
    契約のため、対象文字の group 変換を素通しにして per-char のワールド座標をそのまま
    `node.position`/`node.rotation.z` へ書く方式にした。詳細は report.md §契約逸脱
+5. **`physics.spawn`（2026-08-14 追補）は `physicsInitialState(seed, index, spawn)` に第 3 引数を
+   足すだけ**で実装した。`spawn` が渡らなければ従来の 5 レーングリッド分岐へそのまま入るため、
+   未宣言時の挙動は 1 ビットも変わらない（`spawn-backward-compat-result.json` で実測確認）。
+   spawn 分岐も同じ `seededUnit` を塩（201/202 とは別の 211/212）だけ変えて再利用している —
+   上記 2 の判断をそのまま踏襲した
+6. **`physics.start="layout"`（task 2026-08-14-3d-physics-hold）は char.base（`charBasePosition`
+   がロード時に焼いた per-char のレイアウト内オフセット）+ `entry.layout` を直接使う**新しい
+   `physicsLayoutInitialState()` を追加した（`seededUnit` は使わない — 乱数を使わないのが機能の
+   要件そのもの）。上記 4 の「physics 対象は `layout.position`/`layout.rotation` を無視する」
+   判断はそのまま残し、`start="layout"` のときだけ presim の初期配置計算に限定してこの 2 つを
+   読む例外にした。matter-js は x/y と z 軸回転しか持てないため、`layout.position` の z と
+   `layout.rotation` の x/y、`charBasePosition` が cylinder layout 用に返す z/rotationY は
+   使わない（line layout ならどのみち 0 なので情報は失わない）
+7. **`physics.holdSeconds`（task 2026-08-14-3d-physics-hold）は presim ループの途中で
+   `Body.setStatic(body, false)` を呼んで動的化する方式**にした。**罠**: 生成直後の
+   `Bodies.rectangle(..., { isStatic: true })` のように isStatic を body の生成オプションへ
+   直接渡すと、matter-js の `Body.create()` は先に options を素の `extend()` でマージしてから
+   内部で `Body.set(body, {isStatic: c.isStatic, ...})` を呼ぶため、この時点で
+   `body.isStatic` が既に `true` になっている。`Body.setStatic()` 内の
+   `body.isStatic || (保存)` ガードがこれで素通りし、`restitution`/`friction`/`mass`/`inertia`/
+   `density` の復元用スナップショット（`_original`）が保存されない。結果、後で
+   `Body.setStatic(body, false)` を呼んでも `mass=Infinity`・`inverseMass=0` のまま復元されず、
+   重力が一切効かなくなる（vendor bundle のミニファイ済みソースを直接読解して発見。実行時例外は
+   出ないため気づきにくい）。回避策は、body を**通常どおり動的で生成してから**
+   `Body.setStatic(body, true)` を明示的に呼ぶこと — この時点では `body.isStatic` がまだ
+   `false` なので `_original` が正しく保存され、解放時に元の値へ正常に復元される。
+   `holdSeconds<=0`（既定）のときはこの分岐自体に入らないため、未宣言時の挙動は 1 ビットも
+   変わらない（`start-hold-backward-compat-result.json` で実測確認）
 
 ## 既知の限界
 

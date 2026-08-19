@@ -145,9 +145,11 @@
         "t": { "$ref": "#/$defs/seconds" },
         "in": { "$ref": "#/$defs/seconds" },
         "out": { "$ref": "#/$defs/positiveNumber" },
-        "gain_db": { "type": "number", "minimum": -60, "maximum": 12 }
+        "gain_db": { "type": "number", "minimum": -60, "maximum": 12 },
+        "fade_in": { "$ref": "#/$defs/seconds" },
+        "fade_out": { "$ref": "#/$defs/seconds" }
       },
-      "$comment": "再生区間 = 素材の [in, out)。in は素材秒・省略時 0（素材頭から）。out は素材秒・省略時 素材末尾まで。タイムライン上の開始は従来どおり t（timeline 秒）・表示尺 = out − in。out > in が必須（edit-lint が検証）。実尺越えは消費側（render-cut / preview）が素材末尾へクランプする。"
+      "$comment": "再生区間 = 素材の [in, out)。in は素材秒・省略時 0（素材頭から）。out は素材秒・省略時 素材末尾まで。タイムライン上の開始は従来どおり t（timeline 秒）・表示尺 = out − in。out > in が必須（edit-lint が検証）。実尺越えは消費側（render-cut / preview）が素材末尾へクランプする。fade_in/fade_out は秒・省略時 0（フェードなし。docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 追記、audio-clip-fades task）。フェード対象はこのクリップの実効再生窓 [t, t + 実効尺)（実効尺 = out − in、in/out 省略時は素材尺）。audio.bgm.fadeIn/fadeOutと同じ『実効尺の半分まで』クランプ規則を適用する（render-cut が実装、edit-lint がクランプ発生時に warning を出す）。"
     },
     "audioMaster": {
       "type": "object",
@@ -223,10 +225,10 @@
       "additionalProperties": true,
       "required": ["type", "duration"],
       "properties": {
-        "type": { "enum": ["dissolve", "fade-black", "fade-white"] },
+        "type": { "enum": ["dissolve", "fade-black", "fade-white", "reveal-down", "reveal-up"] },
         "duration": { "$ref": "#/$defs/positiveNumber" }
       },
-      "$comment": "docs/contract-2026-07-22-render-basics.md #3。v0 は指定されたカット境界のみ xfade 経路（残裁定3）。ffmpeg xfade の transition 名へ直接対応: dissolve/fadeblack/fadewhite。"
+      "$comment": "docs/contract-2026-07-22-render-basics.md #3。v0 は指定されたカット境界のみ xfade 経路（残裁定3）。ffmpeg xfade の transition 名へ直接対応: dissolve/fadeblack/fadewhite/revealdown/revealup。reveal-down / reveal-up は前カットが丸ごとその方向へ動いて画面外へ抜け、空いた側から次カットが現れる（2026-08-14 追加）。"
     },
     "cutTransform": {
       "type": "object",

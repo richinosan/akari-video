@@ -82,6 +82,11 @@ function orDash<T>(raw: T | null | undefined, formatFn: (value: T) => string): s
     return raw === null || raw === undefined ? '—' : formatFn(raw);
 }
 
+/** インスペクター「種別」フィールドの表示ラベル（sfx は音声クリップ語彙へ、2026-08-18）。 */
+function formatAudioKindLabel(audioKind: TimelineAudioSelection['audioKind']): string {
+    return audioKind === 'sfx' ? '音声クリップ' : audioKind;
+}
+
 const CAPTION_STYLE_DEFAULTS = {
     color: '#FFFFFF',
     sizePx: 38,
@@ -746,7 +751,7 @@ function AUDIO_TABS(
     requestWrite: (request: InspectorWriteRequest) => Promise<InspectorWriteResult>
 ): InspectorTabDef[] {
     const basicFields: InspectorFieldDef[] = [
-        { label: '種別', getValue: () => snapshot.audioKind },
+        { label: '種別', getValue: () => formatAudioKindLabel(snapshot.audioKind) },
         { label: 'path', getValue: () => snapshot.label },
         { label: 't', getValue: () => formatTimestamp(snapshot.outputStart) },
         {
@@ -816,6 +821,45 @@ function AUDIO_TABS(
                     inputKind: 'boolean-select',
                     write: async (_snapshot, nextValue) =>
                         requestWrite({ kind: 'bgm-ducking', value: nextValue === 'true' })
+                }
+            ]
+        });
+    } else if (snapshot.audioKind === 'sfx') {
+        // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum (audio-clip-fades,
+        // 2026-08-18): same fadeIn/fadeOut knob shape as bgm's above, minus ducking (sfx-only;
+        // ducking is a bgm concept), writing sfx-fade-in/sfx-fade-out scoped to this item's id.
+        tabs.push({
+            label: 'フェード',
+            fields: [
+                {
+                    label: 'fadeIn',
+                    getValue: () => withDefaultNumber(snapshot.fadeIn, 0, formatDurationSeconds),
+                    getEditValue: () => String(snapshot.fadeIn ?? 0),
+                    inputKind: 'scrub-number',
+                    scrubStep: 0.05,
+                    min: 0,
+                    write: async (_snapshot, nextValue) => {
+                        const parsed = Number(nextValue);
+                        if (!Number.isFinite(parsed) || parsed < 0) {
+                            return { ok: false, message: 'fadeIn は 0 以上の数値で入力してください。' };
+                        }
+                        return requestWrite({ kind: 'sfx-fade-in', id: snapshot.id, value: parsed });
+                    }
+                },
+                {
+                    label: 'fadeOut',
+                    getValue: () => withDefaultNumber(snapshot.fadeOut, 0, formatDurationSeconds),
+                    getEditValue: () => String(snapshot.fadeOut ?? 0),
+                    inputKind: 'scrub-number',
+                    scrubStep: 0.05,
+                    min: 0,
+                    write: async (_snapshot, nextValue) => {
+                        const parsed = Number(nextValue);
+                        if (!Number.isFinite(parsed) || parsed < 0) {
+                            return { ok: false, message: 'fadeOut は 0 以上の数値で入力してください。' };
+                        }
+                        return requestWrite({ kind: 'sfx-fade-out', id: snapshot.id, value: parsed });
+                    }
                 }
             ]
         });

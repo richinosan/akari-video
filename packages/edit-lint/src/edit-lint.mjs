@@ -14,6 +14,7 @@ import { createRequire } from "node:module";
 
 import { renderLintReport } from "./report.mjs";
 import { deriveTracks } from "./derive-tracks.mjs";
+import { segmentDuration } from "./cut-timeline.mjs";
 import { musicGrid } from "../../audio-library-setup/shared/beat-grid.mjs";
 import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
 
@@ -222,6 +223,7 @@ export async function lintProject(input, options = {}) {
     edit.version,
     structure.sourceIds,
   );
+  validateFrameGridAlignment(edit.cuts, edit?.output?.fps, findings);
   validateCutTrackFields(edit.cuts, findings);
   validateCutTransformFields(edit.cuts, findings);
   validateStillImageCuts(edit, findings);
@@ -235,7 +237,6 @@ export async function lintProject(input, options = {}) {
       range: { start: segment.start, end: segment.end },
     });
   }
-  validateCutTrackRenderSupport(edit, cutTrackSegments, findings);
   validateDurationMaximum(edit.outputs, timeline, findings, paths);
   validateOutputAxisDurationMax(edit.outputs, cutTrackSegments, findings);
   await validateOverlays(edit.overlays, timeline, findings, paths);
@@ -599,8 +600,8 @@ function validateTransitionOut(value, findings, path) {
     addFinding(findings, { severity: "error", check: "cuts.transition-out.structure", message: "transition_out must be an object", path });
     return;
   }
-  if (!["dissolve", "fade-black", "fade-white"].includes(value.type)) {
-    addFinding(findings, { severity: "error", check: "cuts.transition-out.type", message: "type must be dissolve/fade-black/fade-white", path });
+  if (!["dissolve", "fade-black", "fade-white", "reveal-down", "reveal-up"].includes(value.type)) {
+    addFinding(findings, { severity: "error", check: "cuts.transition-out.type", message: "type must be dissolve/fade-black/fade-white/reveal-down/reveal-up", path });
   }
   if (!isPositiveNumber(value.duration)) {
     addFinding(findings, { severity: "error", check: "cuts.transition-out.duration", message: "duration must be a positive number", path });
@@ -668,46 +669,6 @@ function computeCutTrackSegments(cuts) {
     segments.push({ index, track, start, end });
   }
   return segments;
-}
-
-// edit.json v1（sources[] 形式）の書き出しは buildMultiSourceCutCommand を通り、
-// そこは cuts[] を配列順に連結するだけで track / at を見ない（v0 単一ソース経路にだけ
-// gap-aware / track-aware の合成がある）。宣言だけ通って絵が消えるのが最悪なので、
-// 「lint は通ったのに映像層が丸ごと無い動画が焼ける」前に error で止める。
-// 実測（2026-08-04 PV ドッグフーディング）: track 1 のカットは合成されず出力尺へ連結され、
-// 一度も画面に出ないまま尺だけ伸びた mp4 が PASS で焼き上がった。
-function validateCutTrackRenderSupport(edit, segments, findings) {
-  if (edit?.version !== 1 || !Array.isArray(edit.cuts)) return;
-  const cursorByTrack = new Map();
-  for (const segment of segments) {
-    const cut = edit.cuts[segment.index];
-    if (!isRecord(cut)) continue;
-    const cursor = cursorByTrack.get(segment.track) ?? 0;
-    cursorByTrack.set(segment.track, segment.end);
-    if (segment.track > 0) {
-      addFinding(findings, {
-        severity: "warning",
-        check: "cuts.track-render-unsupported",
-        message:
-          `cuts[].track >= 1 is declared but the v1 (sources[]) render path concatenates cuts instead of compositing them; `
-          + `the clip never appears on screen. Pre-composite the upper track into one source, or move it to overlays[] / layers[].`,
-        path: `edit.json#cuts[${segment.index}]`,
-        range: { start: segment.start, end: segment.end },
-      });
-      continue;
-    }
-    if (Math.abs(segment.start - cursor) > EPSILON) {
-      addFinding(findings, {
-        severity: "warning",
-        check: "cuts.at-render-unsupported",
-        message:
-          `cuts[].at leaves a gap/overlap on track 0, but the v1 (sources[]) render path ignores at and concatenates cuts; `
-          + `the rendered timing will not match this declaration.`,
-        path: `edit.json#cuts[${segment.index}]`,
-        range: { start: segment.start, end: segment.end },
-      });
-    }
-  }
 }
 
 function findTrackOverlaps(segments) {
@@ -1240,7 +1201,7 @@ function validateCuts(cuts, sourceDuration, findings, paths, version, sourceIds)
       });
       valid = false;
     } else {
-      timeline += cut.out - cut.in;
+      timeline += segmentDuration(cut);
     }
     if (version === 1) {
       if (!isNonEmptyString(cut.src)) {
@@ -1315,6 +1276,37 @@ function validateCuts(cuts, sourceDuration, findings, paths, version, sourceIds)
 
   if (cuts.length === 0) return version === 1 ? 0 : sourceDuration;
   return valid ? timeline : null;
+}
+
+function validateFrameGridAlignment(cuts, fps, findings) {
+  if (!Array.isArray(cuts) || !isPositiveNumber(fps)) return;
+  const frameDuration = 1 / fps;
+  let position = 0;
+
+  for (const [index, cut] of cuts.entries()) {
+    if (
+      !isRecord(cut) ||
+      !isFiniteNumber(cut.in) ||
+      !isFiniteNumber(cut.out) ||
+      cut.out <= cut.in
+    ) {
+      continue;
+    }
+    const duration = segmentDuration(cut);
+    position += duration;
+    const frames = position / frameDuration;
+    const nearest = Math.round(frames);
+    const errorFrames = Math.abs(frames - nearest);
+    if (errorFrames <= 0.05) continue;
+
+    const cutFrames = duration / frameDuration;
+    addFinding(findings, {
+      severity: "warning",
+      check: "cuts.frame-grid",
+      message: `cut ${index} duration ${duration.toFixed(4)}s is not frame-aligned at ${fps}fps (${cutFrames.toFixed(1)} frames) -- boundary-synced overlays/transitions may shift by one frame`,
+      path: `edit.json#cuts[${index}]`,
+    });
+  }
 }
 
 function validateDurationMaximum(outputs, timeline, findings) {
@@ -1426,9 +1418,18 @@ async function validateOverlays(overlays, timeline, findings, paths) {
     }
     if (!isNonEmptyString(overlay.html)) continue;
     const htmlPath = resolveReference(paths.editPath, overlay.html);
-    if (!(await isRegularFile(htmlPath))) continue;
+    const isHtmlFile = await isRegularFile(htmlPath);
+    // overlay.html は file 参照（相対パス）とインライン HTML の両方をとりうる。参照でなければ
+    // フィールドの値そのものを断片本文として扱う（inspectHtmlFragment 以降のルート要素検証は
+    // 既存どおり file 参照限定のまま — 挙動変更を避ける）。
+    const html = isHtmlFile ? await readRequiredText(htmlPath, overlay.html) : overlay.html;
+    validateOverlayReservedCssVarReferences(
+      html,
+      isHtmlFile ? relativePath(paths.projectRoot, htmlPath) : `${itemPath}.html`,
+      findings,
+    );
+    if (!isHtmlFile) continue;
 
-    const html = await readRequiredText(htmlPath, overlay.html);
     const fragment = inspectHtmlFragment(html);
     if (fragment.rootCount !== 1 || fragment.hasTopLevelText || fragment.unbalanced) {
       addFinding(findings, {
@@ -1455,6 +1456,41 @@ async function validateOverlays(overlays, timeline, findings, paths) {
         });
       }
     }
+  }
+}
+
+// --x/--y/--scale/--rotate はランタイム予約変数（renderOverlayNode が
+// .akari-overlay-container へ必ずインライン設定する。packages/render-cut/src/rasterize.mjs）。
+// 断片が var(--x, 80px) のように参照すると、フォールバックではなくランタイムが設定した
+// 継承値へ解決される（実機バグ報告 overlay-css-var-collision、2026-08-17）。エラーにはしない —
+// ランタイムが設定した値を意図的に読む正当用途があり得るため警告に留める。
+const RESERVED_OVERLAY_VARS = ["--x", "--y", "--scale", "--rotate"];
+
+// 前方一致誤検知（--xanadu 等）を避けるため、予約名の直後が CSS カスタムプロパティ名の
+// 継続文字（英数字・アンダースコア・ハイフン）でないことを確認する。
+function findReservedOverlayVarReferences(html) {
+  const found = [];
+  for (const name of RESERVED_OVERLAY_VARS) {
+    const pattern = new RegExp(`var\\(\\s*${name}(?![A-Za-z0-9_-])`);
+    if (pattern.test(html)) found.push(name);
+  }
+  return found;
+}
+
+function validateOverlayReservedCssVarReferences(html, path, findings) {
+  if (!isNonEmptyString(html)) return;
+  for (const name of findReservedOverlayVarReferences(html)) {
+    addFinding(findings, {
+      severity: "warning",
+      check: "overlays.reserved-css-var-reference",
+      message:
+        `overlay fragment references var(${name}, ...) -- ${name} is a runtime-reserved variable that `
+          + "renderOverlayNode always sets inline on the container (packages/render-cut/src/rasterize.mjs), "
+          + "so the fallback never applies and it resolves to the runtime's inherited value instead "
+          + `(bug report: overlay-css-var-collision, 2026-08-17). Use a non-reserved name for custom knobs `
+          + "(e.g. --block-left).",
+      path,
+    });
   }
 }
 
@@ -2121,6 +2157,51 @@ async function validateBgmSfx(bgm, sfx, timeline, findings, paths) {
         path: itemPath,
         range: { start: item.in, end: item.out },
       });
+    }
+    // audio.sfx[].fade_in/fade_out (docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2
+    // addendum, audio-clip-fades task): type/sign validation always runs; the "fade total exceeds
+    // the clip's effective duration" warning only fires when both in and out are present, because
+    // that is the only case edit-lint can compute the effective duration (out - in) from sibling
+    // values alone -- it has no ffprobe (contract's own "lint は ffprobe を持たない" rule, already
+    // applied to sfx.out real-duration overrun above). When in/out are absent, render-cut/preview
+    // still clamp fade_in/fade_out against the material's real duration at their own layer; this
+    // just can't be linted ahead of time without probing the file.
+    let fadeInValue;
+    let fadeOutValue;
+    for (const field of ["fade_in", "fade_out"]) {
+      if (!Object.hasOwn(item, field)) continue;
+      if (!isFiniteNumber(item[field]) || item[field] < 0) {
+        addFinding(findings, {
+          severity: "error",
+          check: `audio.sfx.${field}`,
+          message: `${field} must be a non-negative finite number`,
+          path: itemPath,
+        });
+      } else if (field === "fade_in") {
+        fadeInValue = item[field];
+      } else {
+        fadeOutValue = item[field];
+      }
+    }
+    if (
+      (fadeInValue !== undefined || fadeOutValue !== undefined) &&
+      Object.hasOwn(item, "in") &&
+      Object.hasOwn(item, "out") &&
+      isFiniteNumber(item.in) &&
+      isFiniteNumber(item.out) &&
+      item.out > item.in
+    ) {
+      const effectiveDuration = item.out - item.in;
+      const fadeTotal = (fadeInValue ?? 0) + (fadeOutValue ?? 0);
+      if (fadeTotal > effectiveDuration + EPSILON) {
+        addFinding(findings, {
+          severity: "warning",
+          check: "audio.sfx.fade-total",
+          message: `fade_in + fade_out ${formatNumber(fadeTotal)}s exceeds the clip's effective duration ${formatNumber(effectiveDuration)}s (in=${formatNumber(item.in)}s, out=${formatNumber(item.out)}s); each will be clamped to half the effective duration at render time`,
+          path: itemPath,
+          range: { start: item.in, end: item.out },
+        });
+      }
     }
   }
 }

@@ -26,6 +26,8 @@ import {
 } from "./track-compose.mjs";
 import { resolveTrackOrder, usesDefaultTrackOrder } from "./track-order.mjs";
 import { resolveFfmpeg, resolveFfprobe } from "../../media-bin/src/index.mjs";
+import { enableWindowExpr } from "./enable-window.mjs";
+import { appliedTruePeakDbtp, hasExplicitTruePeakDbtp } from "./audio-qc.mjs";
 
 // docs/contract-2026-07-14-edit-json-v1-audio.md §4: sidechaincompress threshold ~-24dB (linear 0.063), ratio 8, attack 5ms, release 300ms.
 const DUCKING_SIDECHAIN_ARGS = "threshold=0.063:ratio=8:attack=5:release=300";
@@ -114,18 +116,38 @@ export function buildPlan({
   const rasterizer = selectRasterizer(capabilities, hasThreeDimensionalOverlay);
   let cut;
   if (edit.version === 1) {
-    cut = buildMultiSourceCutCommand({
-      sourceInputs: capabilities.sourceInputs,
-      cutPath,
-      cuts: edit.cuts,
-      width,
-      height,
-      fps,
-      ffmpegCommand: capabilities.ffmpegCommand,
-      projectRoot,
-      look: edit.output.look,
-      videoEncodeArgs: cutVideoEncodeArgs,
-    });
+    // docs/contract-2026-08-18-v1-render-parity.md §2: cuts[].at / cuts[].track only get a
+    // compositing effect when usesDefaultTrackOrder is false (a custom timeline.tracks declaration
+    // routes through buildTrackStackPlan below). Under the default order -- which is what a plain
+    // UI drag onto an explicit position or a PiP track actually writes -- this is the only dispatch
+    // that ever sees the declaration, so it must itself be gap-aware or the declaration silently
+    // renders as a same-length concat instead (the exact bug this contract fixes).
+    cut = needsGapAwareCutTimeline(edit.cuts)
+      ? buildGapAwareMultiSourceCutCommand({
+          sourceInputs: capabilities.sourceInputs,
+          cutPath,
+          cuts: edit.cuts,
+          width,
+          height,
+          fps,
+          duration: cutsEndSeconds,
+          ffmpegCommand: capabilities.ffmpegCommand,
+          projectRoot,
+          look: edit.output.look,
+          videoEncodeArgs: cutVideoEncodeArgs,
+        })
+      : buildMultiSourceCutCommand({
+          sourceInputs: capabilities.sourceInputs,
+          cutPath,
+          cuts: edit.cuts,
+          width,
+          height,
+          fps,
+          ffmpegCommand: capabilities.ffmpegCommand,
+          projectRoot,
+          look: edit.output.look,
+          videoEncodeArgs: cutVideoEncodeArgs,
+        });
   } else {
     const sourcePath = resolve(projectRoot, edit.source.path);
     cut = buildCutCommand({
@@ -192,14 +214,7 @@ export function buildPlan({
       });
   const baseVideoPath = trackStack ? trackStack.outputPath : (layers ? layeredPath : cutOutputPath);
 
-  // v1（sources[]）の書き出しは cuts[] を連結するだけで track / at を合成しない。
-  // 宣言だけ通って絵が消える事故を検証メッセージで名指しするための旗（verifyArtifact が読む）。
-  const cutTrackDeclarationUnrendered = edit.version === 1
-    && Array.isArray(edit.cuts)
-    && needsGapAwareCutTimeline(edit.cuts);
-
   return {
-    cut_track_declaration_unrendered: cutTrackDeclarationUnrendered,
     predicted_duration_seconds: finalDurationSeconds,
     duration_tolerance_seconds: Math.max(0.1, 2 / fps),
     output: relativeOrAbsolute(projectRoot, outputPath),
@@ -586,8 +601,19 @@ export function buildAudioMixCommand({
     if (trim.skip) continue;
     args.push("-i", sfxSourcePath);
     const delay = Math.max(0, Math.round((sfx.t ?? 0) * 1000));
+    let fadeSuffix = "";
+    if (trim.effectiveDuration !== null) {
+      const fade = resolveSfxFadeSeconds(sfx, trim.effectiveDuration, `audio.sfx[${index}]`);
+      warnings.push(...fade.warnings);
+      fadeSuffix = buildSfxFadeSuffix(fade, trim.effectiveDuration);
+    }
+    // fade is chained directly onto volume -- i.e. before adelay -- for the same reason as
+    // trim's atrim/asetpts: afade's st=0 must land on the clip's own content start, not on
+    // adelay's leading silence padding. Appending it after adelay would fade the silence, not
+    // the sound (mirrors buildBgmFadeSuffix's placement rationale, just one filter stage earlier
+    // in this chain since sfx additionally has adelay).
     filters.push(
-      `[${inputIndex}:a]${trim.trimFilter}volume=${formatNumber(sfx.gain_db ?? 0)}dB,adelay=${delay}:all=1[sfx${index}]`,
+      `[${inputIndex}:a]${trim.trimFilter}volume=${formatNumber(sfx.gain_db ?? 0)}dB${fadeSuffix},adelay=${delay}:all=1[sfx${index}]`,
     );
     labels.push(`[sfx${index}]`);
     inputIndex += 1;
@@ -644,8 +670,14 @@ function normalizeMasterPlan(master) {
   const denoise = ["off", "std", "strong"].includes(master.denoise) ? master.denoise : "off";
   const rawTarget = master.loudnorm;
   const loudnormTarget = typeof rawTarget === "number" && Number.isFinite(rawTarget) ? rawTarget : -14;
-  const rawTruePeak = master.true_peak_dbtp;
-  const truePeakTarget = typeof rawTruePeak === "number" && Number.isFinite(rawTruePeak) ? rawTruePeak : -1.5;
+  const truePeakExplicit = hasExplicitTruePeakDbtp(master);
+  const configuredTruePeak = truePeakExplicit ? master.true_peak_dbtp : -1.5;
+  // Real AAC re-encode overshoots loudnorm's PCM-stage true peak target (audio-qc.mjs's
+  // AAC_TRUE_PEAK_OVERSHOOT_MARGIN_DBTP; measured +1.2 dB on real material — planning/
+  // notes-2026-08-17-mac-fresh-install-bug-reports.md #05). Bake the margin into what loudnorm is
+  // told to target only when true_peak_dbtp is explicit — the -1.5 dBTP default already carries
+  // its own headroom and must not double up (task 2026-08-17-render-cut-true-peak-guard 裁定 B).
+  const truePeakTarget = truePeakExplicit ? appliedTruePeakDbtp(configuredTruePeak) : configuredTruePeak;
   return { denoise, loudnormTarget, truePeakTarget };
 }
 
@@ -768,7 +800,7 @@ function buildStaticCompositeCommand(command, cutPath, outputPath, temporary, ov
     args.push("-loop", "1", "-i", png);
     const next = `[overlay${index}]`;
     filters.push(
-      `${previous}[${index + 1}:v]overlay=0:0:format=auto:enable='between(t,${formatNumber(overlay.start)},${formatNumber(overlay.start + overlay.duration)})'${next}`,
+      `${previous}[${index + 1}:v]overlay=0:0:format=auto:enable='${enableWindowExpr(overlay.start, overlay.start + overlay.duration)}'${next}`,
     );
     previous = next;
   }
@@ -863,13 +895,19 @@ function resolveBgmInSeconds(bgm, ffprobeCommand, resolvedPath) {
 
 // docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 (sfx): playback window = material's
 // [in, out). in defaults to 0, out defaults to the material's own end. Only probes the material's
-// real duration (an extra ffprobe call) when in/out is actually present on this item -- the
-// in/out-free path (the vast majority of existing sfx) returns immediately with no trim filter,
-// keeping its output byte-identical to pre-R6b.
+// real duration (an extra ffprobe call) when in/out or fade_in/fade_out is actually present on
+// this item -- the fully-bare path (the vast majority of existing sfx) returns immediately with
+// no trim filter and no known effectiveDuration, keeping its output byte-identical to pre-R6b.
+// effectiveDuration (the [in,out) window's own length, once knowable) is what audio-clip-fades'
+// resolveSfxFadeSeconds clamps fade_in/fade_out against -- null means "not knowable without a
+// probe that didn't happen" and the caller skips fade application rather than guessing.
 function resolveSfxTrim(sfx, ffprobeCommand, resolvedPath, index) {
   const hasIn = sfx.in !== undefined;
   const hasOut = sfx.out !== undefined;
-  if (!hasIn && !hasOut) return { skip: false, trimFilter: "", warnings: [] };
+  const hasFade = sfx.fade_in !== undefined || sfx.fade_out !== undefined;
+  if (!hasIn && !hasOut && !hasFade) {
+    return { skip: false, trimFilter: "", effectiveDuration: null, warnings: [] };
+  }
 
   const label = `audio.sfx[${index}]`;
   const warnings = [];
@@ -882,7 +920,7 @@ function resolveSfxTrim(sfx, ffprobeCommand, resolvedPath, index) {
       warnings.push(
         `${label}: in ${formatNumber(inSeconds)}s is at or beyond the material duration (${formatNumber(actualDuration)}s); skipped (silent)`,
       );
-      return { skip: true, warnings };
+      return { skip: true, trimFilter: "", effectiveDuration: null, warnings };
     }
     if (outSeconds === null || outSeconds > actualDuration) {
       if (outSeconds !== null) {
@@ -901,13 +939,14 @@ function resolveSfxTrim(sfx, ffprobeCommand, resolvedPath, index) {
     warnings.push(
       `${label}: out <= in after clamping (in=${formatNumber(inSeconds)}s, out=${formatNumber(outSeconds)}s); skipped (silent)`,
     );
-    return { skip: true, warnings };
+    return { skip: true, trimFilter: "", effectiveDuration: null, warnings };
   }
 
   const end = outSeconds === null ? "" : `:end=${formatNumber(outSeconds)}`;
   const trimFilter =
     inSeconds > 0 || end !== "" ? `atrim=start=${formatNumber(inSeconds)}${end},asetpts=PTS-STARTPTS,` : "";
-  return { skip: false, trimFilter, warnings };
+  const effectiveDuration = outSeconds === null ? null : outSeconds - inSeconds;
+  return { skip: false, trimFilter, effectiveDuration, warnings };
 }
 
 // audio.bgm.fadeIn/fadeOut clamp rule: the "clip" bgm occupies is the full timeline (it is
@@ -937,6 +976,41 @@ function buildBgmFadeSuffix({ fadeIn, fadeOut }, duration) {
   if (fadeIn > 0) parts.push(`afade=t=in:st=0:d=${formatNumber(fadeIn)}`);
   if (fadeOut > 0) {
     const start = Math.max(0, duration - fadeOut);
+    parts.push(`afade=t=out:st=${formatNumber(start)}:d=${formatNumber(fadeOut)}`);
+  }
+  return parts.length > 0 ? `,${parts.join(",")}` : "";
+}
+
+// docs/contract-2026-07-25-r6-audio-tracks-and-trim.md §2 addendum (audio-clip-fades,
+// 2026-08-18 — owner ruling "クリップ主義" T2): audio.sfx[].fade_in/fade_out clamp rule mirrors
+// bgm's fadeIn/fadeOut (resolveBgmFadeSeconds above) but against the sfx clip's own effective
+// playback window [t, t + effectiveDuration) instead of the full timeline -- effectiveDuration is
+// resolveSfxTrim's [in,out) window length (or the full material duration when in/out are
+// omitted), so each of fade_in/fade_out is independently capped at effectiveDuration/2. Only
+// called once effectiveDuration is known (non-null); the caller skips fade entirely otherwise.
+function resolveSfxFadeSeconds(sfx, effectiveDuration, label) {
+  const warnings = [];
+  const ceiling = isFiniteNumber(effectiveDuration) && effectiveDuration > 0 ? effectiveDuration / 2 : 0;
+  const resolveField = (field) => {
+    const raw = sfx[field];
+    if (raw === undefined) return 0;
+    if (!isFiniteNumber(raw) || raw < 0) return 0; // schema/edit-lint reject this; render tolerates it as "no fade".
+    if (ceiling > 0 && raw > ceiling) {
+      warnings.push(
+        `${label}.${field} ${formatNumber(raw)}s exceeds half the clip's effective duration (${formatNumber(effectiveDuration)}s); clamped to ${formatNumber(ceiling)}s`,
+      );
+      return ceiling;
+    }
+    return raw;
+  };
+  return { fadeIn: resolveField("fade_in"), fadeOut: resolveField("fade_out"), warnings };
+}
+
+function buildSfxFadeSuffix({ fadeIn, fadeOut }, effectiveDuration) {
+  const parts = [];
+  if (fadeIn > 0) parts.push(`afade=t=in:st=0:d=${formatNumber(fadeIn)}`);
+  if (fadeOut > 0) {
+    const start = Math.max(0, effectiveDuration - fadeOut);
     parts.push(`afade=t=out:st=${formatNumber(start)}:d=${formatNumber(fadeOut)}`);
   }
   return parts.length > 0 ? `,${parts.join(",")}` : "";
@@ -1384,7 +1458,15 @@ export function buildMultiSourceCutCommand({
     }
   }
 
-  let videoLabel = "[joinedv]";
+  appendMultiSourceLookFilters(filters, "[joinedv]", { look, projectRoot });
+
+  return buildMultiSourceCommandResult({ ffmpegCommand, sourceInputs, filters, videoEncodeArgs, cutPath });
+}
+
+// docs/contract-2026-08-18-v1-render-parity.md §2: shared tail for both v1 cut-command builders
+// (the plain concat path above and buildGapAwareMultiSourceCutCommand below) -- identical LUT/look
+// blend + tv-range clamp logic, factored out once instead of duplicated a second time.
+function appendMultiSourceLookFilters(filters, videoLabel, { look, projectRoot }) {
   if (look) {
     const lutPath = resolveLutPath(projectRoot, look.lut);
     const intensity = isFiniteNumber(look.intensity) ? Math.max(0, Math.min(1, look.intensity)) : 1;
@@ -1401,7 +1483,9 @@ export function buildMultiSourceCutCommand({
     filters.push(`${videoLabel}null[outv]`);
   }
   filters.push("[outv]scale=out_range=tv[outv_tv]");
+}
 
+function buildMultiSourceCommandResult({ ffmpegCommand, sourceInputs, filters, videoEncodeArgs, cutPath }) {
   return {
     command: ffmpegCommand,
     args: [
@@ -1432,6 +1516,147 @@ export function buildMultiSourceCutCommand({
       cutPath,
     ],
   };
+}
+
+// docs/contract-2026-08-18-v1-render-parity.md §2: v1's counterpart to buildGapAwareCutCommand
+// below -- dispatched only from buildPlan's top-level v1 branch (NOT from buildTrackStackPlan's
+// per-track v1 call in this file, which deliberately keeps calling the plain buildMultiSourceCutCommand
+// above unchanged; see the contract for why: resolveCutTrackRanges's v1 branch already gets correct
+// at/track placement out of a plain sequential per-track clip via its own offset math, verified by a
+// real render in track-compose.test.mjs, and switching that clip to this gap-aware/output-aligned
+// shape would silently break that existing, working math). This function instead fixes the actually
+// broken path: a v1 project with cuts[].at / cuts[].track and NO custom timeline.tracks declaration
+// (the common case -- this is what the UI writes when a user drags a clip to an explicit position or
+// a PiP track), which today skips buildTrackStackPlan entirely (usesDefaultTrackOrder) and falls
+// straight into the plain concat above, silently ignoring at/track.
+//
+// Multi-track "compositing" here is v0's own winner-take-all switch (computeVideoRuns picks the
+// highest-track cut active at each instant), not a simultaneous alpha overlay -- same semantics v0
+// itself uses by default, so this is v0 parity, not a new richer model. Video runs with no active cut
+// render as plain black (matches buildGapAwareCutCommand's gap filler). Audio is NOT winner-take-all:
+// every cut's own [in,out) audio plays at its own `at` position and mixes together (amix), so a PiP
+// cut's audio and the base track's audio both stay audible through the overlap even though only one
+// track's picture shows at a time -- again mirroring buildGapAwareCutCommand exactly, just resolving
+// each segment's source via cut.src instead of a single implicit v0 source.
+export function buildGapAwareMultiSourceCutCommand({
+  sourceInputs,
+  cutPath,
+  cuts,
+  width,
+  height,
+  fps,
+  duration,
+  ffmpegCommand = resolveFfmpeg(),
+  projectRoot,
+  look,
+  videoEncodeArgs = null,
+}) {
+  // Same restriction as v0's buildCutCommand dispatch (see its own comment): computeVideoRuns maps
+  // output time back to source time with a single linear speed factor per run, which cannot represent
+  // a freeze hold's non-linear pause. Reject loudly rather than silently render the wrong frames.
+  if (hasCutFreeze(cuts)) {
+    throw new Error(
+      "cuts[].freeze is not supported together with a gap-aware cut timeline (explicit at/track placement) in "
+        + "v1 (sources[]) either -- same restriction as v0 (docs/contract-2026-07-22-render-basics.md #7). Remove "
+        + "freeze from this cut, or drop its at/track placement so the whole cuts[] array renders through the "
+        + "default sequential path instead.",
+    );
+  }
+
+  const inputsById = new Map(sourceInputs.map((source, index) => [source.id, { ...source, inputIndex: index }]));
+  const segments = resolveCutSegments(cuts);
+  const runs = computeVideoRuns(segments, duration);
+  const filters = [];
+  const videoLabels = [];
+  const transformCuts = hasCutVisualTransform(cuts) || hasCutFraming(cuts);
+  const fxCuts = hasCutFx(cuts);
+
+  for (const [index, run] of runs.entries()) {
+    const label = `[gv1_${index}]`;
+    if (run.kind === "gap") {
+      filters.push(
+        `color=c=black:s=${width}x${height}:r=${formatNumber(fps)}:d=${formatNumber(run.outEnd - run.outStart)}${label}`,
+      );
+    } else {
+      const cut = run.cut;
+      const source = inputsById.get(cut.src);
+      const speed = cutSpeed(cut);
+      const ptsExpr = speed === 1 ? "PTS-STARTPTS" : `(PTS-STARTPTS)/${formatNumber(speed)}`;
+      const rawLabel = `[gv1raw${index}]`;
+      const shapedLabel = fxCuts ? `[gv1shaped${index}]` : label;
+      filters.push(
+        `[${source.inputIndex}:v]trim=start=${formatNumber(run.srcIn)}:end=${formatNumber(run.srcOut)},setpts=${ptsExpr}${rawLabel}`,
+      );
+      if (transformCuts) {
+        appendCutVisualTransform({
+          filters,
+          inputLabel: rawLabel,
+          outputLabel: shapedLabel,
+          cut,
+          id: `gap1_${index}`,
+          width,
+          height,
+          fps,
+          duration: run.outEnd - run.outStart,
+        });
+      } else {
+        filters.push(
+          `${rawLabel}scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${formatNumber(fps)},setsar=1${shapedLabel}`,
+        );
+      }
+      if (fxCuts) {
+        appendCutFxChain({
+          filters,
+          inputLabel: shapedLabel,
+          outputLabel: label,
+          fx: cut.fx,
+          id: `gap1_${index}`,
+          width,
+          height,
+          fps,
+          duration: run.outEnd - run.outStart,
+        });
+      }
+    }
+    videoLabels.push(label);
+  }
+  filters.push(`${videoLabels.join("")}concat=n=${runs.length}:v=1:a=0[joinedv]`);
+
+  // Audio is per-cut (not per-run): every cut's own [in,out) plays at its own `at` position and
+  // mixes with every other cut's audio, regardless of which track wins the picture at that moment.
+  // Mirrors buildGapAwareCutCommand's own audio loop exactly (iterates segments, not runs).
+  const audioLabels = [];
+  for (const segment of segments) {
+    const { index, cut } = segment;
+    const source = inputsById.get(cut.src);
+    const speed = cutSpeed(cut);
+    if (source.hasAudio) {
+      const atempoSuffix = buildAtempoChain(speed)
+        .map((factor) => `,atempo=${formatNumber(factor)}`)
+        .join("");
+      filters.push(
+        `[${source.inputIndex}:a]atrim=start=${formatNumber(cut.in)}:end=${formatNumber(cut.out)},asetpts=PTS-STARTPTS${atempoSuffix}[araw1_${index}]`,
+      );
+    } else {
+      filters.push(
+        `anullsrc=r=48000:cl=stereo,atrim=duration=${formatNumber(segmentDuration(cut))},asetpts=PTS-STARTPTS[araw1_${index}]`,
+      );
+    }
+    const delayMs = Math.max(0, Math.round(segment.start * 1000));
+    filters.push(`[araw1_${index}]adelay=${delayMs}:all=1[adelay1_${index}]`);
+    audioLabels.push(`[adelay1_${index}]`);
+  }
+  if (audioLabels.length === 1) {
+    filters.push(`${audioLabels[0]}apad=whole_dur=${formatNumber(duration)}[joineda]`);
+  } else {
+    filters.push(
+      `${audioLabels.join("")}amix=inputs=${audioLabels.length}:duration=longest:normalize=0,apad=whole_dur=${formatNumber(duration)}[joineda]`,
+    );
+  }
+
+  appendMultiSourceLookFilters(filters, "[joinedv]", { look, projectRoot });
+
+  return buildMultiSourceCommandResult({ ffmpegCommand, sourceInputs, filters, videoEncodeArgs, cutPath });
 }
 
 function buildGapAwareCutCommand({
@@ -1647,19 +1872,26 @@ function buildGapAwareCutCommand({
 }
 
 export function predictedDuration(cuts, sourceDuration, version = 0) {
-  if (version === 1) {
-    // task 2026-08-07-v1-transition-out: v1 never takes the gap-aware path (the version check
-    // above runs before needsGapAwareCutTimeline is ever consulted), so it always uses this same
-    // sequential-with-overlap math as v0's own non-gap-aware branch below -- now that
-    // buildMultiSourceCutCommand actually renders the xfade overlap instead of silently ignoring
-    // transition_out, predicted_duration_seconds must account for it too or verify.duration /
-    // verify.frame-count / verify.fps would all expect a timeline 1x transition_out.duration too
-    // long for the real (now correctly shortened) output.
-    return sequentialDurationWithTransitionOverlap(cuts);
-  }
+  // docs/contract-2026-08-18-v1-render-parity.md §2: gap-awareness (explicit at/track) is checked
+  // before the version branch now, for both v0 and v1 -- an at-gap or a track>=1 cut shifts the
+  // real end of the timeline (buildGapAwareCutCommand / buildGapAwareMultiSourceCutCommand both
+  // pad/position to this same segment-end-max), so a plain sum-of-segments duration undercounts
+  // trailing gaps and overcounts a PiP cut nested entirely inside its base track's span. v1 used to
+  // short-circuit to sequentialDurationWithTransitionOverlap before this check ever ran, so an at/
+  // track v1 project got the wrong predicted_duration_seconds even after the render itself became
+  // gap-aware -- verify.duration would then reject a now-correctly-rendered file.
   if (Array.isArray(cuts) && cuts.length > 0 && needsGapAwareCutTimeline(cuts)) {
     const segments = resolveCutSegments(cuts);
     return Math.max(0, ...segments.map((segment) => segment.end));
+  }
+  if (version === 1) {
+    // task 2026-08-07-v1-transition-out: non-gap-aware v1 always uses this same
+    // sequential-with-overlap math as v0's own non-gap-aware branch below -- buildMultiSourceCutCommand
+    // actually renders the xfade overlap instead of silently ignoring transition_out, so
+    // predicted_duration_seconds must account for it too or verify.duration / verify.frame-count /
+    // verify.fps would all expect a timeline 1x transition_out.duration too long for the real
+    // (correctly shortened) output.
+    return sequentialDurationWithTransitionOverlap(cuts);
   }
   if (Array.isArray(cuts) && cuts.length > 0) {
     return sequentialDurationWithTransitionOverlap(cuts);
@@ -1689,6 +1921,12 @@ const XFADE_TRANSITION_NAMES = {
   dissolve: "dissolve",
   "fade-black": "fadeblack",
   "fade-white": "fadewhite",
+  // reveal-down / reveal-up: 前カットが丸ごとその方向へ動いて画面外へ抜け、空いた側から
+  // 次カットが現れる（前カットは動きながら画面端でクロップされる）。ディゾルブのように
+  // 混ざらないので、同じ構図が続くトークシーンでも「場面が入れ替わった」ことが読める。
+  // 2026-08-14 追加（テンプレの基本トランジションとしてオーナー指定）。
+  "reveal-down": "revealdown",
+  "reveal-up": "revealup",
 };
 
 // atempo only accepts factors in [0.5, 2.0]; speeds outside that range are decomposed into a

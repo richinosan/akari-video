@@ -10,6 +10,7 @@ import {
     AkariProjectService,
     AssetCatalogView,
     AssetCatalogViewItem,
+    AssetEntitlementsStatus,
     AssetResolveOutcome,
     DiffPreparationResult,
     DiffResourcePair,
@@ -20,6 +21,7 @@ import {
     DroppedVideoImportResult,
     EditLintOutcome,
     MaterialThumbnailOutcome,
+    PresetShowcase,
     ProjectGitEligibility,
     StoreConnectionStatus,
     StoreDevicePollOutcome,
@@ -28,11 +30,12 @@ import {
 } from '../common/akari-project-protocol';
 import { deriveThumbnailCacheKey, thumbnailCacheFileName } from './thumbnail-cache';
 import { CATALOG_ROOT_UPWARD_MAX_DEPTH, resolveUpwardCatalogRoot } from './catalog-root-search';
-import { assetResolverSrcCandidates, editLintCliCandidates } from './packaged-tool-candidates';
+import { assetResolverSrcCandidates, editLintCliCandidates, presetShowcaseIndexCandidates } from './packaged-tool-candidates';
 import { CATALOG_CATEGORIES, parseCatalogItemMeta } from '../common/catalog-reader';
 import { deriveAssetDistribution, mergeAssetCatalogViews, ResolverRawCatalogItem, selectResolverAudioFileRef, toResolverAssetCatalogViewItem } from '../common/asset-catalog-view';
 import { CatalogPack, parseCatalogPacksFile } from '../common/catalog-packs';
 import { resolveResolverPreviewUrl } from './resolver-preview-url';
+import { parsePresetShowcaseJsonl } from '../common/preset-showcase';
 import {
     pollDeviceConnection,
     readCredentials,
@@ -270,8 +273,31 @@ export class AkariProjectServiceImpl implements AkariProjectService {
                 status: resolverResult.status,
                 itemCount: resolverResult.items.length,
                 error: resolverResult.error
-            }
+            },
+            entitlementsStatus: resolverResult.entitlementsStatus
         };
+    }
+
+    async getPresetShowcase(): Promise<PresetShowcase> {
+        const [telop, lut] = await Promise.all([
+            this.loadPresetShowcaseIndex('telop'),
+            this.loadPresetShowcaseIndex('lut')
+        ]);
+        return { telop, lut };
+    }
+
+    protected async loadPresetShowcaseIndex(kind: 'telop' | 'lut'): Promise<PresetShowcase['telop']> {
+        const directory = kind === 'telop' ? 'telop' : 'luts';
+        const candidates = presetShowcaseIndexCandidates(__dirname, process.cwd(), directory, this.resourcesPath());
+        for (const candidate of candidates) {
+            try {
+                const raw = await fs.readFile(candidate, 'utf8');
+                return parsePresetShowcaseJsonl(raw, kind);
+            } catch {
+                // 読めない候補は次の開発配置 / パッケージ配置へ進む。
+            }
+        }
+        return [];
     }
 
     /**
@@ -413,30 +439,44 @@ export class AkariProjectServiceImpl implements AkariProjectService {
      * いずれも fail-soft（ローカル catalog/ の表示は継続）だが、原因（error）は
      * 開発者向け折りたたみでの手がかりに残す。
      */
-    protected async loadResolverCatalogItems(): Promise<{ items: AssetCatalogViewItem[]; status: 'ok' | 'failed'; error?: string }> {
+    protected async loadResolverCatalogItems(): Promise<{
+        items: AssetCatalogViewItem[];
+        status: 'ok' | 'failed';
+        entitlementsStatus: AssetEntitlementsStatus;
+        error?: string;
+    }> {
         const srcDir = await this.findAssetResolverSrcDir();
         if (!srcDir) {
-            return { items: [], status: 'failed', error: 'アセット resolver が見つかりません（開発配置を確認してください）' };
+            return {
+                items: [],
+                status: 'failed',
+                entitlementsStatus: 'error',
+                error: 'アセット resolver が見つかりません（開発配置を確認してください）'
+            };
         }
         const stateModuleUrl = pathToFileURL(join(srcDir, 'state.mjs')).toString();
         const script = `
 import { composeState } from ${JSON.stringify(stateModuleUrl)};
-const { base, items } = await composeState();
-process.stdout.write(JSON.stringify({ base, items }));
+const { base, items, entitlementsStatus } = await composeState();
+process.stdout.write(JSON.stringify({ base, items, entitlementsStatus }));
 `;
         const { code, stdout, stderr } = await this.runResolverScript(script);
         if (code !== 0) {
             const message = (stderr || stdout).trim();
             console.warn('[akari-project] resolver カタログの取得に失敗（ローカル catalog/ のみで継続）:', message);
-            return { items: [], status: 'failed', error: message || undefined };
+            return { items: [], status: 'failed', entitlementsStatus: 'error', error: message || undefined };
         }
-        let parsed: { base: string; items: Array<ResolverRawCatalogItem & { preview?: string }> };
+        let parsed: {
+            base: string;
+            items: Array<ResolverRawCatalogItem & { preview?: string }>;
+            entitlementsStatus?: AssetEntitlementsStatus;
+        };
         try {
             parsed = JSON.parse(stdout);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             console.warn('[akari-project] resolver カタログの応答を解釈できませんでした:', error);
-            return { items: [], status: 'failed', error: message };
+            return { items: [], status: 'failed', entitlementsStatus: 'error', error: message };
         }
         const items = parsed.items.map(item => {
             const previewUrl = resolveResolverPreviewUrl(item.preview, parsed.base);
@@ -448,7 +488,15 @@ process.stdout.write(JSON.stringify({ base, items }));
             const mediaUrl = resolveResolverPreviewUrl(selectResolverAudioFileRef(item), parsed.base);
             return toResolverAssetCatalogViewItem(item, previewUrl, mediaUrl);
         });
-        return { items, status: 'ok' };
+        const entitlementsStatus = parsed.entitlementsStatus;
+        const validEntitlementsStatuses: AssetEntitlementsStatus[] = ['ok', 'no_credentials', 'unauthorized', 'error'];
+        return {
+            items,
+            status: 'ok',
+            entitlementsStatus: entitlementsStatus && validEntitlementsStatuses.includes(entitlementsStatus)
+                ? entitlementsStatus
+                : 'error'
+        };
     }
 
     /**
@@ -1322,6 +1370,7 @@ try {
             }, null, 2) + '\n',
             '.claude/skills/README.md': FALLBACK_SKILLS_GUIDANCE,
             '.akari/workflow.json': JSON.stringify(FALLBACK_WORKFLOW, null, 2) + '\n',
+            'edit.json': JSON.stringify(FALLBACK_EDIT_JSON, null, 2) + '\n',
             'assets/.gitkeep': '',
             'planning/.gitkeep': '',
             'exports/.gitkeep': '',
@@ -1438,4 +1487,15 @@ const FALLBACK_WORKFLOW = {
         directory: '.akari/events',
         gateTypes: ['report-generated', 'report-approved', 'edit-completed', 'export-completed']
     }
+};
+// 新規プロジェクトの edit.json 雛形（オーナー決定 2026-08-18: 新規作成は常に v1 —
+// docs/contract-2026-07-18-edit-json-v1-sources.md §1）。`packages/project-scaffold`
+// 側の同名定数と同じ内容（このファイルはその「単一実装」に寄せる前の独立経路 —
+// akari-surfaces/src/common/akari-new-project-protocol.ts 冒頭のコメント参照。
+// `NEW_AKARI_PROJECT`「場所を選んで新規作成…」用の副導線として現役のためここでも直す）。
+const FALLBACK_EDIT_JSON = {
+    version: 1,
+    output: { width: 1920, height: 1080, fps: 30 },
+    sources: [],
+    cuts: []
 };

@@ -1,4 +1,6 @@
 import { CatalogPack } from './catalog-packs';
+import { PresetShowcase } from './preset-showcase';
+export { PresetShowcase, PresetShowcaseItem, PresetShowcaseKind } from './preset-showcase';
 
 export const AKARI_PROJECT_SERVICE_PATH = '/services/akari-project';
 export const AkariProjectService = Symbol('AkariProjectService');
@@ -140,6 +142,9 @@ export interface AssetCatalogResolverStatus {
     error?: string;
 }
 
+/** resolver が entitlements API を取得した結果。素材の locked 判定とは独立した UI 可視化用。 */
+export type AssetEntitlementsStatus = 'ok' | 'no_credentials' | 'unauthorized' | 'error';
+
 /**
  * カタログ面「1 ビュー」の応答本体。items は従来どおりの 1 ビュー配列、packs は
  * `catalog/packs.json`（無ければ空配列）。パック棚のグループ化・内訳集計は
@@ -152,6 +157,7 @@ export interface AssetCatalogView {
     items: AssetCatalogViewItem[];
     packs: CatalogPack[];
     resolver: AssetCatalogResolverStatus;
+    entitlementsStatus: AssetEntitlementsStatus;
 }
 
 export type AssetResolveOutcome =
@@ -220,6 +226,8 @@ export interface AkariProjectService {
      * 到達不能（未デプロイ・開発配置なし等）でもローカル分は表示を継続する（fail-soft）。
      */
     getAssetCatalogView(preferenceRoot: string | undefined): Promise<AssetCatalogView>;
+    /** テロップ / LUT の参照表を、素材カタログとは別系統の読み取り専用棚として返す。 */
+    getPresetShowcase(): Promise<PresetShowcase>;
     /**
      * resolver 直行（エージェント非経由）で素材を解決し、指定プロジェクトの assets/ 配下へ
      * 配置する。無料 or 購入済み（entitlements 保有）のみ成功する。未購入は

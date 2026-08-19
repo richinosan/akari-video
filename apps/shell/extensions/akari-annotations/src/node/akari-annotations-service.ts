@@ -55,6 +55,7 @@ import {
     SetLayerOpacityRequest,
     SetLayerTransformRequest,
     SetOverlayVarRequest,
+    SetSfxFadeRequest,
     SetSfxGainRequest,
     SplitCutRequest,
     TrimCutRequest,
@@ -63,6 +64,7 @@ import {
     WriteEditSnapshotRequest
 } from '../common/akari-annotations-protocol';
 import * as mediaCache from './media-cache';
+import { setSfxFadeInSource } from '../common/sfx-fade-store';
 import {
     appendAnnotationLine,
     emptyReviewSource,
@@ -536,7 +538,19 @@ export class AkariAnnotationsServiceImpl implements AkariAnnotationsService {
         const source = await fs.readFile(editPath, 'utf8');
         const updated = setSfxGainDbInSource(source, request.sfxIndex, request.gainDb);
         await this.writeProjectFileGuarded(editPath, updated);
-        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), 'SE の音量を変更') };
+        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップの音量を変更') };
+    }
+
+    async setSfxFade(request: SetSfxFadeRequest): Promise<WriteBackResult> {
+        this.requireWriteRequest(request?.editUri, request?.projectRootUri);
+        const editPath = this.fsPath(request.editUri);
+        const source = await fs.readFile(editPath, 'utf8');
+        const updated = setSfxFadeInSource(source, request.sfxIndex, {
+            fadeIn: request.fadeIn,
+            fadeOut: request.fadeOut
+        });
+        await this.writeProjectFileGuarded(editPath, updated);
+        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップのフェードを変更') };
     }
 
     async setBgmFields(request: SetBgmFieldsRequest): Promise<WriteBackResult> {
@@ -737,7 +751,7 @@ export class AkariAnnotationsServiceImpl implements AkariAnnotationsService {
         const source = await fs.readFile(editPath, 'utf8');
         const updated = moveSfxInSource(source, request.sfxIndex, request.t, request.track, request.trackState);
         await this.writeProjectFileGuarded(editPath, updated);
-        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), 'SE を移動') };
+        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップを移動') };
     }
 
     async trimSfx(request: TrimSfxRequest): Promise<WriteBackResult> {
@@ -746,7 +760,7 @@ export class AkariAnnotationsServiceImpl implements AkariAnnotationsService {
         const source = await fs.readFile(editPath, 'utf8');
         const updated = trimSfxInSource(source, request.sfxIndex, request.in, request.out, request.t);
         await this.writeProjectFileGuarded(editPath, updated);
-        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), 'SE をトリム') };
+        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップをトリム') };
     }
 
     async removeSfx(request: RemoveSfxRequest): Promise<RemoveSfxResult> {
@@ -755,7 +769,7 @@ export class AkariAnnotationsServiceImpl implements AkariAnnotationsService {
         const source = await fs.readFile(editPath, 'utf8');
         const { source: updated, removedText } = deleteSfxInSource(source, request.sfxIndex);
         await this.writeProjectFileGuarded(editPath, updated);
-        const committed = await this.commitWrite(this.fsPath(request.projectRootUri), 'SE を削除');
+        const committed = await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップを削除');
         return { committed, removedText, sfxIndex: request.sfxIndex };
     }
 
@@ -765,7 +779,7 @@ export class AkariAnnotationsServiceImpl implements AkariAnnotationsService {
         const source = await fs.readFile(editPath, 'utf8');
         const updated = insertSfxInSource(source, request.sfxIndex, request.elementText);
         await this.writeProjectFileGuarded(editPath, updated);
-        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), 'SE を挿入') };
+        return { committed: await this.commitWrite(this.fsPath(request.projectRootUri), '音声クリップを挿入') };
     }
 
     /**

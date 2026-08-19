@@ -44,6 +44,7 @@ import {
 import {
     applyShellUpdaterEvent,
     formatDownloadedBannerText,
+    formatDownloadingBannerText,
     INITIAL_SHELL_UPDATER_UI_STATE,
     ShellUpdaterUiState
 } from '../common/shell-update-applier';
@@ -60,12 +61,18 @@ import {
 } from '../common/akari-new-project-protocol';
 import { FirstRunSetupOpenMode } from '../common/first-run-onboarding';
 import { parseIntakeTitle, resolveProjectDisplayName } from '../common/project-display-name';
+import { shouldAutoOpenProjectLauncher } from '../common/launcher-visibility';
 import { AkariFirstRunSetupDialog } from './akari-first-run-setup-dialog';
-import { AkariProjectService } from 'akari-project/lib/common/akari-project-protocol';
+import { AkariProjectLauncherDialog } from './akari-project-launcher-dialog';
+import { AkariProjectService, AssetEntitlementsStatus } from 'akari-project/lib/common/akari-project-protocol';
 import {
     StoreConnectionFlowController,
     StoreConnectionFlowPhase
 } from 'akari-project/lib/common/store-connection-flow';
+import {
+    STORE_RECONNECT_REQUIRED_MESSAGE,
+    storeReconnectRequired
+} from '../common/store-entitlements-visibility';
 
 // ホーム v4（裁定 R1〜R3・notes-2026-08-02-home-v4-minimal）: dashboard の
 // 構成要素を 3 つだけに削る — ①説明（2 動作） ②過去プロジェクト一覧
@@ -98,7 +105,6 @@ const STORE_SITE_FALLBACK = 'https://akari-oss.app/lab/';
 // 「AI パートナー接続」のプロジェクト単位 SSOT は connections.json の akari-cloud
 // provider の doctor.status（partner pane が「akari-cloud・接続済み」と表示する対象と同一）。
 const CLOUD_PROVIDER_ID = 'akari-cloud';
-const BEGIN_ONBOARDING_COMMAND = 'akari.partner.beginOnboarding';
 const SEND_TO_PARTNER_COMMAND = 'akari.partner.send';
 // akari-project の akari-reveal-commands.ts とミラー（拡張間 npm 依存を作らない —
 // akari-project-contribution.ts 冒頭コメントと同じ「薄いコマンド境界」流儀。
@@ -170,8 +176,12 @@ interface StandaloneProjectEntry {
     title: string | null;
 }
 
-/** U3: プロジェクト一覧（唯一のスイッチャー）1 行分。past/current/standalone を統合した表示用の形。 */
-interface ProjectListRow {
+/**
+ * U3: プロジェクト一覧（唯一のスイッチャー）1 行分。past/current/standalone を統合した表示用の形。
+ * ランチャー（`akari-project-launcher-dialog.ts`）が列挙結果をそのまま受け取れるよう export する
+ * （型だけの参照 — 列挙ロジック自体は `buildProjectRows` に残したまま複製しない）。
+ */
+export interface ProjectListRow {
     key: string;
     name: string;
     uri: URI;
@@ -263,8 +273,16 @@ export class AkariHomeWidget extends ReactWidget {
     // セットアップ完了直後はワークスペース root がまだ無くても dashboard へ抜ける。
     protected showDashboardWithoutProject = false;
 
+    // --- プロジェクト・ランチャー（task 2026-08-17-home-launcher-popup・裁定 D + §3.2）。
+    // 中身（列挙・開く・新規作成）は一切複製せず、home widget 側の既存実装を props 経由で
+    // 渡すだけ。ここは開閉のライフサイクルと「同一セッションで再ポップしない」の状態だけを持つ。
+    protected projectLauncherDialog: AkariProjectLauncherDialog | undefined;
+    protected projectLauncherDialogClosed: Promise<void> | undefined;
+    protected launcherDismissedThisSession = false;
+
     // --- AKARI Store 接続（オーナー要望 2026-08-03「アプリ側でも欲しい」） ---
     protected storeEmail: string | null = null;
+    protected storeEntitlementsStatus: AssetEntitlementsStatus = 'no_credentials';
     protected storeFlowPhase: StoreConnectionFlowPhase = 'idle';
     protected storeFlowError?: string;
     protected storeFlowUserCode?: string;
@@ -295,13 +313,14 @@ export class AkariHomeWidget extends ReactWidget {
     // U5「チャンネルに入れる」実行中フラグ。
     protected joiningChannel = false;
 
-    // --- ホーム v3 由来: 接続案内カード / 進め方フォーム ---
+    // --- ホーム v3 由来: 接続状態の判定 / 進め方フォーム ---
+    // 接続案内カード自体は裁定 C4 により撤去済み（task 2026-08-17-home-launcher-popup）。
+    // `connected` の判定（readConnected 系）は接続状態の SSOT として他用途のために維持する。
     protected connectionsUri: URI | undefined;
     protected intakeUri: URI | undefined;
     protected connected = false;
     protected intakeStatus: 'absent' | 'draft' | 'submitted' = 'absent';
     protected intakeSnapshot: IntakeSnapshot | undefined;
-    protected connecting = false;
 
     // 進め方フォームを dashboard 内の展開セクションとして開いているか。
     // v4 ではホーム上のカードから開く経路が無くなったため、
@@ -347,6 +366,8 @@ export class AkariHomeWidget extends ReactWidget {
                 this.storeFlowUserCode = state.userCode;
                 if (state.connection.connected) {
                     this.storeEmail = state.connection.email ?? state.connection.identifier ?? '接続済み';
+                    this.storeEntitlementsStatus = 'ok';
+                    void this.refreshHomeFlow();
                 }
                 this.update();
             }
@@ -363,7 +384,10 @@ export class AkariHomeWidget extends ReactWidget {
         await this.loadCreatorRootProjects();
         // U3: 履歴由来の「単体」プロジェクトは creatorRootProjects（重複除外に使う）の後に読む。
         await this.loadStandaloneProjects();
-        await this.initializeFirstRunSetup();
+        const firstRunWillAutoOpen = await this.initializeFirstRunSetup();
+        // ランチャー（正本 §3.2）: 完全初回はセットアップが優先するため、その場合はここでは
+        // 開かない — セットアップの onFinished からの明示 open に続きを委ねる。
+        await this.initializeProjectLauncher(firstRunWillAutoOpen);
         // U2: 状態バッジの解決（creatorRootUri）の後に読む — 現在地がチャンネルの
         // 内側かどうかの判定に使うため。
         await this.refreshCurrentLocation();
@@ -416,19 +440,72 @@ export class AkariHomeWidget extends ReactWidget {
         this.update();
     }
 
-    /** 完全初回だけ、ウェルカム面の上へ専用モーダルを自動表示する。 */
-    protected async initializeFirstRunSetup(): Promise<void> {
+    /**
+     * 完全初回だけ、ウェルカム面の上へ専用モーダルを自動表示する。戻り値は自動表示したか
+     * どうか — ランチャーの自動表示判定（`initializeProjectLauncher`）が「今回はセットアップが
+     * 優先された」ことを知るために使う（正本 §3.2「完全初回はセットアップダイアログが優先」）。
+     */
+    protected async initializeFirstRunSetup(): Promise<boolean> {
         const roots = await this.workspaceService.roots;
         const hasProjectHistory = this.creatorRootProjects.length > 0 || this.standaloneProjects.length > 0;
         const dialog = this.createFirstRunSetupDialog();
-        if (!await dialog.shouldAutoOpen({
+        const willAutoOpen = await dialog.shouldAutoOpen({
             hasOpenProject: roots.length > 0,
             hasProjectHistory
+        });
+        if (!willAutoOpen) {
+            return false;
+        }
+        void this.openFirstRunSetupDialog('automatic', dialog);
+        return true;
+    }
+
+    /**
+     * ランチャーの自動表示判定（正本 §3.2）。純ロジックは `launcher-visibility.ts` に
+     * 分離してあり、ここは状態集めと呼び出しだけを行う。
+     */
+    protected async initializeProjectLauncher(firstRunWillAutoOpen: boolean): Promise<void> {
+        const roots = await this.workspaceService.roots;
+        if (!shouldAutoOpenProjectLauncher({
+            hasOpenProject: roots.length > 0,
+            firstRunWillAutoOpen,
+            dismissedThisSession: this.launcherDismissedThisSession
         })) {
             return;
         }
-        void this.openFirstRunSetupDialog('automatic', dialog);
+        void this.openProjectLauncher();
     }
+
+    /**
+     * ランチャーを開く（自動表示・初回セットアップ onFinished からの継続・コマンド/ボタンからの
+     * 手動再表示の共通入口）。既に開いていればそれを前面に出すだけで新しいダイアログは作らない
+     * （`openFirstRunSetupDialog` と同じ流儀）。一覧・新規作成・開くの実処理はすべて props 経由で
+     * 既存実装（`buildProjectRows` / `startNewProject` / `openCreatorRootProject`）へ委ねる。
+     */
+    openProjectLauncher = async (): Promise<void> => {
+        if (this.projectLauncherDialog && this.projectLauncherDialogClosed) {
+            this.projectLauncherDialog.activate();
+            return this.projectLauncherDialogClosed;
+        }
+        const dialog = new AkariProjectLauncherDialog({
+            title: 'プロジェクトを選ぶ',
+            rows: this.buildProjectRows(),
+            onStartNewProject: this.startNewProject,
+            onOpenProject: this.openCreatorRootProject,
+            onDismissed: () => {
+                this.launcherDismissedThisSession = true;
+            }
+        });
+        this.projectLauncherDialog = dialog;
+        const closed = dialog.openLauncher().finally(() => {
+            if (this.projectLauncherDialog === dialog) {
+                this.projectLauncherDialog = undefined;
+                this.projectLauncherDialogClosed = undefined;
+            }
+        });
+        this.projectLauncherDialogClosed = closed;
+        return closed;
+    };
 
     /** コマンドパレット／ホームの導線から何度でも明示再表示できる。 */
     openFirstRunSetup = async (): Promise<void> => {
@@ -448,6 +525,9 @@ export class AkariHomeWidget extends ReactWidget {
                     this.showDashboardWithoutProject = true;
                     this.update();
                     void this.refreshHomeFlow();
+                    // D3（正本）: オンボーディング 1→2→3 の完了後はランチャーへ続く。
+                    // 完了直後は `launcherDismissedThisSession` がまだ false なので無条件に開いてよい。
+                    void this.openProjectLauncher();
                 }
             },
             this.fileService,
@@ -504,9 +584,15 @@ export class AkariHomeWidget extends ReactWidget {
      * 入力が消えないようにするため（フォームの開閉は純粋な UI 状態）。
      */
     protected async refreshHomeFlow(): Promise<void> {
-        this.connected = await this.readConnected();
-        this.storeEmail = await this.readStoreConnection();
-        const intake = await this.readIntake();
+        const [connected, storeEmail, storeEntitlementsStatus, intake] = await Promise.all([
+            this.readConnected(),
+            this.readStoreConnection(),
+            this.readStoreEntitlementsStatus(),
+            this.readIntake()
+        ]);
+        this.connected = connected;
+        this.storeEmail = storeEmail;
+        this.storeEntitlementsStatus = storeEntitlementsStatus;
         this.intakeSnapshot = intake;
         this.intakeStatus = intake.status;
         this.update();
@@ -532,6 +618,18 @@ export class AkariHomeWidget extends ReactWidget {
             return typeof parsed?.email === 'string' ? parsed.email : '接続済み';
         } catch {
             return null;
+        }
+    }
+
+    /**
+     * resolver と同じ entitlements 取得結果を akari-project のカタログ RPC 経由で読む。
+     * ホーム独自のトークン検証は追加せず、カタログ面と判定元を一つに保つ。
+     */
+    protected async readStoreEntitlementsStatus(): Promise<AssetEntitlementsStatus> {
+        try {
+            return (await this.storeService.getAssetCatalogView(undefined)).entitlementsStatus;
+        } catch {
+            return 'error';
         }
     }
 
@@ -574,8 +672,9 @@ export class AkariHomeWidget extends ReactWidget {
      * FileService 経路）。無い/壊れている/status が ok でなければ未接続扱い。
      *
      * v0 ではこのファイルの watch は張らない（マーカーは「次回起動時に効く」で
-     * 足りる契約）。同一セッション内の反映は connectPartner の完了時と
-     * ホーム再表示時の読み直しで担保する。
+     * 足りる契約）。同一セッション内の反映はホーム再表示時の読み直しで担保する
+     * （接続案内カード撤去〔裁定 C4〕前は接続フロー完了時の読み直しもあったが、
+     * その呼び出し元自体が無くなったため今はここだけが反映経路）。
      */
     protected async readAppConnected(): Promise<boolean> {
         try {
@@ -1331,19 +1430,39 @@ export class AkariHomeWidget extends ReactWidget {
     };
 
     /**
-     * 「更新する」（F7-v1・task 2026-08-03-home-v5-terms）: 自プラットフォームの配布物
-     * URL（無ければ notes_url。`evaluateUpdateStatus`/`resolveUpdateDownloadUrl` が
-     * 解決済み）を外部ブラウザで開いてダウンロードを開始する。`{ external: true }` を
-     * 明示しないと Electron 版 `WindowService`（`electron-main-window-service-impl.js`）は
-     * 新規 Electron ウィンドウで URL を内部的に開くだけになり（`shell.openExternal` が
-     * 呼ばれない）、バイナリ配布物のダウンロードが実ブラウザのダウンロードマネージャ
-     * を経由しない — task.md の「外部ブラウザで開いて DL 開始」を満たすにはこのフラグが必須。
+     * 「更新する」: electron-updater が使える環境（パッケージ済み Electron）では
+     * main プロセスへ即時チェックを発火する — autoDownload で裏 DL が始まり、イベントが
+     * バナーを「ダウンロード中」→「DL 済み・再起動で適用」へ進める（アプリ内で完結）。
+     * updater が使えない（非 Electron・開発ビルド）か直近で error になっている場合は
+     * 従来の F7-v1 挙動（外部ブラウザで配布物 DL）へ縮退する。
      */
     protected downloadUpdate = (): void => {
+        const api = this.resolveElectronUpdaterApi();
+        if (api && !this.updaterUiState.failed) {
+            this.updateCheckRequested = true;
+            void api.checkForUpdatesNow().catch(() => {
+                // IPC 自体の失敗は沈黙（契約 §11）。次クリックは failed 経由でブラウザ DL に落とす。
+                this.updateCheckRequested = false;
+                this.applyUpdaterEvent({ kind: 'error' });
+            });
+            return;
+        }
+        this.openUpdateDownloadInBrowser();
+    };
+
+    /**
+     * F7-v1（task 2026-08-03-home-v5-terms）: 自プラットフォームの配布物 URL（無ければ
+     * notes_url。`evaluateUpdateStatus`/`resolveUpdateDownloadUrl` が解決済み）を外部
+     * ブラウザで開いてダウンロードを開始する。`{ external: true }` を明示しないと
+     * Electron 版 `WindowService`（`electron-main-window-service-impl.js`）は新規 Electron
+     * ウィンドウで URL を内部的に開くだけになり（`shell.openExternal` が呼ばれない）、
+     * バイナリ配布物のダウンロードが実ブラウザのダウンロードマネージャを経由しない。
+     */
+    protected openUpdateDownloadInBrowser(): void {
         if (this.updateStatus.downloadUrl) {
             this.windowService.openNewWindow(this.updateStatus.downloadUrl, { external: true });
         }
-    };
+    }
 
     // --- U3 electron-updater（内部リポ契約 update-and-versioning §11）: main プロセス
     // イベントの購読と「今すぐ再起動して適用」アクション ---
@@ -1380,8 +1499,19 @@ export class AkariHomeWidget extends ReactWidget {
         this.toDispose.push({ dispose: () => this.updaterUnsubscribe?.() });
     }
 
+    /** 「更新する」クリック起点のチェックが進行中か（error 時にブラウザ DL へ一度だけ自動フォールバックするための印）。 */
+    protected updateCheckRequested = false;
+
     protected applyUpdaterEvent(event: ShellUpdaterEvent): void {
         this.updaterUiState = applyShellUpdaterEvent(this.updaterUiState, event);
+        if (event.kind === 'update-downloaded' || event.kind === 'update-not-available') {
+            this.updateCheckRequested = false;
+        } else if (event.kind === 'error' && this.updateCheckRequested) {
+            // ユーザーが明示的に「更新する」を押した直後の失敗だけは黙って終わらせず、
+            // 従来の手動 DL（外部ブラウザ）へ引き継ぐ。バックグラウンドチェックの失敗では開かない。
+            this.updateCheckRequested = false;
+            this.openUpdateDownloadInBrowser();
+        }
         this.update();
     }
 
@@ -1395,24 +1525,8 @@ export class AkariHomeWidget extends ReactWidget {
     };
 
     // --- ホーム v2: アクション ---
-
-    protected connectPartner = async (): Promise<void> => {
-        if (this.connecting) {
-            return;
-        }
-        this.connecting = true;
-        this.update();
-        try {
-            await this.commands.executeCommand(BEGIN_ONBOARDING_COMMAND);
-        } finally {
-            this.connecting = false;
-            // アプリ単位マーカーは watch していない（v0）。接続フローが終わった
-            // この時点で読み直すことで、connections.json を持たないプロジェクト
-            // でも同一セッション内でゲートが消える。connections.json 側の修復は
-            // watch でも拾われるが、二重に読んでも害はない。
-            await this.refreshHomeFlow();
-        }
-    };
+    // 接続案内カード（旧 connectPartner・BEGIN_ONBOARDING_COMMAND）は裁定 C4 により撤去済み
+    // （task 2026-08-17-home-launcher-popup）。接続は右側「パートナーを追加」パネルが正。
 
     protected connectStore = async (): Promise<void> => {
         await this.storeConnectionFlow.start();
@@ -1803,11 +1917,10 @@ export class AkariHomeWidget extends ReactWidget {
                 style={{ height: '100%', overflow: 'auto', padding: '18px 22px', boxSizing: 'border-box', position: 'relative' }}
             >
                 {this.renderDashboardHeader()}
-                {(this.updateStatus.available || this.updaterUiState.downloaded) && this.renderUpdateBanner()}
+                {(this.updateStatus.available || this.updaterUiState.downloaded || this.updaterUiState.downloading) && this.renderUpdateBanner()}
                 {this.importedNotice && this.renderImportedNotice()}
                 {this.renderExplanation()}
                 {this.renderProjectList()}
-                {!this.connected && this.renderConnectCard()}
                 {this.renderStoreCard()}
                 {this.intakeFormOpen && this.renderIntakeForm()}
                 {this.dragActive && this.renderDropOverlay()}
@@ -1835,7 +1948,7 @@ export class AkariHomeWidget extends ReactWidget {
                 style={homeFlowStyles.welcomeSurface}
             >
                 <div style={homeFlowStyles.welcomeStack}>
-                    {(this.updateStatus.available || this.updaterUiState.downloaded) && this.renderUpdateBanner()}
+                    {(this.updateStatus.available || this.updaterUiState.downloaded || this.updaterUiState.downloading) && this.renderUpdateBanner()}
                     {this.renderWelcomeCard()}
                 </div>
             </div>
@@ -1905,6 +2018,16 @@ export class AkariHomeWidget extends ReactWidget {
                     type='button'
                     className='theia-button secondary'
                     style={homeFlowStyles.welcomeSetupButton}
+                    data-akari-open-project-launcher='true'
+                    onClick={() => void this.openProjectLauncher()}
+                >
+                    <span className='codicon codicon-layout' aria-hidden='true' />
+                    プロジェクト・ランチャーを開く
+                </button>
+                <button
+                    type='button'
+                    className='theia-button secondary'
+                    style={homeFlowStyles.welcomeSetupButton}
                     data-akari-open-first-run-setup='true'
                     onClick={() => void this.openFirstRunSetup()}
                 >
@@ -1952,14 +2075,14 @@ export class AkariHomeWidget extends ReactWidget {
     }
 
     /**
-     * 更新ホームバナー（D5 裁定・F7-v1 更新 — task 2026-08-03-home-v5-terms）。
+     * 更新ホームバナー（D5 裁定・F7-v1 — task 2026-08-03-home-v5-terms）。
      * 新版がある時だけ出す。常時領域を専有しない。アクション 2 つ:
-     * 更新する（自プラットフォーム配布物 DL を外部ブラウザで開始） /
-     * 今回はスキップ（dismissed 記録・不変）。文言・ボタン構成はモック準拠（U7・U8）。
+     * 更新する（electron-updater の即時チェック発火。使えない環境ではブラウザ DL に縮退
+     * — downloadUpdate 参照） / 今回はスキップ（dismissed 記録・不変）。
      *
-     * U3（electron-updater・契約 §11）: `updaterUiState.downloaded` が true の間は
-     * 上記の DL 前バナーの代わりに「DL 済み・再起動で適用されます」バナーへ切り替える
-     * （task.md §4「DL 前は従来どおり」= 逆に言えば DL 後はここで表示が変わる）。
+     * U3（electron-updater・契約 §11）の 3 段階:
+     * DL 前 = U2 フィード比較バナー → `downloading` の間 = 「ダウンロード中」表示
+     * （ボタンなし） → `downloaded` = 「DL 済み・今すぐ再起動して適用」バナー。
      */
     protected renderUpdateBanner(): React.ReactNode {
         if (this.updaterUiState.downloaded) {
@@ -1978,6 +2101,14 @@ export class AkariHomeWidget extends ReactWidget {
                             今すぐ再起動して適用
                         </button>
                     </div>
+                </div>
+            );
+        }
+        if (this.updaterUiState.downloading && this.updaterUiState.downloadingVersion) {
+            return (
+                <div role='status' style={homeFlowStyles.updateBanner} data-akari-update-downloading='true'>
+                    <span className='codicon codicon-arrow-circle-up' aria-hidden='true' style={homeFlowStyles.updateBannerIcon} />
+                    <span style={homeFlowStyles.updateBannerText}>{formatDownloadingBannerText(this.updaterUiState)}</span>
                 </div>
             );
         }
@@ -2008,15 +2139,26 @@ export class AkariHomeWidget extends ReactWidget {
             <header style={{ marginBottom: 14 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                     <h1 style={{ margin: 0, fontSize: 21 }}>ホーム</h1>
-                    <button
-                        type='button'
-                        className='theia-button secondary'
-                        data-akari-open-first-run-setup='true'
-                        style={homeFlowStyles.setupReopenButton}
-                        onClick={() => void this.openFirstRunSetup()}
-                    >
-                        セットアップを開く
-                    </button>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                            type='button'
+                            className='theia-button secondary'
+                            data-akari-open-project-launcher='true'
+                            style={homeFlowStyles.setupReopenButton}
+                            onClick={() => void this.openProjectLauncher()}
+                        >
+                            プロジェクト・ランチャー
+                        </button>
+                        <button
+                            type='button'
+                            className='theia-button secondary'
+                            data-akari-open-first-run-setup='true'
+                            style={homeFlowStyles.setupReopenButton}
+                            onClick={() => void this.openFirstRunSetup()}
+                        >
+                            セットアップを開く
+                        </button>
+                    </div>
                 </div>
                 {this.renderStatusBadge()}
             </header>
@@ -2240,71 +2382,54 @@ export class AkariHomeWidget extends ReactWidget {
     }
 
     /**
-     * 接続案内カード（裁定 R6）。未接続のときだけ dashboard に出る**案内**で、
-     * ゲートではない — 上にある説明・過去プロジェクトを開く操作は未接続のまま行える。
-     */
-    protected renderConnectCard(): React.ReactNode {
-        return (
-            <section style={{ ...homeFlowStyles.card, ...homeFlowStyles.cardAccent }}>
-                <div style={homeFlowStyles.cardMark} aria-hidden='true'>
-                    <span className='codicon codicon-comment-discussion' style={{ fontSize: 20, color: 'var(--theia-button-foreground)' }} />
-                </div>
-                <div style={homeFlowStyles.cardBody}>
-                    <strong style={homeFlowStyles.cardTitle}>パートナーとつなぐ</strong>
-                    <p style={homeFlowStyles.cardLead}>
-                        過去プロジェクトを開くなど、ここまでの操作は接続前でも使えます。
-                    </p>
-                    <p style={homeFlowStyles.cardFine}>初回のみ · 完了すると次からは自動接続</p>
-                </div>
-                <button
-                    type='button'
-                    className='theia-button main'
-                    style={homeFlowStyles.cardCta}
-                    disabled={this.connecting}
-                    onClick={() => void this.connectPartner()}
-                >
-                    {this.connecting ? '接続しています…' : 'パートナーに接続する'}
-                </button>
-            </section>
-        );
-    }
-
-    /**
      * AKARI Store カード（ホーム v4 の 3 要素へのオーナー承認済み追加・2026-08-03）。
      * 未接続 = 内蔵デバイスフローの進行表示と接続ボタン。
      * 接続済み = メール表示 + マイページを外部ブラウザで開く。
      */
     protected renderStoreCard(): React.ReactNode {
         const connected = this.storeEmail !== null;
-        const connectionState = connected
+        const reconnectRequired = storeReconnectRequired(connected, this.storeEntitlementsStatus);
+        const connectionState = reconnectRequired && this.storeFlowPhase === 'idle'
+            ? 'reconnect-required'
+            : connected && this.storeFlowPhase === 'idle'
             ? 'connected'
             : this.storeFlowPhase === 'idle' ? 'disconnected' : this.storeFlowPhase;
         return (
-            <section style={homeFlowStyles.card} data-akari-store-connection={connectionState}>
+            <section
+                style={homeFlowStyles.card}
+                data-akari-store-connection={connectionState}
+                data-akari-store-entitlements-status={this.storeEntitlementsStatus}
+                data-akari-store-reconnect-required={reconnectRequired ? 'true' : undefined}
+            >
                 <div style={homeFlowStyles.cardMark} aria-hidden='true'>
                     <span className='codicon codicon-package' style={{ fontSize: 20, color: 'var(--theia-button-foreground)' }} />
                 </div>
                 <div style={homeFlowStyles.cardBody}>
                     <strong style={homeFlowStyles.cardTitle}>AKARI Store</strong>
-                    {connected && <p style={homeFlowStyles.cardLead}>接続中: {this.storeEmail}</p>}
+                    {connected && !reconnectRequired && <p style={homeFlowStyles.cardLead}>接続中: {this.storeEmail}</p>}
+                    {reconnectRequired && this.storeFlowPhase === 'idle' && (
+                        <p style={{ ...homeFlowStyles.cardLead, color: 'var(--theia-errorForeground)' }}>
+                            {STORE_RECONNECT_REQUIRED_MESSAGE}
+                        </p>
+                    )}
                     {!connected && this.storeFlowPhase === 'idle' && (
                         <p style={homeFlowStyles.cardLead}>購入した素材（宣言パック・3D モックなど）を本体で使うには接続します。</p>
                     )}
-                    {!connected && this.storeFlowPhase === 'starting' && (
+                    {(!connected || reconnectRequired) && this.storeFlowPhase === 'starting' && (
                         <p style={homeFlowStyles.cardLead}>接続を開始しています…</p>
                     )}
-                    {!connected && this.storeFlowPhase === 'pending' && (
+                    {(!connected || reconnectRequired) && this.storeFlowPhase === 'pending' && (
                         <>
                             <p style={homeFlowStyles.cardLead}>ブラウザで承認してください…</p>
                             {this.storeFlowUserCode && <p style={homeFlowStyles.cardFine}>確認コード: {this.storeFlowUserCode}</p>}
                         </>
                     )}
-                    {!connected && (this.storeFlowPhase === 'expired' || this.storeFlowPhase === 'error') && (
+                    {(!connected || reconnectRequired) && (this.storeFlowPhase === 'expired' || this.storeFlowPhase === 'error') && (
                         <p style={{ ...homeFlowStyles.cardLead, color: 'var(--theia-errorForeground)' }}>{this.storeFlowError}</p>
                     )}
-                    {connected && <p style={homeFlowStyles.cardFine}>購入素材の導入は「購入した素材をセットアップして」と頼むだけ</p>}
+                    {connected && !reconnectRequired && <p style={homeFlowStyles.cardFine}>購入素材の導入は「購入した素材をセットアップして」と頼むだけ</p>}
                 </div>
-                {connected ? (
+                {connected && !reconnectRequired ? (
                     <button
                         type='button'
                         className='theia-button secondary'
@@ -2341,7 +2466,9 @@ export class AkariHomeWidget extends ReactWidget {
                         disabled={this.storeFlowPhase === 'starting'}
                         onClick={() => void this.connectStore()}
                     >
-                        {this.storeFlowPhase === 'starting' ? '接続を開始しています…' : 'ストアに接続する'}
+                        {this.storeFlowPhase === 'starting'
+                            ? '接続を開始しています…'
+                            : reconnectRequired ? 'ストアに再接続する' : 'ストアに接続する'}
                     </button>
                 )}
             </section>
@@ -2465,7 +2592,6 @@ const homeFlowStyles: Record<string, React.CSSProperties> = {
         borderRadius: 12, border: '1px solid var(--theia-widget-border)',
         background: 'var(--theia-editorWidget-background)'
     },
-    cardAccent: { borderColor: 'var(--theia-focusBorder)' },
     cardMark: {
         width: 38, height: 38, flex: '0 0 auto', borderRadius: 11,
         background: 'var(--theia-button-background)', display: 'flex', alignItems: 'center', justifyContent: 'center'
